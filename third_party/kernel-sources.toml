@@ -11,6 +11,16 @@ entrypoint = "flashinfer.mm_fp4"
 notes = "Observed in the live Qwen3.8 27B SGLang image on GB10. First dense NVFP4 backend candidate."
 
 [[source]]
+id = "flashinfer-gdn-decode-oracle"
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "semantic-oracle"
+status = "clean-room-local-cuda-implemented"
+entrypoint = "flashinfer/gdn_kernels/gdn_decode_pretranspose.py"
+notes = "Defines Qwen GDN BF16 K-last state recurrence and pool layout. SparkServe reimplements the fixed K=V=128 decode contract in raw CUDA and does not link Python or CuTe DSL."
+
+[[source]]
 id = "sglang-qwen38-27b-oracle"
 repository = "https://github.com/sgl-project/sglang"
 revision = "c4271c3fe1262fc2adbd162c33b25de5255251c5"

@@ -1,6 +1,6 @@
 use std::ffi::{c_char, c_void};
 
-use crate::kernel::{DenseNvfp4Spec, KERNEL_ABI_VERSION};
+use crate::kernel::{DataType, DenseNvfp4Spec, KERNEL_ABI_VERSION};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +97,67 @@ pub struct DenseNvfp4Args {
     pub cuda_stream: *mut c_void,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GdnBackend {
+    Auto = 0,
+    LocalCuda = 1,
+    FlashInfer = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GdnDecodePlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub batch_size: u32,
+    pub num_qk_heads: u32,
+    pub num_value_heads: u32,
+    pub key_dim: u32,
+    pub value_dim: u32,
+    pub state_slots: u32,
+    pub state_dtype: u32,
+    pub requested_backend: u32,
+}
+
+impl GdnDecodePlan {
+    pub fn qwen38_flash_decode(batch_size: u32, state_slots: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            batch_size,
+            num_qk_heads: 16,
+            num_value_heads: 48,
+            key_dim: 128,
+            value_dim: 128,
+            state_slots,
+            state_dtype: DataType::BFloat16 as u32,
+            requested_backend: GdnBackend::Auto as u32,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GdnDecodeArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: GdnDecodePlan,
+    pub q: *const c_void,
+    pub k: *const c_void,
+    pub v: *const c_void,
+    pub a: *const c_void,
+    pub b: *const c_void,
+    pub a_log: *const f32,
+    pub dt_bias: *const f32,
+    pub state_pool: *mut c_void,
+    pub state_indices: *const i32,
+    pub output: *mut c_void,
+    pub scale: f32,
+    pub reserved: u32,
+    pub cuda_stream: *mut c_void,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct KernelInfo {
@@ -135,6 +196,16 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const DenseNvfp4Args,
     ) -> Status;
+    pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
+    pub fn sparkserve_gdn_decode_query(
+        caps: *const DeviceCaps,
+        plan: *const GdnDecodePlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_gdn_decode_launch(
+        caps: *const DeviceCaps,
+        args: *const GdnDecodeArgs,
+    ) -> Status;
 }
 
 fn size_u32<T>() -> u32 {
@@ -152,6 +223,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<DenseNvfp4Plan>(), 80);
         assert_eq!(std::mem::size_of::<Nvfp4MatrixView>(), 32);
         assert_eq!(std::mem::size_of::<DenseNvfp4Args>(), 200);
+        assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
+        assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
     }
 
@@ -164,5 +237,16 @@ mod tests {
         assert_eq!(plan.input_scale_layout, ScaleLayout::Cutlass128x4 as u32);
         assert_eq!(plan.output_dtype, DataType::BFloat16 as u32);
         assert_eq!(plan.requested_backend, KernelBackend::Auto as u32);
+    }
+
+    #[test]
+    fn qwen_flash_gdn_plan_matches_checkpoint_topology() {
+        let plan = GdnDecodePlan::qwen38_flash_decode(1, 20);
+        assert_eq!(plan.num_qk_heads, 16);
+        assert_eq!(plan.num_value_heads, 48);
+        assert_eq!(plan.key_dim, 128);
+        assert_eq!(plan.value_dim, 128);
+        assert_eq!(plan.state_dtype, DataType::BFloat16 as u32);
+        assert_eq!(plan.requested_backend, GdnBackend::Auto as u32);
     }
 }

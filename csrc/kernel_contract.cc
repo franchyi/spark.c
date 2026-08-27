@@ -2,6 +2,10 @@
 
 #include <limits>
 
+#ifdef SPARKSERVE_WITH_CUDA
+#include "internal/gdn_decode_backend.h"
+#endif
+
 namespace {
 
 constexpr uint64_t kWeightNAlignment = 32;
@@ -49,6 +53,17 @@ SparkServeStatus ValidateCaps(const SparkServeDeviceCaps* caps) {
   if (header.code != SPARKSERVE_STATUS_OK) return header;
   if (caps->sm < 100 || caps->supports_fp4_tensor_cores == 0) {
     return Unsupported("native NVFP4 requires Blackwell FP4 Tensor Cores");
+  }
+  return Ok();
+}
+
+SparkServeStatus ValidateCudaCaps(const SparkServeDeviceCaps* caps) {
+  if (caps == nullptr) return Invalid("device capabilities are required");
+  SparkServeStatus header =
+      ValidateHeader(caps->struct_size, sizeof(*caps), caps->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (caps->sm < 80) {
+    return Unsupported("native BF16 GDN decode requires compute capability 80+");
   }
   return Ok();
 }
@@ -189,4 +204,98 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_launch(
   }
   return Unavailable(
       "NVFP4 contract is valid but no CUDA backend is linked in milestone zero");
+}
+
+extern "C" SparkServeStatus sparkserve_gdn_decode_validate(
+    const SparkServeGdnDecodePlan* plan) {
+  if (plan == nullptr) return Invalid("GDN decode plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->batch_size == 0 || plan->num_qk_heads == 0 ||
+      plan->num_value_heads == 0 || plan->key_dim == 0 ||
+      plan->value_dim == 0 || plan->state_slots == 0) {
+    return Invalid("GDN dimensions and state slot count must be non-zero");
+  }
+  if (plan->num_value_heads % plan->num_qk_heads != 0) {
+    return Invalid("GDN value heads must be a multiple of Q/K heads");
+  }
+  if (plan->key_dim != 128 || plan->value_dim != 128) {
+    return Unsupported("the first native GDN kernel requires K=V=128");
+  }
+  if (plan->state_dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("the first native GDN kernel requires BF16 state");
+  }
+  if (plan->requested_backend > SPARKSERVE_GDN_BACKEND_FLASHINFER) {
+    return Invalid("unknown GDN decode backend");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_gdn_decode_query(
+    const SparkServeDeviceCaps* caps, const SparkServeGdnDecodePlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  SparkServeStatus plan_status = sparkserve_gdn_decode_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+
+  const uint32_t backend =
+      plan->requested_backend == SPARKSERVE_GDN_BACKEND_AUTO
+          ? static_cast<uint32_t>(SPARKSERVE_GDN_BACKEND_LOCAL_CUDA)
+          : plan->requested_backend;
+  info->backend = backend;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  if (backend == SPARKSERVE_GDN_BACKEND_LOCAL_CUDA) {
+    info->name = "sparkserve-gdn-decode-bf16";
+    info->source_revision = "flashinfer-gdn-contract-v1";
+#ifdef SPARKSERVE_WITH_CUDA
+    info->available = 1;
+#endif
+    return Ok();
+  }
+  info->name = "flashinfer-gdn-decode-pretranspose";
+  info->source_revision =
+      "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_gdn_decode_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeGdnDecodeArgs* args) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (args == nullptr) return Invalid("GDN decode arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeStatus plan_status = sparkserve_gdn_decode_validate(&args->plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (args->q == nullptr || args->k == nullptr || args->v == nullptr ||
+      args->a == nullptr || args->b == nullptr || args->a_log == nullptr ||
+      args->dt_bias == nullptr || args->state_pool == nullptr ||
+      args->state_indices == nullptr || args->output == nullptr) {
+    return Invalid("GDN decode launch pointers cannot be null");
+  }
+  if (!(args->scale > 0.0f) ||
+      args->scale > std::numeric_limits<float>::max()) {
+    return Invalid("GDN query scale must be finite and positive");
+  }
+  const uint32_t backend =
+      args->plan.requested_backend == SPARKSERVE_GDN_BACKEND_AUTO
+          ? static_cast<uint32_t>(SPARKSERVE_GDN_BACKEND_LOCAL_CUDA)
+          : args->plan.requested_backend;
+  if (backend != SPARKSERVE_GDN_BACKEND_LOCAL_CUDA) {
+    return Unavailable("the raw FlashInfer GDN adapter is not linked");
+  }
+#ifdef SPARKSERVE_WITH_CUDA
+  return sparkserve_gdn_decode_cuda_launch(args);
+#else
+  return Unavailable(
+      "GDN contract is valid but this library was built without CUDA");
+#endif
 }

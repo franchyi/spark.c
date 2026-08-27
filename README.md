@@ -90,6 +90,8 @@ cargo run -p sparkserve-runtime -- checkpoint-plan \
   /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4
 cargo run -p sparkserve-runtime -- kernel-plan nvfp4-dense 1 4096 4096 121
 make test-cpp
+# Inside a CUDA 13 environment on Spark:
+make test-cuda-gdn
 ```
 
 The defaults reserve 8 GiB for KV cache, 12 GiB for the runtime, 8 GiB as a hard
@@ -112,9 +114,18 @@ contract: packed E2M1 weights and activations, FP8-E4M3 scales in CUTLASS 128x4
 layout, group size 16, independent packed-weight/scale padding, FP32 global
 alpha, and BF16 output.
 
-No CUDA backend is claimed as linked yet. A valid launch returns `UNAVAILABLE`
-until the pinned FlashInfer `mm_fp4` adapter is compiled into the runtime. This
-keeps the control plane and tests honest while the oracle tensors are captured.
+The dense NVFP4 CUDA backend is not linked yet. A valid dense launch returns
+`UNAVAILABLE` until the pinned FlashInfer `mm_fp4` adapter is compiled into the
+runtime. This keeps the control plane and tests honest while oracle tensors are
+captured.
+
+The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
+a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real
+`H=16`, `HV=48`, `K=V=128` topology and BF16 K-last state pool. It has no Torch,
+Triton, CuTe DSL, or SGLang runtime dependency. Its C ABI validates on CPU, and
+the `sm_121a` GPU test compares updated state and output against an independent
+reference implementation. This is a correctness kernel; profiling and fusion
+with QKV extraction come after real-tensor parity with SGLang.
 
 The Flash-Next storage path now has a cross-language `SSPLEIDX` contract, a
 zero-copy safetensors indexer, bounded Python and Rust caches, cross-page row

@@ -15,7 +15,7 @@ contracts, and promotion gates are recorded in
 | NVFP4 grouped MoE | CUTLASS example 79d; FlashInfer CUTLASS backend | Start from CUTLASS grouped GEMM and borrow routing/packing contracts from FlashInfer | SM121 autotune regressions and inefficient M=1 tiles |
 | PLE row gather | SGLang Qwen4 gather; SGLang PR 36567 storage design | Rust reads original safetensors; use a tiny CUDA gather × scalar-scale × BF16-accumulate kernel | cold-page tail latency during long prefill |
 | QSA decode | SGLang Qwen4 backend plus FlashInfer TRT-LLM sparse decode | Extract and pin the working SM120/121 path | architecture gates and FP8-KV edge cases |
-| GDN recurrent update | SGLang Qwen4 implementation as oracle | Port the fixed Qwen shape to CUDA and capture it in the decode graph | state-stride correctness and FP32 state contract |
+| GDN recurrent update | SGLang Qwen4 + pinned FlashInfer recurrence | Raw CUDA BF16 K-last decode is implemented for Qwen K=V=128; next fuse projection and add prefill | real-tensor parity, state-slot addressing, and reduction-order drift |
 | GLM KDA/DSA state and sparse indexer | pinned GLM5Next llama.cpp oracle | Port only after exact index, state, and FP32-reference fixtures are frozen | draft upstream CUDA path, pooled top-k semantics, accidental RoPE |
 | Hyperconnection mix/combine | SGLang fused kernels as oracle | Small shape-specialized CUDA kernels | silent stream-index errors |
 | RMSNorm, RoPE, sampling | FlashInfer or compact local CUDA | Reuse only when it wins a GB10 microbenchmark | launch overhead at batch one |

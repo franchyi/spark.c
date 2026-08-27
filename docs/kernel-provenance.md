@@ -81,6 +81,13 @@ Flash-Next adds model-specific pieces that must be considered separately:
 Those pieces are the main reason SGLang remains the semantic oracle even when
 SparkServe does not ship SGLang's Python scheduler.
 
+On the validated GB10 oracle, SGLang selects `TritonGDNKernel` for decode,
+extend, and verify with packed decode enabled. Its standard full-attention split
+is Triton prefill plus TRT-LLM/FlashInfer sparse decode. SparkServe does not copy
+that Python dispatcher: the first native GDN decode kernel reimplements the
+pinned FlashInfer K-last BF16 recurrence in raw CUDA, while QSA remains a
+separate indexed-attention adapter.
+
 ## What `ds4.c` actually reuses
 
 `ds4.c` demonstrates the packaging pattern we should copy for GGUF:
@@ -116,7 +123,7 @@ retaining a switch back to the legacy dispatch.
 | --- | --- | --- | --- | --- |
 | Qwen3.8 27B dense NVFP4 linear | live SGLang ModelOpt path | FlashInfer `mm_fp4` or direct CUTLASS 79a instantiation | wrap first; specialize later | packed bytes/scales exact, real-tensor output parity, greedy-token parity |
 | Flash-Next routed NVFP4 MoE | SGLang Qwen4-exp + ModelOpt | FlashInfer CUTLASS fused MoE / CUTLASS grouped GEMM | wrap with a frozen raw C contract | exact expert ids/order/weights, two GEMMs and activation checked separately, then fused parity |
-| GDN projection and recurrence | SGLang Qwen4-exp/Transformers | port fixed-shape SGLang Triton/CUDA algorithms | reimplement behind golden tests | exact state addressing; layer-state and multi-step sequence parity |
+| GDN projection and recurrence | SGLang Qwen4-exp + FlashInfer GDN | local raw CUDA K=V=128 BF16-state decode; later fuse QKV extraction | correctness kernel implemented; optimize behind the same ABI | CPU-reference parity now; real SGLang tensor/state and multi-step parity next |
 | QSA indexer and sparse attention | SGLang QSA backend | SGLang JIT CUDA indexer plus proven SM121 sparse-decode kernel | vendor small CUDA pieces; wrap external attention kernel | exact selected indices/masks/cache writes; dense-attention comparison on small cases |
 | Hyperconnection mix/combine | SGLang Qwen4-exp | small SGLang CUDA/Triton kernels | port or vendor after license audit | per-stream output and residual-state parity |
 | PLE lookup | SGLang Qwen4-exp + checkpoint | local mmap-aware gather/scale/accumulate kernel | reimplement for the one-copy store | exact row ids and scale; BF16 result against SGLang for cold/hot rows |

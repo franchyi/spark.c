@@ -40,6 +40,16 @@ typedef enum SparkServeKernelBackend {
   SPARKSERVE_BACKEND_CUTLASS_SM121 = 2,
 } SparkServeKernelBackend;
 
+typedef enum SparkServeGdnBackend {
+  SPARKSERVE_GDN_BACKEND_AUTO = 0,
+  // SparkServe-owned correctness-first CUDA decode kernel. It implements the
+  // same BF16-state recurrence used by the pinned FlashInfer/SGLang oracle.
+  SPARKSERVE_GDN_BACKEND_LOCAL_CUDA = 1,
+  // Reserved for a future raw FlashInfer adapter. The current FlashInfer GDN
+  // entry point is Python/CuTe DSL and is not linked into the shipping runtime.
+  SPARKSERVE_GDN_BACKEND_FLASHINFER = 2,
+} SparkServeGdnBackend;
+
 typedef struct SparkServeStatus {
   int32_t code;
   const char* message;
@@ -112,6 +122,48 @@ typedef struct SparkServeKernelInfo {
   const char* source_revision;
 } SparkServeKernelInfo;
 
+// Single-token Gated Delta Network decode. The first native implementation is
+// deliberately fixed to the Qwen3.8 Flash shape K=V=128 and BF16 recurrent
+// state. Q/K use H heads, V/state use HV heads, and HV must be a multiple of H.
+typedef struct SparkServeGdnDecodePlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t batch_size;
+  uint32_t num_qk_heads;
+  uint32_t num_value_heads;
+  uint32_t key_dim;
+  uint32_t value_dim;
+  uint32_t state_slots;
+  uint32_t state_dtype;
+  uint32_t requested_backend;
+} SparkServeGdnDecodePlan;
+
+typedef struct SparkServeGdnDecodeArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeGdnDecodePlan plan;
+  // BF16 Q/K: [B,H,K]. BF16 V: [B,HV,V].
+  const void* q;
+  const void* k;
+  const void* v;
+  // BF16 input-dependent gates: [B,HV].
+  const void* a;
+  const void* b;
+  // FP32 persistent gate parameters: [HV].
+  const float* a_log;
+  const float* dt_bias;
+  // BF16 K-contiguous state pool: [slots,HV,V,K], updated in place.
+  void* state_pool;
+  // INT32 slot per batch row. A negative index produces zero output and no
+  // state write. Active rows must name distinct slots within one launch.
+  const int32_t* state_indices;
+  // BF16 output: [B,HV,V].
+  void* output;
+  float scale;
+  uint32_t reserved;
+  void* cuda_stream;
+} SparkServeGdnDecodeArgs;
+
 uint32_t sparkserve_kernel_abi_version(void);
 
 SparkServeStatus sparkserve_dense_nvfp4_validate(
@@ -127,6 +179,18 @@ SparkServeStatus sparkserve_dense_nvfp4_query(
 SparkServeStatus sparkserve_dense_nvfp4_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeDenseNvfp4Args* args);
+
+SparkServeStatus sparkserve_gdn_decode_validate(
+    const SparkServeGdnDecodePlan* plan);
+
+SparkServeStatus sparkserve_gdn_decode_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGdnDecodePlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_gdn_decode_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGdnDecodeArgs* args);
 
 #ifdef __cplusplus
 }  // extern "C"

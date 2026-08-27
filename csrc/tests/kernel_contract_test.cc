@@ -64,5 +64,27 @@ int main() {
   args.alpha = 0.0f;
   assert(sparkserve_dense_nvfp4_launch(&caps, &args).code ==
          SPARKSERVE_STATUS_INVALID_ARGUMENT);
+
+  SparkServeGdnDecodePlan gdn = {
+      sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
+      1,                                16,
+      48,                               128,
+      128,                              20,
+      SPARKSERVE_DTYPE_BF16,            SPARKSERVE_GDN_BACKEND_AUTO};
+  assert(sparkserve_gdn_decode_validate(&gdn).code == SPARKSERVE_STATUS_OK);
+  gdn.value_dim = 64;
+  assert(sparkserve_gdn_decode_validate(&gdn).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+  gdn.value_dim = 128;
+
+  SparkServeKernelInfo gdn_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_gdn_decode_query(&caps, &gdn, &gdn_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(gdn_info.backend == SPARKSERVE_GDN_BACKEND_LOCAL_CUDA);
+  assert(gdn_info.available == 0);
   return 0;
 }
