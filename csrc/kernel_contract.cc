@@ -20,6 +20,9 @@
 #ifdef SPARKSERVE_WITH_FLASHINFER_MOE_ROUTE
 #include "internal/moe_route_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_SGLANG_PLE_GATHER
+#include "internal/ple_gather_backend.h"
+#endif
 
 namespace {
 
@@ -195,6 +198,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("activation quantizer cannot serve a dense plan");
     case SPARKSERVE_BACKEND_FLASHINFER_MOE_ROUTE:
       return Invalid("MoE routing backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_PLE_GATHER:
+      return Invalid("PLE gather backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -845,6 +850,97 @@ extern "C" SparkServeStatus sparkserve_moe_route_finalize(
   return sparkserve_flashinfer_moe_route_finalize(args);
 #else
   return Unavailable("FlashInfer-derived MoE finalize kernel is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_ple_gather_validate(
+    const SparkServePleGatherPlan* plan) {
+  if (plan == nullptr) return Invalid("PLE gather plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->rows == 0 || plan->rows > 1U << 20) {
+    return Invalid("PLE gather row count is invalid");
+  }
+  if (plan->row_bytes != 160) {
+    return Unsupported("Qwen3.8 Flash-Next PLE rows must contain 160 FP8 values");
+  }
+  if (plan->input_dtype != SPARKSERVE_DTYPE_FP8_E4M3 ||
+      plan->output_dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("PLE gather requires FP8-E4M3 input and BF16 output");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_SGLANG_PLE_GATHER) {
+    return Invalid("unknown PLE gather backend");
+  }
+  if (!CanMultiply(plan->rows, plan->row_bytes) ||
+      !CanMultiply(static_cast<uint64_t>(plan->rows) * plan->row_bytes, 2)) {
+    return Invalid("PLE gather buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_ple_gather_query(
+    const SparkServeDeviceCaps* caps, const SparkServePleGatherPlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first native PLE gather is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_ple_gather_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_SGLANG_PLE_GATHER;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "sglang-qwen4-ple-fp8-bf16";
+  info->source_revision =
+      "sglang@7c66045d71f067c1c5da2b85baad3c47d9a19cb7";
+#ifdef SPARKSERVE_WITH_SGLANG_PLE_GATHER
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_ple_gather_launch(
+    const SparkServeDeviceCaps* caps, const SparkServePleGatherArgs* args) {
+  if (args == nullptr) return Invalid("PLE gather arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query_status =
+      sparkserve_ple_gather_query(caps, &args->plan, &info);
+  if (query_status.code != SPARKSERVE_STATUS_OK) return query_status;
+  if (args->coherent_base == nullptr || args->fragments == nullptr ||
+      args->output == nullptr) {
+    return Invalid("PLE gather pointers cannot be null");
+  }
+  const uint64_t compact_row_bytes =
+      static_cast<uint64_t>(args->plan.row_bytes) * 2;
+  if (args->output_row_stride_bytes < compact_row_bytes ||
+      args->output_row_stride_bytes % 2 != 0) {
+    return Invalid("PLE gather BF16 output stride is invalid");
+  }
+  const uint16_t magnitude = args->scale_bf16_bits & 0x7fffU;
+  if ((args->scale_bf16_bits & 0x8000U) != 0 || magnitude == 0 ||
+      (magnitude & 0x7f80U) == 0x7f80U) {
+    return Invalid("PLE gather BF16 scale must be finite and positive");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_PLE_GATHER
+  return sparkserve_sglang_ple_gather_cuda_launch(args);
+#else
+  return Unavailable("SGLang-derived PLE gather kernel is not linked");
 #endif
 }
 

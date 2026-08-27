@@ -102,11 +102,19 @@ native SparkServe kernel. The server returned the exact non-thinking completion
 
 ## Next kernel boundary
 
-The fixed slab, direct miss completion, and Rust lifetime barrier are complete.
-Next, the borrowed FP8 gather consumes `(offset, length)` fragments and the
-coherent device base, applying BF16 scale bits `0x3951`. Prefill will
-double-buffer chunk `n+1` I/O under chunk `n` compute, while decode submits its
-miss set immediately after the next token is known.
+The fixed slab, direct miss completion, Rust lifetime barrier, and native gather
+are complete. The gather consumes Rust-produced two-fragment descriptors and a
+coherent device base, applying checkpoint BF16 scale bits `0x3951`. A private
+fixture selects 16 real rows across page, shard, and table boundaries. All 2,560
+scaled BF16 values match the pinned SGLang oracle bit-for-bit on SM121, with a
+2.06-microsecond mean launch time over 1,000 iterations.
+
+The same 4 MiB anonymous slab has passed simultaneous CUDA host registration
+and `io_uring` fixed-buffer registration on GB10. Two real `ReadFixed`
+operations completed directly into it and produced exact bytes without an
+intermediate allocation. The next scheduling boundary is to double-buffer
+chunk `n+1` I/O under chunk `n` compute, while decode submits its miss set as
+soon as the next token establishes the required n-grams.
 
 No additional PLE quantization is part of this path. Exact FP8 bytes and the
 checkpoint scale are preserved so outputs can be compared directly with the

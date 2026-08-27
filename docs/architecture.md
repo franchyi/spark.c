@@ -82,6 +82,11 @@ from a CUDA kernel and matches their CPU byte checksums. The current GB10 driver
 does not advertise `cudaHostRegisterReadOnly`; the file backend therefore uses a
 private writable mapping only during registration and immediately restores
 `PROT_READ` with `mprotect`. Serving kernels treat that pointer as immutable.
+The 4 MiB PLE slab has also passed simultaneous CUDA host registration and
+`io_uring` fixed-buffer registration: two real `ReadFixed` operations complete
+directly into offsets subsequently addressable through the matching CUDA device
+pointer. This is the concrete one-copy boundary; no CPU-to-GPU staging buffer is
+introduced.
 
 ### Transactional expert residency
 
@@ -116,6 +121,13 @@ reads into the same slab. A returned batch borrows the cache, so CLOCK cannot
 recycle a slot until the CUDA gather releases it. The consuming kernel applies
 the per-table scale and accumulates FP8 values into the BF16 stream without ever
 constructing a BF16 copy of the full table.
+
+Rust writes two-fragment descriptors into preallocated scratch and launches a
+small raw-CUDA adapter matching SGLang PR 36497's FP8-E4M3-to-BF16 arithmetic.
+Against 16 real checkpoint rows spanning shard, page, and table boundaries, its
+2,560 scaled BF16 values match SGLang bit-for-bit on SM121. The measured 16-row
+launch mean is 2.06 microseconds. The adapter allocates nothing and makes no
+residency decisions; those remain in the Rust scheduler.
 
 The checkpoint stores 128 physical tensors shaped `[2,500,012, 160]`; one token
 selects 16 rows, for 2,560 useful bytes. Existing GB10 measurements establish
@@ -225,8 +237,10 @@ configured safety reserve.
 - The exact-FP8 safetensors index and fixed-address hybrid reader are
   implemented; registered `io_uring` handles decode misses and parallel
   positional reads handle prefill misses without an intermediate page copy.
-- Connect the borrowed FP8-to-BF16 gather arithmetic to the CUDA-visible row
-  fragments, then double-buffer two 4 MiB windows to overlap I/O and compute.
+- The pinned SGLang FP8-to-BF16 arithmetic is connected to CUDA-visible
+  two-fragment rows and passes bit-exact real-checkpoint parity on SM121.
+- Double-buffer two 4 MiB windows to overlap I/O and compute, keeping descriptor
+  and output addresses fixed for graph replay.
 - Keep the 72.498 GiB base checkpoint resident, add the 4.856 GiB MTP weights only
   when speculation is enabled, and keep PLE staging at two 4 MiB windows. Never construct the
   full BF16 PLE tensor; the 0.836 GiB vision tower is excluded in text mode.

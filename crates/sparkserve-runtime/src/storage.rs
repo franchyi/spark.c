@@ -333,14 +333,12 @@ impl PageSource for FilePageSource {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FixedPageSlice {
     pub buffer_offset: usize,
     pub bytes: usize,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FixedPleRow {
     pub first: FixedPageSlice,
@@ -405,6 +403,26 @@ impl FixedPleBatch<'_, '_> {
     /// constructed from `fabric_api.h` rather than ordinary host memory.
     pub fn device_base(&self) -> Option<NonNull<std::ffi::c_void>> {
         self.cache.device_base
+    }
+
+    /// Fill scheduler-owned device-upload scratch without allocating in the
+    /// decode path. The returned descriptors use offsets relative to
+    /// `device_base()` and are ABI-ready for the PLE gather kernel.
+    pub fn write_kernel_fragments<'output>(
+        &self,
+        output: &'output mut [crate::ffi::PleRowFragment],
+    ) -> Result<&'output [crate::ffi::PleRowFragment], StoreError> {
+        if output.len() < self.rows.len() {
+            return Err(StoreError::FragmentBufferTooSmall {
+                needed: self.rows.len(),
+                available: output.len(),
+            });
+        }
+        for (destination, row) in output.iter_mut().zip(&self.rows) {
+            *destination = crate::ffi::PleRowFragment::from_fixed(*row, self.row_bytes)
+                .map_err(|_| StoreError::InvalidPageSource)?;
+        }
+        Ok(&output[..self.rows.len()])
     }
 
     /// Correctness helper. Production passes `rows()` and the coherent slab's
@@ -1066,6 +1084,7 @@ pub enum StoreError {
     PageOutOfRange(PageKey),
     SourceTruncated(String),
     BatchExceedsCache { pages: usize, capacity: usize },
+    FragmentBufferTooSmall { needed: usize, available: usize },
 }
 
 impl fmt::Display for StoreError {
@@ -1086,6 +1105,10 @@ impl fmt::Display for StoreError {
             Self::BatchExceedsCache { pages, capacity } => write!(
                 formatter,
                 "PLE batch needs {pages} pages but cache holds {capacity}; reduce the prefill chunk"
+            ),
+            Self::FragmentBufferTooSmall { needed, available } => write!(
+                formatter,
+                "PLE gather needs {needed} fragment descriptors but scratch holds {available}"
             ),
         }
     }
@@ -1493,6 +1516,18 @@ mod tests {
             assert_eq!(batch.rows()[0].first.bytes, 80);
             assert_eq!(batch.rows()[0].second.expect("cross-page").bytes, 80);
             assert_eq!(batch.device_base(), Some(expected_device_base));
+            let mut kernel_fragments = [crate::ffi::PleRowFragment {
+                first_offset_bytes: 0,
+                second_offset_bytes: 0,
+                first_bytes: 0,
+                second_bytes: 0,
+            }; 3];
+            let written = batch
+                .write_kernel_fragments(&mut kernel_fragments)
+                .expect("kernel fragments");
+            assert_eq!(written.len(), 3);
+            assert_eq!(written[0].first_bytes, 80);
+            assert_eq!(written[0].second_bytes, 80);
             let mut expected = Vec::new();
             expected.extend_from_slice(&source[4016..4176]);
             expected.extend_from_slice(&source[4176..4336]);

@@ -438,6 +438,82 @@ pub struct MoeRouteArgs {
     pub cuda_stream: *mut c_void,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PleRowFragment {
+    pub first_offset_bytes: u64,
+    pub second_offset_bytes: u64,
+    pub first_bytes: u32,
+    pub second_bytes: u32,
+}
+
+impl PleRowFragment {
+    pub fn from_fixed(
+        row: crate::storage::FixedPleRow,
+        row_bytes: usize,
+    ) -> Result<Self, &'static str> {
+        let second_bytes = row.second.map_or(0, |second| second.bytes);
+        if row.first.bytes.checked_add(second_bytes) != Some(row_bytes) {
+            return Err("PLE fragments do not cover exactly one row");
+        }
+        Ok(Self {
+            first_offset_bytes: u64::try_from(row.first.buffer_offset)
+                .map_err(|_| "PLE first offset exceeds u64")?,
+            second_offset_bytes: row.second.map_or(Ok(0), |second| {
+                u64::try_from(second.buffer_offset).map_err(|_| "PLE second offset exceeds u64")
+            })?,
+            first_bytes: u32::try_from(row.first.bytes)
+                .map_err(|_| "PLE first fragment exceeds u32")?,
+            second_bytes: u32::try_from(second_bytes)
+                .map_err(|_| "PLE second fragment exceeds u32")?,
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PleGatherPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub rows: u32,
+    pub row_bytes: u32,
+    pub input_dtype: u32,
+    pub output_dtype: u32,
+    pub requested_backend: u32,
+    pub reserved: u32,
+}
+
+impl PleGatherPlan {
+    pub fn qwen38_flash(rows: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            rows,
+            row_bytes: 160,
+            input_dtype: DataType::Fp8E4m3 as u32,
+            output_dtype: DataType::BFloat16 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangPleGather as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PleGatherArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: PleGatherPlan,
+    pub coherent_base: *const c_void,
+    pub fragments: *const PleRowFragment,
+    pub output: *mut c_void,
+    pub output_row_stride_bytes: u64,
+    pub scale_bf16_bits: u16,
+    pub reserved16: u16,
+    pub reserved32: u32,
+    pub cuda_stream: *mut c_void,
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GdnBackend {
@@ -603,6 +679,16 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const MoeRouteArgs,
     ) -> Status;
+    pub fn sparkserve_ple_gather_validate(plan: *const PleGatherPlan) -> Status;
+    pub fn sparkserve_ple_gather_query(
+        caps: *const DeviceCaps,
+        plan: *const PleGatherPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_ple_gather_launch(
+        caps: *const DeviceCaps,
+        args: *const PleGatherArgs,
+    ) -> Status;
     pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn sparkserve_gdn_decode_query(
         caps: *const DeviceCaps,
@@ -643,6 +729,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<SegmentedNvfp4QuantizeArgs>(), 152);
         assert_eq!(std::mem::size_of::<MoeRoutePlan>(), 40);
         assert_eq!(std::mem::size_of::<MoeRouteArgs>(), 128);
+        assert_eq!(std::mem::size_of::<PleRowFragment>(), 24);
+        assert_eq!(std::mem::size_of::<PleGatherPlan>(), 32);
+        assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
@@ -668,6 +757,38 @@ mod tests {
         assert_eq!(plan.value_dim, 128);
         assert_eq!(plan.state_dtype, DataType::BFloat16 as u32);
         assert_eq!(plan.requested_backend, GdnBackend::Auto as u32);
+    }
+
+    #[test]
+    fn qwen_ple_plan_and_fragment_preserve_fixed_slab_offsets() {
+        let plan = PleGatherPlan::qwen38_flash(16);
+        assert_eq!(plan.rows, 16);
+        assert_eq!(plan.row_bytes, 160);
+        assert_eq!(plan.input_dtype, DataType::Fp8E4m3 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangPleGather as u32
+        );
+        let row = crate::storage::FixedPleRow {
+            first: crate::storage::FixedPageSlice {
+                buffer_offset: 4016,
+                bytes: 80,
+            },
+            second: Some(crate::storage::FixedPageSlice {
+                buffer_offset: 8192,
+                bytes: 80,
+            }),
+        };
+        assert_eq!(
+            PleRowFragment::from_fixed(row, 160).expect("fragment"),
+            PleRowFragment {
+                first_offset_bytes: 4016,
+                second_offset_bytes: 8192,
+                first_bytes: 80,
+                second_bytes: 80,
+            }
+        );
+        assert!(PleRowFragment::from_fixed(row, 159).is_err());
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub enum KernelBackend {
     FlashInferCuteSiluNvfp4 = 4,
     FlashInferCuteNvfp4Quantize = 5,
     FlashInferMoeRoute = 6,
+    SglangPleGather = 7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

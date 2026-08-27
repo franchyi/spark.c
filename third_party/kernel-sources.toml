@@ -72,6 +72,16 @@ entrypoint = "rust/sglang-storage/src/io_uring_reader.rs"
 notes = "Persistent bounded io_uring structure adapted without PyO3. SparkServe registers one caller-owned coherent slab and reads directly into disjoint CUDA-visible offsets instead of returning copied page vectors."
 
 [[source]]
+id = "sglang-qwen4-ple-gather"
+repository = "https://github.com/sgl-project/sglang"
+revision = "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+license = "Apache-2.0"
+mode = "semantic-oracle"
+status = "linked-raw-cuda-sm121-real-row-bit-parity-passed"
+entrypoint = "python/sglang/srt/models/qwen4_exp.py"
+notes = "Pinned-host Triton gather defines FP8-E4M3 load, BF16 conversion, and separate BF16 weight-scale multiplication. SparkServe consumes Rust-owned fragmented fixed-slab rows behind a raw CUDA ABI."
+
+[[source]]
 id = "ds4-minimal-runtime-pattern"
 repository = "https://github.com/antirez/ds4"
 revision = "c1d4597a80e300b803dc642519718f2c999589da"

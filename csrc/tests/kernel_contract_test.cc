@@ -278,6 +278,45 @@ int main() {
   assert(sparkserve_moe_route_validate(&route).code ==
          SPARKSERVE_STATUS_INVALID_ARGUMENT);
 
+  SparkServePleGatherPlan ple = {
+      sizeof(SparkServePleGatherPlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      16,
+      160,
+      SPARKSERVE_DTYPE_FP8_E4M3,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_BACKEND_AUTO,
+      0,
+  };
+  assert(sparkserve_ple_gather_validate(&ple).code == SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo ple_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_ple_gather_query(&caps, &ple, &ple_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(ple_info.backend == SPARKSERVE_BACKEND_SGLANG_PLE_GATHER);
+  assert(ple_info.available == 0);
+  SparkServePleRowFragment ple_fragment = {0, 0, 160, 0};
+  SparkServePleGatherArgs ple_args = {};
+  ple_args.struct_size = sizeof(ple_args);
+  ple_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  ple_args.plan = ple;
+  ple_args.coherent_base = &packed;
+  ple_args.fragments = &ple_fragment;
+  ple_args.output = &output;
+  ple_args.output_row_stride_bytes = 320;
+  ple_args.scale_bf16_bits = 0x3951;
+  assert(sparkserve_ple_gather_launch(&caps, &ple_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  ple_args.scale_bf16_bits = 0x7f80;
+  assert(sparkserve_ple_gather_launch(&caps, &ple_args).code ==
+         SPARKSERVE_STATUS_INVALID_ARGUMENT);
+  ple.row_bytes = 256;
+  assert(sparkserve_ple_gather_validate(&ple).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,

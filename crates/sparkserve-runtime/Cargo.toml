@@ -9,6 +9,14 @@ description = "Minimal Rust control plane for the SparkServe GB10 inference runt
 name = "sparkserve-runtime"
 path = "src/main.rs"
 
+[[example]]
+name = "coherent_uring_smoke"
+path = "examples/coherent_uring_smoke.rs"
+required-features = ["native-fabric-smoke"]
+
+[features]
+native-fabric-smoke = []
+
 [dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 

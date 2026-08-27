@@ -88,3 +88,29 @@ def test_sglang_storage_donor_is_pinned_and_hashed() -> None:
         "d359ebd45c1624e480cb04d9001b424534345154670ab3121135c33c2f8b70e9  "
         "rust/sglang-storage/Cargo.toml",
     ]
+
+
+def test_sglang_ple_oracle_is_pinned_and_hashed() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qwen4-ple-gather"
+    )
+    assert donor["revision"] == "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["mode"] == "semantic-oracle"
+    assert donor["status"] == (
+        "linked-raw-cuda-sm121-real-row-bit-parity-passed"
+    )
+    assert donor["entrypoint"] == "python/sglang/srt/models/qwen4_exp.py"
+
+    vendor = ROOT / "third_party" / "sglang-qwen4-ple"
+    assert (vendor / "VENDOR.md").is_file()
+    hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
+    assert hashes == [
+        "f406977eb2373937393241f453477867f7dc943bd4839216db8fe66fa9f921d8  "
+        "python/sglang/srt/models/qwen4_exp.py"
+    ]

@@ -74,7 +74,9 @@ The real Qwen fixture is byte-exact through route dispatch, K=2560 quantization,
 both grouped GEMMs, fused activation quantization, and weighted finalize. The
 Rust control plane also has transactional fixed-slot expert residency, and GB10
 has passed CUDA reads from both the registered cache slab and a protected
-file-backed mapping. This document remains a completion checklist: the joined
-QSA/full-token graph, tokenizer/server, production async I/O, GGUF, GLM graph,
-and end-to-end continuation gates are not implied to be finished by isolated
-kernel and fabric tests.
+file-backed mapping. PLE now adds bit-exact scaled-BF16 gather parity on 16 real
+boundary rows plus simultaneous CUDA and `io_uring` registration of the same
+4 MiB physical slab. This document remains a completion checklist: PLE
+double-buffer integration, the joined QSA/full-token graph, tokenizer/server,
+GGUF, GLM graph, and end-to-end continuation gates are not implied to be
+finished by isolated kernel and fabric tests.

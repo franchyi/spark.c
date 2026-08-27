@@ -49,6 +49,8 @@ typedef enum SparkServeKernelBackend {
   // Row gather and weighted finalize adapted from FlashInfer's fused-MoE
   // prologue/epilogue. Rust owns the maps and scheduling policy.
   SPARKSERVE_BACKEND_FLASHINFER_MOE_ROUTE = 6,
+  // FP8 PLE row gather matching SGLang's Qwen4 pinned-host Triton arithmetic.
+  SPARKSERVE_BACKEND_SGLANG_PLE_GATHER = 7,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -314,6 +316,44 @@ typedef struct SparkServeMoeRouteArgs {
   void* cuda_stream;
 } SparkServeMoeRouteArgs;
 
+// One logical FP8 PLE row may cross two fixed cache pages. Rust uploads these
+// compact descriptors into preallocated device scratch; both offsets are
+// relative to the stable coherent-slab device base.
+typedef struct SparkServePleRowFragment {
+  uint64_t first_offset_bytes;
+  uint64_t second_offset_bytes;
+  uint32_t first_bytes;
+  uint32_t second_bytes;
+} SparkServePleRowFragment;
+
+typedef struct SparkServePleGatherPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t rows;
+  uint32_t row_bytes;
+  uint32_t input_dtype;
+  uint32_t output_dtype;
+  uint32_t requested_backend;
+  uint32_t reserved;
+} SparkServePleGatherPlan;
+
+typedef struct SparkServePleGatherArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServePleGatherPlan plan;
+  const void* coherent_base;
+  // Device array [rows]. Every descriptor must cover exactly row_bytes.
+  const SparkServePleRowFragment* fragments;
+  // BF16 [rows,row_bytes].
+  void* output;
+  uint64_t output_row_stride_bytes;
+  // Raw BF16 bits. Qwen3.8 Flash-Next uses 0x3951.
+  uint16_t scale_bf16_bits;
+  uint16_t reserved16;
+  uint32_t reserved32;
+  void* cuda_stream;
+} SparkServePleGatherArgs;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -445,6 +485,18 @@ SparkServeStatus sparkserve_moe_route_dispatch(
 SparkServeStatus sparkserve_moe_route_finalize(
     const SparkServeDeviceCaps* caps,
     const SparkServeMoeRouteArgs* args);
+
+SparkServeStatus sparkserve_ple_gather_validate(
+    const SparkServePleGatherPlan* plan);
+
+SparkServeStatus sparkserve_ple_gather_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServePleGatherPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_ple_gather_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServePleGatherArgs* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);

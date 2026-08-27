@@ -22,7 +22,7 @@ is tested first in the upstream layout.
 | --- | --- | --- |
 | Live Qwen3.8 27B SGLang image | SGLang build `c4271c3fe1262fc2adbd162c33b25de5255251c5`; package `0.0.0.dev0+qwen38.27b.g561c8f3`; FlashInfer `0.6.18` at `906181e3f4cf4bcc81835fb480db4011bbd80b62` | Dense NVFP4 and hybrid GDN execution oracle on this GB10 |
 | Flash-Next Spark image inspected for kernel reuse | SGLang source `d91c3682b0b429e4c70df63cd57f819588ce29b0`; FlashInfer `0.6.17` source pin `906181e3f4cf4bcc81835fb480db4011bbd80b62` | Exact selected CUTLASS MoE path plus Apache-2.0 routing/finalize donor |
-| SGLang Qwen3.8 Flash-Next support | PR `sgl-project/sglang#36497`, initial implementation `73a255206f916366c8d26d4022f82ddfb0ab558d`; current integration helper `02d38b77db92699e5d4f1a78226bf711e9cc762a` | Qwen4-exp graph, PLE, QSA, GDN, mHC, MTP, and memory-state oracle |
+| SGLang Qwen3.8 Flash-Next support | PR `sgl-project/sglang#36497`, current head and PLE pin `7c66045d71f067c1c5da2b85baad3c47d9a19cb7` | Qwen4-exp graph, PLE, QSA, GDN, mHC, MTP, and memory-state oracle |
 | DwarfStar / `ds4.c` | `c1d4597a80e300b803dc642519718f2c999589da` | Minimal-runtime design and GGUF validation oracle |
 | llama.cpp kernels vendored by `ds4.c` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a` | Q8/Q2/IQ MMQ implementation donor |
 | llama.cpp GLM5Next support | Draft PR `ggml-org/llama.cpp#27754`; branch `unslothai/llama.cpp:glm5next/upstream`; revision deliberately `UNFROZEN` | Temporary GLM-5.3-Flash semantic oracle only; current CUDA and quantized verification is incomplete |
@@ -127,7 +127,7 @@ retaining a switch back to the legacy dispatch.
 | GDN projection and recurrence | SGLang Qwen4-exp + FlashInfer GDN | local raw CUDA K=V=128 BF16-state decode; later fuse QKV extraction | correctness kernel implemented; optimize behind the same ABI | CPU-reference parity now; real SGLang tensor/state and multi-step parity next |
 | QSA indexer and sparse attention | SGLang QSA backend | SGLang JIT CUDA indexer plus proven SM121 sparse-decode kernel | vendor small CUDA pieces; wrap external attention kernel | exact selected indices/masks/cache writes; dense-attention comparison on small cases |
 | Hyperconnection mix/combine | SGLang Qwen4-exp | small SGLang CUDA/Triton kernels | port or vendor after license audit | per-stream output and residual-state parity |
-| PLE lookup | SGLang Qwen4-exp + checkpoint | borrow SGLang/FlashInfer gather-scale arithmetic; Rust supplies mmap/NVMe row residency | pinned kernel adapter plus original one-copy storage policy | exact row ids and scale; BF16 result against SGLang for cold/hot rows |
+| PLE lookup | SGLang Qwen4-exp at `7c66045` + checkpoint | raw CUDA adapter matching the SGLang FP8-E4M3 load, BF16 conversion, and BF16 scaling; Rust supplies NVMe row residency | linked framework-free adapter plus original one-copy storage policy | passed: 16 real boundary rows, 2,560/2,560 scaled BF16 values bit-exact; 2.06 us mean on SM121 |
 | RMSNorm/RoPE/top-k/sampling | SGLang, FlashInfer, ds4 | smallest fastest proven candidate | benchmark and adopt independently | exact discrete ids; numerical parity for continuous outputs |
 | MTP/speculative commit | SGLang Qwen4-exp | local scheduler using shared forward kernels | reimplement state machine | target-only greedy identity; verifier logit and committed-state parity |
 | GGUF Q8/IQ3/Q3 | llama.cpp and ds4 | selected `ggml-cuda` MMQ files | ds4-style pinned vendor + raw C shim | per-format dense/MoE parity, llama continuation fixtures, performance within target |
@@ -201,10 +201,10 @@ kernels—without importing either framework's scheduler, allocator, or graph.
 1. Connect the router projection, borrowed top-k, and shared expert to the now
    byte-exact routed expert pipeline; then capture full-layer logits and greedy
    continuations from the live SGLang service.
-2. Connect the borrowed Flash-Next gather arithmetic to the completed
-   Rust-owned fixed-slab NVMe residency policy; keep routing/top-k separately
-   tested.
-3. Complete QSA/GDN/mHC model-state parity and join the full native token graph.
+2. Double-buffer the completed PLE gather and fixed-slab reader, then connect its
+   fixed descriptors to the token graph; keep routing/top-k separately tested.
+3. Borrow the smallest pinned QSA attention/indexer primitives, complete
+   QSA/GDN/mHC model-state parity, and join the full native token graph.
 4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
 5. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
 6. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed
