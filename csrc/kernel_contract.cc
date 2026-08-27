@@ -29,6 +29,9 @@
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_INDEX_PREP
 #include "internal/qsa_index_prep_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_KV_PACK
+#include "internal/qsa_kv_pack_backend.h"
+#endif
 
 namespace {
 
@@ -210,6 +213,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("QSA top-k backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_QSA_INDEX_PREP:
       return Invalid("QSA index-prep backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_QSA_KV_PACK:
+      return Invalid("QSA K/V-pack backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1134,6 +1139,105 @@ extern "C" SparkServeStatus sparkserve_qsa_index_prep_launch(
   return sparkserve_sglang_qsa_index_prep_cuda_launch(args);
 #else
   return Unavailable("SGLang QSA index-prep donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_kv_pack_validate(
+    const SparkServeQsaKvPackPlan* plan) {
+  if (plan == nullptr) return Invalid("QSA K/V-pack plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->batch_size == 0 || plan->batch_size > 1U << 16 ||
+      plan->slot_capacity == 0 || plan->request_capacity == 0 ||
+      plan->request_stride == 0) {
+    return Invalid("QSA K/V-pack capacities must be non-zero and bounded");
+  }
+  if (plan->topk != 2051 || plan->packed_row_stride != 2112 ||
+      plan->num_kv_heads != 2 || plan->head_dim != 256) {
+    return Unsupported("Qwen3.8 Flash-Next QSA K/V-pack shape is unsupported");
+  }
+  if (plan->dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("QSA K/V pack requires BF16 state");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_SGLANG_QSA_KV_PACK) {
+    return Invalid("unknown QSA K/V-pack backend");
+  }
+  const uint64_t state_row =
+      static_cast<uint64_t>(plan->num_kv_heads) * plan->head_dim;
+  const uint64_t packed_rows =
+      static_cast<uint64_t>(plan->batch_size) * plan->packed_row_stride;
+  if (!CanMultiply(plan->slot_capacity, state_row) ||
+      !CanMultiply(static_cast<uint64_t>(plan->slot_capacity) * state_row,
+                   sizeof(uint16_t)) ||
+      !CanMultiply(plan->request_capacity, plan->request_stride) ||
+      !CanMultiply(static_cast<uint64_t>(plan->request_capacity) *
+                       plan->request_stride,
+                   sizeof(int32_t)) ||
+      !CanMultiply(plan->batch_size, plan->topk) ||
+      !CanMultiply(static_cast<uint64_t>(plan->batch_size) * plan->topk,
+                   sizeof(int32_t)) ||
+      !CanMultiply(packed_rows, state_row) ||
+      !CanMultiply(packed_rows * state_row, sizeof(uint16_t))) {
+    return Invalid("QSA K/V-pack buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_kv_pack_query(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaKvPackPlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first QSA K/V-pack donor is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_qsa_kv_pack_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_SGLANG_QSA_KV_PACK;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "sglang-qsa-kv-pack-bf16-h256";
+  info->source_revision =
+      "sglang@7c66045d71f067c1c5da2b85baad3c47d9a19cb7";
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_KV_PACK
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_kv_pack_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaKvPackArgs* args) {
+  if (args == nullptr) return Invalid("QSA K/V-pack arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query_status =
+      sparkserve_qsa_kv_pack_query(caps, &args->plan, &info);
+  if (query_status.code != SPARKSERVE_STATUS_OK) return query_status;
+  if (args->key_state == nullptr || args->value_state == nullptr ||
+      args->req_to_token == nullptr || args->request_indices == nullptr ||
+      args->logical_indices == nullptr ||
+      args->sequence_lengths == nullptr || args->valid_counts == nullptr ||
+      args->packed_key == nullptr || args->packed_value == nullptr) {
+    return Invalid("QSA K/V-pack pointers cannot be null");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_KV_PACK
+  return sparkserve_sglang_qsa_kv_pack_cuda_launch(args);
+#else
+  return Unavailable("SGLang QSA K/V-pack donor is not linked");
 #endif
 }
 

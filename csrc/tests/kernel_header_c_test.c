@@ -28,6 +28,10 @@ _Static_assert(sizeof(SparkServeMoeRoutePlan) == 40u,
                "C MoE route plan layout drifted");
 _Static_assert(sizeof(SparkServeMoeRouteArgs) == 128u,
                "C MoE route arguments layout drifted");
+_Static_assert(sizeof(SparkServeQsaKvPackPlan) == 48u,
+               "C QSA K/V-pack plan layout drifted");
+_Static_assert(sizeof(SparkServeQsaKvPackArgs) == 136u,
+               "C QSA K/V-pack arguments layout drifted");
 _Static_assert(sizeof(SparkServeCoherentRegionConfig) == 48u,
                "C coherent region config layout drifted");
 _Static_assert(sizeof(SparkServeCoherentRegionView) == 80u,

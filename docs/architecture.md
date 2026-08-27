@@ -170,10 +170,14 @@ the complete selected index sets for four ragged 65,536-column rows and measures
 26.77 microseconds on SM121. The fused Q/K Gemma-RMSNorm, NeoX-RoPE, raw-state,
 and four-token compressed-key donor is also adapted: all Q, raw-K, RoPE-state,
 and compressed-K bits match SGLang for 37 rows and nine groups, at 8.21
-microseconds. Next, selected KV is packed into fixed scratch and sparse decode
-wraps the FlashInfer TRT-LLM-gen kernel that SGLang itself selects on SM121.
-Rust retains ownership of logical-to-physical KV maps, valid lengths, fixed
-scratch, and graph replay.
+microseconds. The borrowed valid-count and selected-K/V compaction path is also
+complete: four BF16 rows, including their fixed page padding, match every bit
+and take 46.33 microseconds on SM121. Each graph row reserves 33 64-token pages
+(2112 positions), and Rust allocates the packed K/V, valid counts, immutable
+block table, output, and shared 128-MiB attention workspace at fixed addresses.
+Sparse decode next wraps the FlashInfer TRT-LLM-gen kernel that SGLang itself
+selects on SM121. Rust retains ownership of logical-to-physical KV maps,
+residency, graph buckets, and replay.
 
 ### GGUF
 

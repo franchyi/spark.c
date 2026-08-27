@@ -172,3 +172,29 @@ def test_sglang_qsa_index_prep_donor_is_pinned_and_hashed() -> None:
         "2e413f99a9c5e475f98529691f1dddf7b59061ff234e107b1894e96e956a54cc  "
         "python/sglang/kernels/ops/attention/qsa_indexer.py",
     ]
+
+
+def test_sglang_qsa_kv_pack_donor_is_pinned_and_hashed() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qsa-kv-pack"
+    )
+    assert donor["revision"] == "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["mode"] == "source-adaptation"
+    assert donor["status"].startswith("linked-raw-cuda-sm121-")
+    assert donor["entrypoint"] == (
+        "python/sglang/srt/layers/attention/qsa/sparse_attn.py"
+    )
+
+    vendor = ROOT / "third_party" / "sglang-qsa-kv-pack"
+    assert (vendor / "VENDOR.md").is_file()
+    hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
+    assert hashes == [
+        "f3801cc37453278e884873a821350def23c58453eb91c56f2c96d8f62a3709f5  "
+        "python/sglang/srt/layers/attention/qsa/sparse_attn.py"
+    ]

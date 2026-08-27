@@ -629,6 +629,65 @@ pub struct QsaIndexPrepArgs {
     pub cuda_stream: *mut c_void,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QsaKvPackPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub batch_size: u32,
+    pub slot_capacity: u32,
+    pub request_capacity: u32,
+    pub request_stride: u32,
+    pub topk: u32,
+    pub packed_row_stride: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub dtype: u32,
+    pub requested_backend: u32,
+}
+
+impl QsaKvPackPlan {
+    pub fn qwen38_flash(
+        batch_size: u32,
+        slot_capacity: u32,
+        request_capacity: u32,
+        request_stride: u32,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            batch_size,
+            slot_capacity,
+            request_capacity,
+            request_stride,
+            topk: 2051,
+            packed_row_stride: 2112,
+            num_kv_heads: 2,
+            head_dim: 256,
+            dtype: DataType::BFloat16 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangQsaKvPack as u32,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QsaKvPackArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: QsaKvPackPlan,
+    pub key_state: *const c_void,
+    pub value_state: *const c_void,
+    pub req_to_token: *const i32,
+    pub request_indices: *const i32,
+    pub logical_indices: *const i32,
+    pub sequence_lengths: *const i32,
+    pub valid_counts: *mut i32,
+    pub packed_key: *mut c_void,
+    pub packed_value: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GdnBackend {
@@ -821,6 +880,16 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const QsaIndexPrepArgs,
     ) -> Status;
+    pub fn sparkserve_qsa_kv_pack_validate(plan: *const QsaKvPackPlan) -> Status;
+    pub fn sparkserve_qsa_kv_pack_query(
+        caps: *const DeviceCaps,
+        plan: *const QsaKvPackPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_qsa_kv_pack_launch(
+        caps: *const DeviceCaps,
+        args: *const QsaKvPackArgs,
+    ) -> Status;
     pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn sparkserve_gdn_decode_query(
         caps: *const DeviceCaps,
@@ -868,6 +937,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<QsaTopkArgs>(), 88);
         assert_eq!(std::mem::size_of::<QsaIndexPrepPlan>(), 56);
         assert_eq!(std::mem::size_of::<QsaIndexPrepArgs>(), 200);
+        assert_eq!(std::mem::size_of::<QsaKvPackPlan>(), 48);
+        assert_eq!(std::mem::size_of::<QsaKvPackArgs>(), 136);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
@@ -947,6 +1018,20 @@ mod tests {
         assert_eq!(
             plan.requested_backend,
             KernelBackend::SglangQsaIndexPrep as u32
+        );
+    }
+
+    #[test]
+    fn qwen_qsa_kv_pack_plan_freezes_trtllm_page_geometry() {
+        let plan = QsaKvPackPlan::qwen38_flash(8, 262_144, 64, 262_144);
+        assert_eq!(plan.topk, 2051);
+        assert_eq!(plan.packed_row_stride, 2112);
+        assert_eq!(plan.num_kv_heads, 2);
+        assert_eq!(plan.head_dim, 256);
+        assert_eq!(plan.dtype, DataType::BFloat16 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangQsaKvPack as u32
         );
     }
 

@@ -5,6 +5,7 @@ pub mod kernel;
 pub mod model;
 pub mod model_lock;
 pub mod ple_pipeline;
+pub mod qsa;
 pub mod routing;
 pub mod scheduler;
 pub mod storage;

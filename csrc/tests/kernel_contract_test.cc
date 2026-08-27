@@ -411,6 +411,50 @@ int main() {
   assert(sparkserve_qsa_index_prep_validate(&qsa_prep).code ==
          SPARKSERVE_STATUS_UNSUPPORTED);
 
+  SparkServeQsaKvPackPlan qsa_pack = {
+      sizeof(SparkServeQsaKvPackPlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      4,
+      8192,
+      8,
+      4096,
+      2051,
+      2112,
+      2,
+      256,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_BACKEND_AUTO,
+  };
+  assert(sparkserve_qsa_kv_pack_validate(&qsa_pack).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo qsa_pack_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_qsa_kv_pack_query(&caps, &qsa_pack, &qsa_pack_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(qsa_pack_info.backend == SPARKSERVE_BACKEND_SGLANG_QSA_KV_PACK);
+  assert(qsa_pack_info.available == 0);
+  SparkServeQsaKvPackArgs qsa_pack_args = {};
+  qsa_pack_args.struct_size = sizeof(qsa_pack_args);
+  qsa_pack_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  qsa_pack_args.plan = qsa_pack;
+  qsa_pack_args.key_state = &output;
+  qsa_pack_args.value_state = &output;
+  qsa_pack_args.req_to_token = &qsa_start;
+  qsa_pack_args.request_indices = &qsa_start;
+  qsa_pack_args.logical_indices = &qsa_start;
+  qsa_pack_args.sequence_lengths = &qsa_length;
+  qsa_pack_args.valid_counts = &qsa_index;
+  qsa_pack_args.packed_key = &output;
+  qsa_pack_args.packed_value = &output;
+  assert(sparkserve_qsa_kv_pack_launch(&caps, &qsa_pack_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  qsa_pack.packed_row_stride = 2051;
+  assert(sparkserve_qsa_kv_pack_validate(&qsa_pack).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,

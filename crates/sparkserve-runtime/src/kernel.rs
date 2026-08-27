@@ -38,6 +38,7 @@ pub enum KernelBackend {
     SglangPleGather = 7,
     SglangQsaTopk = 8,
     SglangQsaIndexPrep = 9,
+    SglangQsaKvPack = 10,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

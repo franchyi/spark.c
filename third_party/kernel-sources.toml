@@ -102,6 +102,16 @@ entrypoint = "python/sglang/kernels/jit/csrc/attention/qsa_indexer.cuh"
 notes = "Locked BF16 H=128 Qwen specialization of SGLang's fused Q/K Gemma RMSNorm, NeoX RoPE, raw-key state store, four-token FP32 mean, and compressed-key store. All output/state bits match the original JIT fixture; Rust owns locations and persistent pools."
 
 [[source]]
+id = "sglang-qsa-kv-pack"
+repository = "https://github.com/sgl-project/sglang"
+revision = "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-bit-parity-passed"
+entrypoint = "python/sglang/srt/layers/attention/qsa/sparse_attn.py"
+notes = "Locked BF16 Qwen selected-K/V pack: valid-count plus two-head, H=256 compaction into 33 fixed 64-token pages. Every output bit matches the SGLang fixture and four rows take 46.33 us on GB10. Triton and framework allocation are removed; Rust owns page tables, scratch addresses, graph buckets, and attention workspace."
+
+[[source]]
 id = "ds4-minimal-runtime-pattern"
 repository = "https://github.com/antirez/ds4"
 revision = "c1d4597a80e300b803dc642519718f2c999589da"

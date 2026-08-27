@@ -80,8 +80,10 @@ boundary rows plus simultaneous CUDA and `io_uring` registration of the same
 address and prevents refill before compute completion. QSA now has its first
 borrowed primitive: SGLang's 512-block radix selector matches every selected
 index in the 65,536-column ragged fixture on SM121. Its fused Q/K preparation
-also matches Q output and all raw/compressed key and RoPE state bits. This
-document remains a completion checklist: storage-thread/CUDA-event overlap
-integration, selected-KV packing and sparse attention, the joined full-token
-graph, tokenizer/server, GGUF, GLM graph, and end-to-end continuation gates are
-not implied to be finished by isolated kernel and fabric tests.
+also matches Q output and all raw/compressed key and RoPE state bits. The
+selected-K/V adapter now matches SGLang's valid counts and all packed BF16 bits;
+Rust fixes its 64-token page table, scratch addresses, graph buckets, and
+128-MiB downstream workspace. This document remains a completion checklist:
+storage-thread/CUDA-event overlap integration, sparse attention, the joined
+full-token graph, tokenizer/server, GGUF, GLM graph, and end-to-end continuation
+gates are not implied to be finished by isolated kernel and fabric tests.

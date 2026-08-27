@@ -56,6 +56,9 @@ typedef enum SparkServeKernelBackend {
   SPARKSERVE_BACKEND_SGLANG_QSA_TOPK = 8,
   // Fused QSA Q/K norm, RoPE, state-store, and compressed-K preparation.
   SPARKSERVE_BACKEND_SGLANG_QSA_INDEX_PREP = 9,
+  // QSA valid-count and selected-K/V compaction adapted from SGLang's Triton
+  // sparse-attention path. Rust owns the page-aligned output layout.
+  SPARKSERVE_BACKEND_SGLANG_QSA_KV_PACK = 10,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -435,6 +438,48 @@ typedef struct SparkServeQsaIndexPrepArgs {
   void* cuda_stream;
 } SparkServeQsaIndexPrepArgs;
 
+typedef struct SparkServeQsaKvPackPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t batch_size;
+  uint32_t slot_capacity;
+  uint32_t request_capacity;
+  // INT32 elements between rows of req_to_token.
+  uint32_t request_stride;
+  // Qwen's final QSA selection width: 2048 sparse positions plus three tail
+  // positions. Invalid tail entries must follow the valid prefix.
+  uint32_t topk;
+  // Page-aligned destination stride. For page size 64 and topk 2051 this is
+  // 2112 tokens, matching SGLang's TRT-LLM-gen path.
+  uint32_t packed_row_stride;
+  uint32_t num_kv_heads;
+  uint32_t head_dim;
+  uint32_t dtype;
+  uint32_t requested_backend;
+} SparkServeQsaKvPackPlan;
+
+typedef struct SparkServeQsaKvPackArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeQsaKvPackPlan plan;
+  // BF16 persistent K/V state: [slot_capacity,num_kv_heads,head_dim].
+  const void* key_state;
+  const void* value_state;
+  // INT32 [request_capacity,request_stride].
+  const int32_t* req_to_token;
+  // INT32 [batch_size].
+  const int32_t* request_indices;
+  // INT32 [batch_size,topk]. Valid entries occupy a contiguous prefix.
+  const int32_t* logical_indices;
+  const int32_t* sequence_lengths;
+  // INT32 [batch_size], consumed directly as TRT-LLM-gen seq_lens.
+  int32_t* valid_counts;
+  // BF16 [batch_size,packed_row_stride,num_kv_heads,head_dim].
+  void* packed_key;
+  void* packed_value;
+  void* cuda_stream;
+} SparkServeQsaKvPackArgs;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -602,6 +647,18 @@ SparkServeStatus sparkserve_qsa_index_prep_query(
 SparkServeStatus sparkserve_qsa_index_prep_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeQsaIndexPrepArgs* args);
+
+SparkServeStatus sparkserve_qsa_kv_pack_validate(
+    const SparkServeQsaKvPackPlan* plan);
+
+SparkServeStatus sparkserve_qsa_kv_pack_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaKvPackPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_qsa_kv_pack_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaKvPackArgs* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);
