@@ -95,6 +95,8 @@ make test-cpp
 make test-cuda-gdn
 scripts/fetch-kernel-sources.sh
 make test-cuda-nvfp4
+./scripts/test-coherent-uring.sh
+./scripts/test-qsa-rust-smoke.sh
 ```
 
 The defaults reserve 8 GiB for KV cache, 12 GiB for the runtime, 8 GiB as a hard
@@ -155,7 +157,12 @@ Rust lease machine prevents repack while selected-K/V packing or XQA owns that
 allocation, rejects stale and foreign completions, and forces a semaphore reset
 after any failed XQA launch. The native `mmap`/CUDA registration handle also has
 a unique Rust owner, so the stable device mapping cannot be freed independently
-of its scheduler.
+of its scheduler. The production-shaped Rust smoke now submits a real
+asynchronous workspace zero, launches the borrowed SGLang selected-K/V packer,
+records its CUDA completion, transfers the same fixed addresses to FlashInfer
+XQA, and records decode completion. On GB10 the joined path matches the oracle's
+packed key, packed value, valid length, and attention output with zero BF16
+mismatches and performs no CPU-to-GPU copy.
 
 The Flash-Next storage path now has a cross-language `SSPLEIDX` contract, a
 zero-copy safetensors indexer, bounded Python and Rust caches, cross-page row

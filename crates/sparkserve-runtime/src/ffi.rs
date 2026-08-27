@@ -97,6 +97,16 @@ pub struct CoherentRegion {
 }
 
 #[repr(C)]
+pub struct CudaStream {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct CudaEvent {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCaps {
     pub struct_size: u32,
@@ -865,6 +875,28 @@ unsafe extern "C" {
         view: *mut CoherentRegionView,
     ) -> Status;
     pub fn sparkserve_coherent_region_destroy(region: *mut CoherentRegion) -> Status;
+    pub fn sparkserve_cuda_stream_create(stream: *mut *mut CudaStream) -> Status;
+    pub fn sparkserve_cuda_stream_raw(
+        stream: *const CudaStream,
+        raw_stream: *mut *mut c_void,
+    ) -> Status;
+    pub fn sparkserve_cuda_stream_memset_async(
+        stream: *mut CudaStream,
+        device_pointer: *mut c_void,
+        value: u32,
+        bytes: u64,
+    ) -> Status;
+    pub fn sparkserve_cuda_stream_wait_event(
+        stream: *mut CudaStream,
+        event: *const CudaEvent,
+    ) -> Status;
+    pub fn sparkserve_cuda_stream_synchronize(stream: *mut CudaStream) -> Status;
+    pub fn sparkserve_cuda_stream_destroy(stream: *mut CudaStream) -> Status;
+    pub fn sparkserve_cuda_event_create(event: *mut *mut CudaEvent) -> Status;
+    pub fn sparkserve_cuda_event_record(event: *mut CudaEvent, stream: *mut CudaStream) -> Status;
+    pub fn sparkserve_cuda_event_query(event: *const CudaEvent, complete: *mut u32) -> Status;
+    pub fn sparkserve_cuda_event_synchronize(event: *mut CudaEvent) -> Status;
+    pub fn sparkserve_cuda_event_destroy(event: *mut CudaEvent) -> Status;
     pub fn sparkserve_kernel_abi_version() -> u32;
     pub fn sparkserve_dense_nvfp4_validate(plan: *const DenseNvfp4Plan) -> Status;
     pub fn sparkserve_dense_nvfp4_query(

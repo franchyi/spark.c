@@ -88,6 +88,26 @@ void TestAnonymousSlab() {
   for (uint64_t index = 0; index < kBytes; ++index) {
     payload[index] = static_cast<uint8_t>((index * 17 + 3) & 0xff);
   }
+  SparkServeCudaStream* stream = nullptr;
+  SparkServeCudaEvent* event = nullptr;
+  Require(sparkserve_cuda_stream_create(&stream));
+  Require(sparkserve_cuda_event_create(&event));
+  void* raw_stream = nullptr;
+  Require(sparkserve_cuda_stream_raw(stream, &raw_stream));
+  assert(raw_stream != nullptr);
+  Require(sparkserve_cuda_stream_memset_async(stream, view.device_pointer, 0x5a,
+                                               4096));
+  Require(sparkserve_cuda_event_record(event, stream));
+  uint32_t complete = 0;
+  Require(sparkserve_cuda_event_query(event, &complete));
+  Require(sparkserve_cuda_event_synchronize(event));
+  Require(sparkserve_cuda_event_query(event, &complete));
+  assert(complete == 1);
+  Require(sparkserve_cuda_stream_wait_event(stream, event));
+  Require(sparkserve_cuda_stream_synchronize(stream));
+  for (uint64_t index = 0; index < 4096; ++index) assert(payload[index] == 0x5a);
+  Require(sparkserve_cuda_event_destroy(event));
+  Require(sparkserve_cuda_stream_destroy(stream));
   assert(DeviceSum(view.device_pointer, kBytes) == HostSum(payload, kBytes));
   Require(sparkserve_coherent_region_destroy(region));
 }

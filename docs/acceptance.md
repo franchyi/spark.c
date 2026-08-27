@@ -89,7 +89,10 @@ Rust arena lifecycle now shares one coherent max-batch allocation across graph
 buckets, blocks early reuse with pack/ready/decode leases, resets after failed
 XQA launches, and owns the native mapping until scheduler teardown. The GB10
 native smoke test allocates this full QSA arena successfully. This document
-remains a completion checklist: storage-thread/CUDA-event overlap integration,
-joined QSA/full-token graph parity, tokenizer/server, GGUF, GLM graph, and
-end-to-end continuation gates are not implied to be finished by isolated kernel
-and fabric tests.
+now also has a Rust-owned native stream/event smoke in which the borrowed SGLang
+packer feeds FlashInfer XQA at the same fixed addresses; packed key, value,
+length, and attention output all have zero mismatches. This document remains a
+completion checklist: PLE storage-thread/CUDA-event overlap, top-k/index-prep
+integration into the joined QSA/full-token graph, tokenizer/server, GGUF, GLM
+graph, and end-to-end continuation gates are not implied to be finished by this
+graph fragment.

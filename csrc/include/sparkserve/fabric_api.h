@@ -50,6 +50,8 @@ typedef struct SparkServeCoherentRegionView {
 } SparkServeCoherentRegionView;
 
 typedef struct SparkServeCoherentRegion SparkServeCoherentRegion;
+typedef struct SparkServeCudaStream SparkServeCudaStream;
+typedef struct SparkServeCudaEvent SparkServeCudaEvent;
 
 SparkServeStatus sparkserve_coherent_region_validate(
     const SparkServeCoherentRegionConfig* config);
@@ -64,6 +66,38 @@ SparkServeStatus sparkserve_coherent_region_view(
 
 SparkServeStatus sparkserve_coherent_region_destroy(
     SparkServeCoherentRegion* region);
+
+// Minimal CUDA-runtime ownership boundary. Kernel ABIs continue to receive the
+// raw stream pointer; scheduling, event reuse, and completion policy stay in
+// Rust.
+SparkServeStatus sparkserve_cuda_stream_create(SparkServeCudaStream** stream);
+
+SparkServeStatus sparkserve_cuda_stream_raw(
+    const SparkServeCudaStream* stream, void** raw_stream);
+
+SparkServeStatus sparkserve_cuda_stream_memset_async(
+    SparkServeCudaStream* stream, void* device_pointer, uint32_t value,
+    uint64_t bytes);
+
+SparkServeStatus sparkserve_cuda_stream_wait_event(
+    SparkServeCudaStream* stream, const SparkServeCudaEvent* event);
+
+SparkServeStatus sparkserve_cuda_stream_synchronize(
+    SparkServeCudaStream* stream);
+
+SparkServeStatus sparkserve_cuda_stream_destroy(SparkServeCudaStream* stream);
+
+SparkServeStatus sparkserve_cuda_event_create(SparkServeCudaEvent** event);
+
+SparkServeStatus sparkserve_cuda_event_record(
+    SparkServeCudaEvent* event, SparkServeCudaStream* stream);
+
+SparkServeStatus sparkserve_cuda_event_query(
+    const SparkServeCudaEvent* event, uint32_t* complete);
+
+SparkServeStatus sparkserve_cuda_event_synchronize(SparkServeCudaEvent* event);
+
+SparkServeStatus sparkserve_cuda_event_destroy(SparkServeCudaEvent* event);
 
 #ifdef __cplusplus
 }

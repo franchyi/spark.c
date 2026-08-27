@@ -1,4 +1,5 @@
 use sparkserve_runtime::coherent::CoherentRegionOwner;
+use sparkserve_runtime::cuda::{CudaEventOwner, CudaStreamOwner};
 use sparkserve_runtime::ffi::COHERENT_REGION_PREFAULT;
 use sparkserve_runtime::qsa::{QsaArenaPhase, QsaCoherentArena, QsaSparseDecodePlan};
 use sparkserve_runtime::uring::{FixedBufferReader, FixedRead};
@@ -57,9 +58,15 @@ fn main() -> io::Result<()> {
         .scratch_layout()
         .map_err(io::Error::other)?
         .total_bytes;
-    let qsa_arena = QsaCoherentArena::allocate(qsa_plan, vec![1], COHERENT_REGION_PREFAULT)
+    let mut qsa_arena = QsaCoherentArena::allocate(qsa_plan, vec![1], COHERENT_REGION_PREFAULT)
         .map_err(io::Error::other)?;
-    assert_eq!(qsa_arena.region().payload_bytes().unwrap(), qsa_bytes);
+    assert_eq!(
+        qsa_arena
+            .region()
+            .payload_bytes()
+            .map_err(io::Error::other)?,
+        qsa_bytes
+    );
     assert_eq!(
         qsa_arena.scheduler().phase(),
         QsaArenaPhase::WorkspaceNeedsZero
@@ -68,7 +75,52 @@ fn main() -> io::Result<()> {
         qsa_arena.scheduler().arena().device_base(),
         qsa_arena.region().device_address()
     );
+
+    let layout = qsa_arena.scheduler().arena().layout();
+    let workspace_end = layout.attention_workspace_offset + layout.attention_workspace_bytes - 1;
+    // SAFETY: the scheduler is in WorkspaceNeedsZero and no CUDA submission
+    // exists yet, so the CPU alias is exclusively owned here.
+    let payload = unsafe { qsa_arena.host_payload_mut() }.map_err(io::Error::other)?;
+    payload[layout.attention_workspace_offset] = 0xa5;
+    payload[workspace_end] = 0xa5;
+
+    let mut stream = CudaStreamOwner::create().map_err(io::Error::other)?;
+    let mut event = CudaEventOwner::create().map_err(io::Error::other)?;
+    let zero = qsa_arena
+        .scheduler_mut()
+        .begin_workspace_zero()
+        .map_err(io::Error::other)?;
+    // SAFETY: the workspace-zero lease uniquely owns this exact fixed range
+    // until the recorded CUDA event completes.
+    unsafe {
+        stream.memset_async(
+            zero.arena().addresses().attention_workspace,
+            0,
+            layout.attention_workspace_bytes,
+        )
+    }
+    .map_err(io::Error::other)?;
+    event.record(&mut stream).map_err(io::Error::other)?;
+    assert_eq!(
+        qsa_arena.scheduler().phase(),
+        QsaArenaPhase::ZeroingWorkspace
+    );
+    event.synchronize().map_err(io::Error::other)?;
+    assert!(event.query().map_err(io::Error::other)?);
+    qsa_arena
+        .scheduler_mut()
+        .complete_workspace_zero(zero)
+        .map_err(io::Error::other)?;
+    assert_eq!(qsa_arena.scheduler().phase(), QsaArenaPhase::Idle);
+    // SAFETY: event completion and the Idle phase exclude CUDA access.
+    let payload = unsafe { qsa_arena.host_payload_mut() }.map_err(io::Error::other)?;
+    assert_eq!(payload[layout.attention_workspace_offset], 0);
+    assert_eq!(payload[workspace_end], 0);
+    event.close().map_err(io::Error::other)?;
+    stream.close().map_err(io::Error::other)?;
     drop(qsa_arena);
-    println!("GB10 coherent slabs accepted io_uring registration and a fixed-address QSA arena");
+    println!(
+        "GB10 coherent slabs accepted io_uring plus event-driven fixed-address QSA initialization"
+    );
     Ok(())
 }

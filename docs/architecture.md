@@ -188,7 +188,13 @@ the scheduler to `workspace-needs-zero`, because the donor's multi-block atomic
 semaphores may have advanced. The mapping itself is held by a unique Rust owner
 around the native `mmap` plus CUDA registration handle. Rust therefore owns
 logical-to-physical KV maps, residency, mapping lifetime, graph buckets, and
-replay; FlashInfer owns only attention arithmetic.
+replay; FlashInfer owns only attention arithmetic. This is no longer only a
+state-machine invariant: the Rust native smoke uses opaque non-blocking CUDA
+streams and timing-disabled events to zero the workspace, launch SGLang's
+selected-K/V packer, publish its completion, and launch XQA from the same
+coherent addresses. The packed K/V, valid length, and attention output all
+match the two framework fixtures bit-for-bit. Stream destruction drains work
+before Rust unregisters either mapping.
 
 ### GGUF
 

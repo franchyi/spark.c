@@ -14,9 +14,15 @@ name = "coherent_uring_smoke"
 path = "examples/coherent_uring_smoke.rs"
 required-features = ["native-fabric-smoke"]
 
+[[example]]
+name = "qsa_xqa_smoke"
+path = "examples/qsa_xqa_smoke.rs"
+required-features = ["native-qsa-smoke"]
+
 [features]
 native-fabric = []
 native-fabric-smoke = ["native-fabric"]
+native-qsa-smoke = ["native-fabric"]
 
 [dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
