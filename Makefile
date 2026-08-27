@@ -230,12 +230,16 @@ $(CUDA_QSA_DECODE_XQA_MHA_OBJECT): $(FLASHINFER_ROOT)/csrc/xqa/mha.cu $(wildcard
 		$(FLASHINFER_XQA_INCLUDE) -c $(FLASHINFER_ROOT)/csrc/xqa/mha.cu \
 		-o $(CUDA_QSA_DECODE_XQA_MHA_OBJECT)
 
-$(CUDA_QSA_SHARED): $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) csrc/kernel_contract.cc csrc/cuda/qsa_kv_pack_sglang.cu csrc/cuda/qsa_decode_xqa_flashinfer.cu csrc/internal/qsa_kv_pack_backend.h csrc/internal/qsa_decode_backend.h csrc/include/sparkserve/kernel_api.h
+$(CUDA_QSA_SHARED): $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) csrc/kernel_contract.cc csrc/cuda/qsa_index_prep_sglang.cu csrc/cuda/qsa_topk_sglang.cu csrc/cuda/qsa_kv_pack_sglang.cu csrc/cuda/qsa_decode_xqa_flashinfer.cu csrc/internal/qsa_index_prep_backend.h csrc/internal/qsa_topk_backend.h csrc/internal/qsa_kv_pack_backend.h csrc/internal/qsa_decode_backend.h csrc/include/sparkserve/kernel_api.h
 	mkdir -p $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(QWEN_XQA_FLAGS) -shared -Xcompiler=-fPIC \
+		-DSPARKSERVE_WITH_SGLANG_QSA_INDEX_PREP \
+		-DSPARKSERVE_WITH_SGLANG_QSA_TOPK \
 		-DSPARKSERVE_WITH_SGLANG_QSA_KV_PACK \
 		-DSPARKSERVE_WITH_FLASHINFER_XQA_DECODE -Icsrc/include -Icsrc \
 		$(FLASHINFER_XQA_INCLUDE) csrc/kernel_contract.cc \
+		csrc/cuda/qsa_index_prep_sglang.cu \
+		csrc/cuda/qsa_topk_sglang.cu \
 		csrc/cuda/qsa_kv_pack_sglang.cu \
 		csrc/cuda/qsa_decode_xqa_flashinfer.cu \
 		$(CUDA_QSA_DECODE_XQA_MHA_OBJECT) -lcuda -o $(CUDA_QSA_SHARED)

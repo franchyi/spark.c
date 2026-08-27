@@ -19,6 +19,11 @@ name = "qsa_xqa_smoke"
 path = "examples/qsa_xqa_smoke.rs"
 required-features = ["native-qsa-smoke"]
 
+[[example]]
+name = "qsa_frontend_smoke"
+path = "examples/qsa_frontend_smoke.rs"
+required-features = ["native-qsa-smoke"]
+
 [features]
 native-fabric = []
 native-fabric-smoke = ["native-fabric"]

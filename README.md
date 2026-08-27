@@ -165,7 +165,13 @@ asynchronous workspace zero, launches the borrowed SGLang selected-K/V packer,
 records its CUDA completion, transfers the same fixed addresses to FlashInfer
 XQA, and records decode completion. On GB10 the joined path matches the oracle's
 packed key, packed value, valid length, and attention output with zero BF16
-mismatches and performs no CPU-to-GPU copy.
+mismatches and performs no CPU-to-GPU copy. The same framework-free shared
+library now links the borrowed SGLang fused index-prep and radix top-k kernels.
+A second Rust smoke runs both from CUDA-registered coherent slabs: all Q output,
+persistent key state, RoPE state, and compressed-key elements are bit-exact, and
+all four 65,536-column top-k rows select the oracle's exact 512-index sets. This
+validates every borrowed QSA operator in the shipping library without claiming
+the still-missing score-GEMM and block-to-token selection glue are joined.
 
 The Flash-Next storage path now has a cross-language `SSPLEIDX` contract, a
 zero-copy safetensors indexer, bounded Python and Rust caches, cross-page row

@@ -197,7 +197,12 @@ streams and timing-disabled events to zero the workspace, launch SGLang's
 selected-K/V packer, publish its completion, and launch XQA from the same
 coherent addresses. The packed K/V, valid length, and attention output all
 match the two framework fixtures bit-for-bit. Stream destruction drains work
-before Rust unregisters either mapping.
+before Rust unregisters either mapping. The same small shared object now also
+contains the SGLang-derived fused index-prep and radix top-k donors. A separate
+Rust-native coherent-memory smoke proves their Q/state/RoPE/compressed-key bits
+and all four selected top-k sets against the oracle. The fixtures are presently
+independent: compressed-query score GEMM plus block-to-token/tail expansion must
+be connected before these four validated donors form one semantic QSA layer.
 
 ### GGUF
 
