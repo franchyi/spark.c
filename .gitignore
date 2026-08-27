@@ -2,6 +2,7 @@
 .uv-cache/
 .pytest_cache/
 third_party/_deps/
+tests/fixtures/private/
 __pycache__/
 *.py[cod]
 build/

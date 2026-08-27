@@ -8,6 +8,7 @@ CONTRACT_TEST := $(BUILD_DIR)/kernel-contract-test
 HEADER_C_TEST := $(BUILD_DIR)/kernel-header-c-test
 CUDA_GDN_TEST := $(BUILD_DIR)/gdn-decode-cuda-test
 CUDA_NVFP4_TEST := $(BUILD_DIR)/nvfp4-dense-cuda-test
+CUDA_NVFP4_FIXTURE_TEST := $(BUILD_DIR)/nvfp4-dense-fixture-test
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_121a
 NVCCFLAGS ?= -O2 -std=c++20 -arch=$(CUDA_ARCH)
@@ -23,7 +24,7 @@ FLASHINFER_INCLUDES := -I$(FLASHINFER_INCLUDE) \
 	-I$(CUTLASS_ROOT)/include \
 	-I$(CUTLASS_ROOT)/tools/util/include
 
-.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -38,6 +39,10 @@ test-cuda-gdn: $(CUDA_GDN_TEST)
 
 test-cuda-nvfp4: $(CUDA_NVFP4_TEST)
 	$(CUDA_NVFP4_TEST)
+
+test-cuda-nvfp4-fixture: $(CUDA_NVFP4_FIXTURE_TEST)
+	test -n "$(NVFP4_FIXTURE)"
+	$(CUDA_NVFP4_FIXTURE_TEST) "$(NVFP4_FIXTURE)"
 
 docker-flash-next-sm121:
 	docker build -t sparkserve/sglang:qwen38flashnext-sm121 -f docker/flashnext-sm121/Dockerfile .
@@ -63,5 +68,12 @@ $(CUDA_NVFP4_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashinfer.cu 
 		csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashinfer.cu \
 		csrc/tests/nvfp4_dense_cuda_test.cu -o $(CUDA_NVFP4_TEST)
 
+$(CUDA_NVFP4_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashinfer.cu csrc/internal/nvfp4_dense_backend.h csrc/tests/nvfp4_dense_fixture_test.cu csrc/include/sparkserve/kernel_api.h
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_ARCH_FLAGS) -DSPARKSERVE_WITH_FLASHINFER_NVFP4 \
+		-Icsrc/include -Icsrc $(FLASHINFER_INCLUDES) \
+		csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashinfer.cu \
+		csrc/tests/nvfp4_dense_fixture_test.cu -o $(CUDA_NVFP4_FIXTURE_TEST)
+
 clean:
-	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST)
+	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST)

@@ -38,8 +38,16 @@ added to the scheduler table; no framework dispatcher is linked.
 
 ## Current gate
 
-CUDA 13.0.3 compiles the adapter for `sm_121a`. The GPU smoke test queries the
-workspace through the ABI, launches the donor kernel, and verifies an exact zero
-output. Real packed-tensor parity against SGLang is the next promotion gate; the
-zero test proves linkage and the physical scale-buffer contract, not numerical
-equivalence for nonzero values.
+CUDA 13.0.3 compiles the adapter for `sm_121a`. The zero GPU smoke test queries
+the workspace through the ABI, launches the donor kernel, and checks the physical
+scale-buffer contract. A private reproducible fixture then loads layer 0, expert
+0's real `gate_proj` from the locked Qwen checkpoint, applies SGLang's upstream
+activation quantizer and exact 128x4 scale swizzle, and records the raw default
+FlashInfer result. SparkServe's independently built ABI path matches all 640 BF16
+outputs bit-for-bit for `M=1,N=640,K=2560`.
+
+The fixture payload is intentionally not committed because it contains model
+weights. `scripts/capture-nvfp4-fixture.py` regenerates it from the locked local
+checkpoint, and `make test-cuda-nvfp4-fixture NVFP4_FIXTURE=...` reruns parity.
+Prefill shapes and additional tactics still require separate fixtures and GB10
+measurements.

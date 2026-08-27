@@ -123,9 +123,11 @@ The ABI models the observed SGLang/ModelOpt contract: packed E2M1 weights and
 activations, FP8-E4M3 group-16 scales in CUTLASS 128x4 physical layout, separate
 packed-weight/scale padding, a GPU-addressable FP32 global alpha, and BF16 output.
 Activation scale allocation now includes the mandatory 128-row physical tile:
-for `M=1,K=4096` it is 32 KiB, not the 256-byte logical element count. Nonzero
-real-tensor parity and tactic tuning remain promotion gates before this path is
-used for the full model.
+for `M=1,K=4096` it is 32 KiB, not the 256-byte logical element count. The first
+real checkpoint fixture (`layer 0 / expert 0 / gate_proj`,
+`M=1,N=640,K=2560`) now matches the raw FlashInfer oracle bit-for-bit across all
+640 BF16 outputs. Prefill tactics and the fused routed-MoE path remain promotion
+gates before this path is used for the full model.
 
 The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
 a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real
