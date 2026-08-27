@@ -1,7 +1,16 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::fabric::{
+    ExpertCacheStats, ExpertKey, ExpertLoad, ExpertResidencyPlan, ExpertSlotAddress, FabricError,
+    FixedExpertCache,
+};
+use crate::routing::{RouteError, RoutePlan};
 
 const ARENA_ALIGNMENT: u64 = 256;
+static NEXT_MOE_STEP_LEASE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchedulerConfig {
@@ -136,6 +145,211 @@ pub struct StaticScheduler {
     free_slots: VecDeque<u32>,
     slot_generations: Vec<u64>,
     active: BTreeMap<u64, ActiveSequence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoeSchedulerConfig {
+    pub layers: u16,
+    pub num_experts: u32,
+    pub top_k: u32,
+    pub hidden_size: u64,
+    pub expert_slots: u32,
+    pub expert_slot_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentExpert {
+    pub expert: u32,
+    pub address: ExpertSlotAddress,
+}
+
+/// A routed layer whose expert destinations are reserved but not yet visible.
+/// The storage thread reads `loads()`, fills those fixed slots, then returns the
+/// plan to `commit_step`. A failed read simply drops this value.
+#[must_use]
+#[derive(Debug)]
+pub struct PendingMoeStep {
+    layer: u16,
+    route: Option<RoutePlan>,
+    active_experts: Vec<u32>,
+    residency: Option<ExpertResidencyPlan>,
+    scheduler_lease: Arc<AtomicU64>,
+    lease_id: u64,
+}
+
+impl PendingMoeStep {
+    pub fn layer(&self) -> u16 {
+        self.layer
+    }
+
+    pub fn route(&self) -> &RoutePlan {
+        self.route.as_ref().expect("pending route remains owned")
+    }
+
+    pub fn loads(&self) -> &[ExpertLoad] {
+        self.residency
+            .as_ref()
+            .expect("pending residency remains owned")
+            .loads()
+    }
+
+    pub fn expert_addresses(&self) -> &[ExpertSlotAddress] {
+        self.residency
+            .as_ref()
+            .expect("pending residency remains owned")
+            .addresses()
+    }
+}
+
+impl Drop for PendingMoeStep {
+    fn drop(&mut self) {
+        let _ = self.scheduler_lease.compare_exchange(
+            self.lease_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadyMoeStep {
+    pub layer: u16,
+    pub route: RoutePlan,
+    pub experts: Vec<ResidentExpert>,
+}
+
+/// The policy layer for out-of-core MoE. Kernel code never selects cache
+/// victims or changes pointers: Rust reserves fixed addresses transactionally
+/// from the exact top-k route, while the I/O engine decides how to fill them.
+pub struct RoutedMoeScheduler {
+    config: MoeSchedulerConfig,
+    cache: FixedExpertCache,
+    pending_lease: Arc<AtomicU64>,
+}
+
+impl RoutedMoeScheduler {
+    pub fn new(config: MoeSchedulerConfig) -> Result<Self, MoeScheduleError> {
+        if config.layers == 0
+            || config.num_experts == 0
+            || config.num_experts > 512
+            || config.top_k == 0
+            || config.top_k > config.num_experts
+            || config.top_k > 32
+            || config.hidden_size == 0
+            || config.hidden_size % 8 != 0
+        {
+            return Err(MoeScheduleError::InvalidConfig);
+        }
+        let cache = FixedExpertCache::new(config.expert_slots, config.expert_slot_bytes)?;
+        Ok(Self {
+            config,
+            cache,
+            pending_lease: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    pub fn prepare_step(
+        &self,
+        layer: u16,
+        num_tokens: u32,
+        expert_ids: &[u32],
+    ) -> Result<PendingMoeStep, MoeScheduleError> {
+        if layer >= self.config.layers {
+            return Err(MoeScheduleError::LayerOutOfRange {
+                layer,
+                layers: self.config.layers,
+            });
+        }
+        let lease_id = NEXT_MOE_STEP_LEASE.fetch_add(1, Ordering::Relaxed);
+        if lease_id == 0 {
+            return Err(MoeScheduleError::InvalidConfig);
+        }
+        if self
+            .pending_lease
+            .compare_exchange(0, lease_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(MoeScheduleError::PendingStep);
+        }
+        let result = (|| {
+            let route = RoutePlan::build(
+                num_tokens,
+                self.config.top_k,
+                self.config.num_experts,
+                expert_ids,
+            )?;
+            route.kernel_spec(self.config.hidden_size)?;
+            let active_experts: Vec<u32> = route
+                .expert_rows
+                .iter()
+                .enumerate()
+                .filter_map(|(expert, rows)| (*rows != 0).then_some(expert as u32))
+                .collect();
+            let keys = active_experts
+                .iter()
+                .map(|expert| ExpertKey {
+                    layer,
+                    expert: *expert as u16,
+                })
+                .collect::<Vec<_>>();
+            let residency = self.cache.prepare(&keys)?;
+            Ok(PendingMoeStep {
+                layer,
+                route: Some(route),
+                active_experts,
+                residency: Some(residency),
+                scheduler_lease: Arc::clone(&self.pending_lease),
+                lease_id,
+            })
+        })();
+        if result.is_err() {
+            let _ = self.pending_lease.compare_exchange(
+                lease_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        result
+    }
+
+    pub fn commit_step(
+        &mut self,
+        mut pending: PendingMoeStep,
+    ) -> Result<ReadyMoeStep, MoeScheduleError> {
+        if !Arc::ptr_eq(&self.pending_lease, &pending.scheduler_lease)
+            || self.pending_lease.load(Ordering::Acquire) != pending.lease_id
+        {
+            return Err(MoeScheduleError::ForeignStep);
+        }
+        let residency = pending
+            .residency
+            .take()
+            .ok_or(MoeScheduleError::ForeignStep)?;
+        let addresses = self.cache.commit(residency)?;
+        if addresses.len() != pending.active_experts.len() {
+            return Err(MoeScheduleError::ResidencyMismatch);
+        }
+        let experts = std::mem::take(&mut pending.active_experts)
+            .into_iter()
+            .zip(addresses)
+            .map(|(expert, address)| ResidentExpert { expert, address })
+            .collect();
+        Ok(ReadyMoeStep {
+            layer: pending.layer,
+            route: pending.route.take().ok_or(MoeScheduleError::ForeignStep)?,
+            experts,
+        })
+    }
+
+    pub fn cache_stats(&self) -> ExpertCacheStats {
+        self.cache.stats
+    }
+
+    pub fn cache_capacity_bytes(&self) -> Result<u64, MoeScheduleError> {
+        Ok(self.cache.capacity_bytes()?)
+    }
 }
 
 impl StaticScheduler {
@@ -335,6 +549,58 @@ impl Display for SchedulerError {
 
 impl std::error::Error for SchedulerError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MoeScheduleError {
+    InvalidConfig,
+    PendingStep,
+    ForeignStep,
+    LayerOutOfRange { layer: u16, layers: u16 },
+    ResidencyMismatch,
+    Route(RouteError),
+    Fabric(FabricError),
+}
+
+impl From<RouteError> for MoeScheduleError {
+    fn from(error: RouteError) -> Self {
+        Self::Route(error)
+    }
+}
+
+impl From<FabricError> for MoeScheduleError {
+    fn from(error: FabricError) -> Self {
+        Self::Fabric(error)
+    }
+}
+
+impl Display for MoeScheduleError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfig => {
+                formatter.write_str("invalid routed MoE scheduler configuration")
+            }
+            Self::PendingStep => {
+                formatter.write_str("one routed MoE residency step is already pending")
+            }
+            Self::ForeignStep => {
+                formatter.write_str("routed MoE step belongs to another scheduler")
+            }
+            Self::LayerOutOfRange { layer, layers } => {
+                write!(
+                    formatter,
+                    "MoE layer {layer} is outside the {layers}-layer model"
+                )
+            }
+            Self::ResidencyMismatch => {
+                formatter.write_str("expert residency result does not match active routes")
+            }
+            Self::Route(error) => write!(formatter, "{error}"),
+            Self::Fabric(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for MoeScheduleError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +705,103 @@ mod tests {
             scheduler.record_decode(lease),
             Err(SchedulerError::GenerationLimit)
         );
+    }
+
+    #[test]
+    fn routed_step_reserves_only_active_experts_then_publishes_atomically() {
+        let mut scheduler = RoutedMoeScheduler::new(MoeSchedulerConfig {
+            layers: 48,
+            num_experts: 512,
+            top_k: 4,
+            hidden_size: 2560,
+            expert_slots: 8,
+            expert_slot_bytes: 4096,
+        })
+        .expect("scheduler");
+        let pending = scheduler
+            .prepare_step(3, 2, &[9, 1, 7, 4, 7, 9, 11, 2])
+            .expect("pending");
+        assert_eq!(pending.route().active_experts(), 6);
+        assert_eq!(pending.loads().len(), 6);
+        assert_eq!(scheduler.cache_stats(), ExpertCacheStats::default());
+
+        let ready = scheduler.commit_step(pending).expect("commit after I/O");
+        assert_eq!(ready.experts.len(), 6);
+        assert_eq!(
+            ready
+                .experts
+                .iter()
+                .map(|placement| placement.expert)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4, 7, 9, 11]
+        );
+        assert_eq!(scheduler.cache_stats().misses, 6);
+
+        let hot = scheduler
+            .prepare_step(3, 1, &[11, 9, 7, 1])
+            .expect("hot route");
+        assert!(hot.loads().is_empty());
+        scheduler.commit_step(hot).expect("hot commit");
+        assert_eq!(scheduler.cache_stats().hits, 4);
+    }
+
+    #[test]
+    fn failed_expert_io_does_not_poison_the_next_route() {
+        let mut scheduler = RoutedMoeScheduler::new(MoeSchedulerConfig {
+            layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            hidden_size: 2560,
+            expert_slots: 2,
+            expert_slot_bytes: 1024,
+        })
+        .expect("scheduler");
+        let failed = scheduler
+            .prepare_step(0, 1, &[0, 1])
+            .expect("failed read plan");
+        drop(failed);
+        assert_eq!(scheduler.cache_stats(), ExpertCacheStats::default());
+
+        let retry = scheduler.prepare_step(0, 1, &[0, 1]).expect("retry");
+        scheduler.commit_step(retry).expect("commit retry");
+        assert_eq!(scheduler.cache_stats().misses, 2);
+    }
+
+    #[test]
+    fn only_one_nvme_fill_can_target_fixed_expert_slots_at_a_time() {
+        let scheduler = RoutedMoeScheduler::new(MoeSchedulerConfig {
+            layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            hidden_size: 2560,
+            expert_slots: 2,
+            expert_slot_bytes: 1024,
+        })
+        .expect("scheduler");
+        let first = scheduler.prepare_step(0, 1, &[0, 1]).expect("first");
+        assert!(matches!(
+            scheduler.prepare_step(0, 1, &[2, 3]),
+            Err(MoeScheduleError::PendingStep)
+        ));
+        drop(first);
+        assert!(scheduler.prepare_step(0, 1, &[2, 3]).is_ok());
+    }
+
+    #[test]
+    fn invalid_route_releases_the_pending_fill_lease() {
+        let scheduler = RoutedMoeScheduler::new(MoeSchedulerConfig {
+            layers: 1,
+            num_experts: 4,
+            top_k: 2,
+            hidden_size: 2560,
+            expert_slots: 2,
+            expert_slot_bytes: 1024,
+        })
+        .expect("scheduler");
+        assert!(matches!(
+            scheduler.prepare_step(0, 1, &[1, 1]),
+            Err(MoeScheduleError::Route(RouteError::DuplicateExpert { .. }))
+        ));
+        assert!(scheduler.prepare_step(0, 1, &[1, 2]).is_ok());
     }
 }

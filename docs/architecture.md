@@ -74,6 +74,27 @@ first-touch, prefetch, residency, and eviction. Direct mmap is enabled only afte
 the target kernel accepts the pointer alignment and matches the performance of a
 resident CUDA allocation.
 
+### Transactional expert residency
+
+The Rust control plane now treats one routed layer as a two-phase transaction:
+
+1. build the exact token-major top-k route and stable expert-contiguous row map;
+2. protect every resident expert in that route and reserve fixed cache slots for
+   misses without changing the visible cache state;
+3. issue NVMe reads directly into those destinations and validate completion;
+4. atomically publish the new expert-to-slot map, then launch the borrowed MMQ
+   or grouped-GEMM kernel with fixed addresses.
+
+Dropping a failed read plan changes neither residency nor telemetry. A cache
+version rejects stale publication, while a unique pending-step lease prevents
+two NVMe fills from targeting the same fixed slots concurrently. Hits, misses,
+evictions, and bytes loaded advance only on commit. This keeps storage failure
+semantics in Rust and arithmetic in the borrowed kernel set. The implemented
+scheduler is address-stable and strictly bounded by its configured slot count;
+the next systems step is to preallocate its route scratch and back the logical
+slots with one registered, page-aligned coherent-memory slab plus an `io_uring`
+fixed-buffer reader.
+
 ### Flash-Next sparse PLE path
 
 The tokenizer/control plane computes the next PLE row ids early. A small index

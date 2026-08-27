@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_EXPERT_CACHE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlacementKind {
@@ -197,6 +200,42 @@ pub struct ExpertSlotAddress {
     pub byte_offset: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpertLoad {
+    pub key: ExpertKey,
+    pub address: ExpertSlotAddress,
+    pub evicts: Option<ExpertKey>,
+}
+
+/// A two-phase expert residency decision. The I/O layer fills every `load`
+/// destination first and commits only after all reads and checksums succeed.
+/// Dropping a plan leaves the cache unchanged.
+#[must_use]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpertResidencyPlan {
+    cache_id: u64,
+    base_version: u64,
+    step: u64,
+    requested_unique: Vec<ExpertKey>,
+    resident_hits: u64,
+    addresses: Vec<ExpertSlotAddress>,
+    loads: Vec<ExpertLoad>,
+}
+
+impl ExpertResidencyPlan {
+    pub fn addresses(&self) -> &[ExpertSlotAddress] {
+        &self.addresses
+    }
+
+    pub fn loads(&self) -> &[ExpertLoad] {
+        &self.loads
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.loads.is_empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ExpertCacheStats {
     pub hits: u64,
@@ -214,6 +253,8 @@ struct ExpertSlot {
 /// A fixed-address cache for encoded GGUF expert blocks. Loading changes the
 /// contents of a slot, never its address, so captured graphs can keep pointers.
 pub struct FixedExpertCache {
+    cache_id: u64,
+    version: u64,
     slot_bytes: u64,
     slots: Vec<ExpertSlot>,
     locations: BTreeMap<ExpertKey, usize>,
@@ -226,7 +267,13 @@ impl FixedExpertCache {
         if slot_count == 0 || slot_bytes == 0 {
             return Err(FabricError::InvalidCache);
         }
+        let cache_id = NEXT_EXPERT_CACHE_ID.fetch_add(1, Ordering::Relaxed);
+        if cache_id == 0 {
+            return Err(FabricError::IntegerOverflow);
+        }
         Ok(Self {
+            cache_id,
+            version: 0,
             slot_bytes,
             slots: vec![
                 ExpertSlot {
@@ -247,79 +294,166 @@ impl FixedExpertCache {
             .ok_or(FabricError::IntegerOverflow)
     }
 
-    /// Resolve one layer's routed experts. All requested keys are protected
-    /// from eviction for the duration of this operation.
-    pub fn resolve(
-        &mut self,
-        requested: &[ExpertKey],
-    ) -> Result<Vec<ExpertSlotAddress>, FabricError> {
+    /// Choose fixed destinations without making them visible as resident.
+    /// Every currently requested expert is protected from eviction, and one
+    /// slot is reserved at most once within the returned transaction.
+    pub fn prepare(&self, requested: &[ExpertKey]) -> Result<ExpertResidencyPlan, FabricError> {
         let requested_set: BTreeSet<_> = requested.iter().copied().collect();
+        if requested_set.is_empty() {
+            return Err(FabricError::InvalidCache);
+        }
         if requested_set.len() > self.slots.len() {
             return Err(FabricError::WorkingSet {
                 requested: requested_set.len(),
                 slots: self.slots.len(),
             });
         }
-        self.step = self
+        let step = self
             .step
             .checked_add(1)
             .ok_or(FabricError::IntegerOverflow)?;
+        let mut placements = BTreeMap::new();
+        let mut reserved_slots = BTreeSet::new();
+        let mut resident_hits = 0_u64;
         for key in requested_set.iter().copied() {
             if let Some(slot_index) = self.locations.get(&key).copied() {
-                self.stats.hits = self.stats.hits.saturating_add(1);
-                self.slots[slot_index].last_used_step = self.step;
+                placements.insert(key, slot_index);
+                resident_hits = resident_hits.saturating_add(1);
+            }
+        }
+
+        let mut loads = Vec::new();
+        for key in requested_set.iter().copied() {
+            if placements.contains_key(&key) {
                 continue;
             }
-            self.stats.misses = self.stats.misses.saturating_add(1);
-            self.stats.bytes_loaded = self.stats.bytes_loaded.saturating_add(self.slot_bytes);
             let slot_index = self
                 .slots
                 .iter()
-                .position(|slot| slot.key.is_none())
+                .enumerate()
+                .find(|(index, slot)| slot.key.is_none() && !reserved_slots.contains(index))
+                .map(|(index, _)| index)
                 .or_else(|| {
                     self.slots
                         .iter()
                         .enumerate()
-                        .filter(|(_, slot)| {
-                            slot.key
-                                .map(|resident| !requested_set.contains(&resident))
-                                .unwrap_or(true)
+                        .filter(|(index, slot)| {
+                            !reserved_slots.contains(index)
+                                && slot
+                                    .key
+                                    .map(|resident| !requested_set.contains(&resident))
+                                    .unwrap_or(true)
                         })
-                        .min_by_key(|(_, slot)| slot.last_used_step)
+                        .min_by_key(|(index, slot)| (slot.last_used_step, *index))
                         .map(|(index, _)| index)
                 })
                 .ok_or(FabricError::WorkingSet {
                     requested: requested_set.len(),
                     slots: self.slots.len(),
                 })?;
+            reserved_slots.insert(slot_index);
+            placements.insert(key, slot_index);
+            loads.push(ExpertLoad {
+                key,
+                address: self.address(slot_index)?,
+                evicts: self.slots[slot_index].key,
+            });
+        }
+
+        let addresses = requested
+            .iter()
+            .map(|key| {
+                let slot_index = placements
+                    .get(key)
+                    .copied()
+                    .ok_or(FabricError::InvalidCache)?;
+                self.address(slot_index)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ExpertResidencyPlan {
+            cache_id: self.cache_id,
+            base_version: self.version,
+            step,
+            requested_unique: requested_set.into_iter().collect(),
+            resident_hits,
+            addresses,
+            loads,
+        })
+    }
+
+    /// Publish a completely loaded plan. A concurrent or out-of-order plan is
+    /// rejected before it can overwrite newer residency state.
+    pub fn commit(
+        &mut self,
+        plan: ExpertResidencyPlan,
+    ) -> Result<Vec<ExpertSlotAddress>, FabricError> {
+        if plan.cache_id != self.cache_id || plan.base_version != self.version {
+            return Err(FabricError::StalePlan);
+        }
+        let next_version = self
+            .version
+            .checked_add(1)
+            .ok_or(FabricError::IntegerOverflow)?;
+        for load in &plan.loads {
+            let slot = self
+                .slots
+                .get(load.address.slot as usize)
+                .ok_or(FabricError::InvalidCache)?;
+            if slot.key != load.evicts {
+                return Err(FabricError::StalePlan);
+            }
+        }
+        for load in &plan.loads {
+            let slot_index = load.address.slot as usize;
             if let Some(evicted) = self.slots[slot_index].key {
                 self.locations.remove(&evicted);
                 self.stats.evictions = self.stats.evictions.saturating_add(1);
             }
             self.slots[slot_index] = ExpertSlot {
-                key: Some(key),
-                last_used_step: self.step,
+                key: Some(load.key),
+                last_used_step: plan.step,
             };
-            self.locations.insert(key, slot_index);
+            self.locations.insert(load.key, slot_index);
         }
-        requested
-            .iter()
-            .map(|key| {
-                let slot = self
-                    .locations
-                    .get(key)
-                    .copied()
-                    .ok_or(FabricError::InvalidCache)?;
-                let byte_offset = self
-                    .slot_bytes
-                    .checked_mul(slot as u64)
-                    .ok_or(FabricError::IntegerOverflow)?;
-                Ok(ExpertSlotAddress {
-                    slot: slot as u32,
-                    byte_offset,
-                })
-            })
-            .collect()
+        for key in &plan.requested_unique {
+            let slot_index = self
+                .locations
+                .get(key)
+                .copied()
+                .ok_or(FabricError::InvalidCache)?;
+            self.slots[slot_index].last_used_step = plan.step;
+        }
+        self.stats.hits = self.stats.hits.saturating_add(plan.resident_hits);
+        self.stats.misses = self.stats.misses.saturating_add(plan.loads.len() as u64);
+        self.stats.bytes_loaded = self
+            .stats
+            .bytes_loaded
+            .saturating_add(self.slot_bytes.saturating_mul(plan.loads.len() as u64));
+        self.step = plan.step;
+        self.version = next_version;
+        Ok(plan.addresses)
+    }
+
+    /// Synchronous compatibility helper used by tests and resident baselines.
+    /// Production NVMe code uses `prepare`, fills the returned slots, and then
+    /// calls `commit`.
+    pub fn resolve(
+        &mut self,
+        requested: &[ExpertKey],
+    ) -> Result<Vec<ExpertSlotAddress>, FabricError> {
+        let plan = self.prepare(requested)?;
+        self.commit(plan)
+    }
+
+    fn address(&self, slot_index: usize) -> Result<ExpertSlotAddress, FabricError> {
+        let byte_offset = self
+            .slot_bytes
+            .checked_mul(slot_index as u64)
+            .ok_or(FabricError::IntegerOverflow)?;
+        Ok(ExpertSlotAddress {
+            slot: u32::try_from(slot_index).map_err(|_| FabricError::IntegerOverflow)?,
+            byte_offset,
+        })
     }
 }
 
@@ -332,6 +466,7 @@ pub enum FabricError {
     IntegerOverflow,
     MemoryBudget { required: u64, available: u64 },
     InvalidCache,
+    StalePlan,
     WorkingSet { requested: usize, slots: usize },
 }
 
@@ -351,6 +486,7 @@ impl Display for FabricError {
                 "fabric requires {required} committed bytes, only {available} are available"
             ),
             Self::InvalidCache => formatter.write_str("invalid fixed expert cache"),
+            Self::StalePlan => formatter.write_str("stale expert residency transaction"),
             Self::WorkingSet { requested, slots } => write!(
                 formatter,
                 "expert working set needs {requested} slots, cache has {slots}"
@@ -437,5 +573,45 @@ mod tests {
             ])
             .expect_err("working set must fit");
         assert!(matches!(error, FabricError::WorkingSet { .. }));
+    }
+
+    #[test]
+    fn dropped_residency_plan_does_not_publish_unread_expert_bytes() {
+        let mut cache = FixedExpertCache::new(1, 4096).expect("cache");
+        let expert = ExpertKey {
+            layer: 3,
+            expert: 7,
+        };
+        let abandoned = cache.prepare(&[expert]).expect("prepare failed I/O");
+        assert_eq!(abandoned.loads().len(), 1);
+        assert_eq!(cache.stats, ExpertCacheStats::default());
+        drop(abandoned);
+
+        let retry = cache.prepare(&[expert]).expect("retry");
+        assert_eq!(retry.loads().len(), 1);
+        let addresses = cache.commit(retry).expect("publish loaded bytes");
+        assert_eq!(addresses[0].byte_offset, 0);
+        assert_eq!(cache.stats.misses, 1);
+        assert_eq!(cache.stats.bytes_loaded, 4096);
+    }
+
+    #[test]
+    fn stale_residency_transaction_cannot_overwrite_a_newer_commit() {
+        let mut cache = FixedExpertCache::new(1, 4096).expect("cache");
+        let a = ExpertKey {
+            layer: 0,
+            expert: 1,
+        };
+        let b = ExpertKey {
+            layer: 0,
+            expert: 2,
+        };
+        let first = cache.prepare(&[a]).expect("first");
+        let stale = cache.prepare(&[b]).expect("parallel stale plan");
+        cache.commit(first).expect("first commit");
+        assert_eq!(cache.commit(stale), Err(FabricError::StalePlan));
+        assert_eq!(cache.resolve(&[a]).expect("a remains resident")[0].slot, 0);
+        assert_eq!(cache.stats.hits, 1);
+        assert_eq!(cache.stats.misses, 1);
     }
 }

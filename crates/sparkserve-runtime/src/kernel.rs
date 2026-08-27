@@ -172,9 +172,14 @@ impl GroupedExpertLayout {
             // Keep even an empty expert's pointer inside an allocated scale
             // tile. This lets a fixed 512-expert CUDA graph remain valid as
             // the set of hot experts changes between batches.
+            let expert_scale_rows = if padded_rows == 0 {
+                128
+            } else {
+                align_up(padded_rows, 128)?
+            };
             input_scale_rows = input_scale_rows.max(
                 scale_offset
-                    .checked_add(128)
+                    .checked_add(expert_scale_rows)
                     .ok_or(KernelContractError::DimensionOverflow)?,
             );
             total_rows = total_rows
@@ -905,5 +910,13 @@ mod tests {
                 host_metadata_bytes: 52,
             }
         );
+    }
+
+    #[test]
+    fn routed_scale_arena_covers_a_large_last_expert() {
+        let layout = GroupedExpertLayout::from_expert_rows(&[1, 257]).expect("layout");
+        assert_eq!(layout.m_indptr, vec![0, 4, 264]);
+        assert_eq!(layout.scale_row_offsets, vec![0, 128]);
+        assert_eq!(layout.input_scale_rows, 512);
     }
 }
