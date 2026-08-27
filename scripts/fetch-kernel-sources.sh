@@ -40,4 +40,6 @@ fi
 
 manifest=$(cd "$(dirname "$0")/.." && pwd)/third_party/flashinfer-nvfp4/source-files.sha256
 (cd "$destination" && sha256sum -c "$manifest")
+xqa_manifest=$(cd "$(dirname "$0")/.." && pwd)/third_party/flashinfer-xqa/source-files.sha256
+(cd "$destination" && sha256sum -c "$xqa_manifest")
 echo "kernel sources ready: $destination"

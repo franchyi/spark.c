@@ -14,7 +14,8 @@ pub const QWEN_QSA_PACKED_ROW_TOKENS: usize = 2112;
 pub const QWEN_QSA_KV_HEADS: usize = 2;
 pub const QWEN_QSA_HEAD_DIM: usize = 256;
 pub const QWEN_QSA_QUERY_HEADS: usize = 24;
-pub const TRTLLM_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
+pub const ATTENTION_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
+pub const XQA_SEMAPHORE_BYTES: usize = 8 * 1024 * 1024;
 
 const BF16_BYTES: usize = 2;
 const I32_BYTES: usize = 4;
@@ -37,8 +38,12 @@ pub struct QsaScratchLayout {
     pub block_tables_bytes: usize,
     pub attention_output_offset: usize,
     pub attention_output_bytes: usize,
-    pub trtllm_workspace_offset: usize,
-    pub trtllm_workspace_bytes: usize,
+    pub attention_workspace_offset: usize,
+    pub attention_workspace_bytes: usize,
+    pub xqa_semaphore_offset: usize,
+    pub xqa_semaphore_bytes: usize,
+    pub xqa_scratch_offset: usize,
+    pub xqa_scratch_bytes: usize,
     pub total_bytes: usize,
     pub alignment: usize,
 }
@@ -134,14 +139,21 @@ impl QsaSparseDecodePlan {
                 .ok_or(QsaPlanError::SizeOverflow)?,
             SCRATCH_ALIGNMENT,
         )?;
-        let trtllm_workspace_offset = align_up(
+        let attention_workspace_offset = align_up(
             attention_output_offset
                 .checked_add(attention_output_bytes)
                 .ok_or(QsaPlanError::SizeOverflow)?,
             SCRATCH_ALIGNMENT,
         )?;
-        let total_bytes = trtllm_workspace_offset
-            .checked_add(TRTLLM_WORKSPACE_BYTES)
+        let total_bytes = attention_workspace_offset
+            .checked_add(ATTENTION_WORKSPACE_BYTES)
+            .ok_or(QsaPlanError::SizeOverflow)?;
+        let xqa_semaphore_offset = attention_workspace_offset;
+        let xqa_scratch_offset = xqa_semaphore_offset
+            .checked_add(XQA_SEMAPHORE_BYTES)
+            .ok_or(QsaPlanError::SizeOverflow)?;
+        let xqa_scratch_bytes = ATTENTION_WORKSPACE_BYTES
+            .checked_sub(XQA_SEMAPHORE_BYTES)
             .ok_or(QsaPlanError::SizeOverflow)?;
 
         Ok(QsaScratchLayout {
@@ -155,14 +167,18 @@ impl QsaSparseDecodePlan {
             block_tables_bytes,
             attention_output_offset,
             attention_output_bytes,
-            trtllm_workspace_offset,
-            trtllm_workspace_bytes: TRTLLM_WORKSPACE_BYTES,
+            attention_workspace_offset,
+            attention_workspace_bytes: ATTENTION_WORKSPACE_BYTES,
+            xqa_semaphore_offset,
+            xqa_semaphore_bytes: XQA_SEMAPHORE_BYTES,
+            xqa_scratch_offset,
+            xqa_scratch_bytes,
             total_bytes,
             alignment: SCRATCH_ALIGNMENT,
         })
     }
 
-    /// Fill the immutable row-major TRT-LLM block table once, before graph
+    /// Fill the immutable row-major XQA block table once, before graph
     /// capture. Each request owns 33 consecutive 64-token pages.
     pub fn fill_block_tables(self, output: &mut [i32]) -> Result<usize, QsaPlanError> {
         let needed = self
@@ -212,7 +228,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qwen_geometry_matches_sglang_trtllm_path() {
+    fn qwen_geometry_matches_sglang_xqa_path() {
         let plan = QsaSparseDecodePlan::qwen38_flash(8).expect("plan");
         assert_eq!(QWEN_QSA_PAGES_PER_ROW, 33);
         assert_eq!(QWEN_QSA_PACKED_ROW_TOKENS, 2112);
@@ -235,8 +251,8 @@ mod tests {
                 layout.attention_output_bytes,
             ),
             (
-                layout.trtllm_workspace_offset,
-                layout.trtllm_workspace_bytes,
+                layout.attention_workspace_offset,
+                layout.attention_workspace_bytes,
             ),
         ];
         for (index, (offset, bytes)) in regions.iter().copied().enumerate() {
@@ -248,6 +264,19 @@ mod tests {
         }
         let (last_offset, last_bytes) = regions[regions.len() - 1];
         assert_eq!(layout.total_bytes, last_offset + last_bytes);
+        assert_eq!(
+            layout.xqa_semaphore_offset,
+            layout.attention_workspace_offset
+        );
+        assert_eq!(layout.xqa_semaphore_bytes, 8 * 1024 * 1024);
+        assert_eq!(
+            layout.xqa_scratch_offset,
+            layout.xqa_semaphore_offset + layout.xqa_semaphore_bytes
+        );
+        assert_eq!(
+            layout.xqa_scratch_bytes,
+            layout.attention_workspace_bytes - layout.xqa_semaphore_bytes
+        );
     }
 
     #[test]

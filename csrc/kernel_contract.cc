@@ -32,6 +32,9 @@
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_KV_PACK
 #include "internal/qsa_kv_pack_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_FLASHINFER_XQA_DECODE
+#include "internal/qsa_decode_backend.h"
+#endif
 
 namespace {
 
@@ -215,6 +218,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("QSA index-prep backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_QSA_KV_PACK:
       return Invalid("QSA K/V-pack backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_FLASHINFER_XQA_DECODE:
+      return Invalid("FlashInfer XQA backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1238,6 +1243,115 @@ extern "C" SparkServeStatus sparkserve_qsa_kv_pack_launch(
   return sparkserve_sglang_qsa_kv_pack_cuda_launch(args);
 #else
   return Unavailable("SGLang QSA K/V-pack donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_decode_validate(
+    const SparkServeQsaDecodePlan* plan) {
+  if (plan == nullptr) return Invalid("QSA decode plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->batch_size == 0 || plan->batch_size > 1U << 16 ||
+      plan->multiprocessor_count == 0 || plan->multiprocessor_count > 1024) {
+    return Invalid("QSA decode batch and SM count must be non-zero and bounded");
+  }
+  if (plan->num_q_heads != 24 || plan->num_kv_heads != 2 ||
+      plan->head_dim != 256 || plan->page_size != 64 ||
+      plan->pages_per_row != 33 || plan->packed_row_stride != 2112) {
+    return Unsupported("Qwen3.8 Flash-Next XQA decode shape is unsupported");
+  }
+  if (plan->dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("QSA XQA decode requires BF16 Q/K/V and output");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_FLASHINFER_XQA_DECODE) {
+    return Invalid("unknown QSA decode backend");
+  }
+  if (plan->enable_pdl > 1) return Invalid("QSA decode PDL flag is invalid");
+  const uint64_t query_elements =
+      static_cast<uint64_t>(plan->batch_size) * plan->num_q_heads *
+      plan->head_dim;
+  const uint64_t packed_tokens =
+      static_cast<uint64_t>(plan->batch_size) * plan->packed_row_stride;
+  const uint64_t packed_elements =
+      packed_tokens * plan->num_kv_heads * plan->head_dim;
+  if (!CanMultiply(query_elements, sizeof(uint16_t)) ||
+      !CanMultiply(packed_elements, sizeof(uint16_t)) ||
+      !CanMultiply(plan->batch_size, plan->pages_per_row) ||
+      !CanMultiply(static_cast<uint64_t>(plan->batch_size) *
+                       plan->pages_per_row,
+                   sizeof(int32_t))) {
+    return Invalid("QSA decode buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_decode_query(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaDecodePlan* plan,
+    SparkServeKernelInfo* info) {
+  constexpr uint64_t kWorkspaceBytes = 128ULL * 1024 * 1024;
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first FlashInfer XQA decode is validated only on GB10/SM121");
+  }
+  if (caps->workspace_limit_bytes != 0 &&
+      caps->workspace_limit_bytes < kWorkspaceBytes) {
+    return Unsupported("device workspace limit is below QSA XQA requirement");
+  }
+  SparkServeStatus plan_status = sparkserve_qsa_decode_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_FLASHINFER_XQA_DECODE;
+  info->workspace_bytes = kWorkspaceBytes;
+  info->available = 0;
+  info->name = "flashinfer-xqa-qwen-qsa-bf16";
+  info->source_revision =
+      "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+#ifdef SPARKSERVE_WITH_FLASHINFER_XQA_DECODE
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_decode_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaDecodeArgs* args) {
+  constexpr uint64_t kWorkspaceBytes = 128ULL * 1024 * 1024;
+  if (args == nullptr) return Invalid("QSA decode arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query_status =
+      sparkserve_qsa_decode_query(caps, &args->plan, &info);
+  if (query_status.code != SPARKSERVE_STATUS_OK) return query_status;
+  if (args->query == nullptr || args->packed_key == nullptr ||
+      args->packed_value == nullptr || args->block_tables == nullptr ||
+      args->sequence_lengths == nullptr || args->output == nullptr ||
+      args->workspace == nullptr) {
+    return Invalid("QSA decode pointers cannot be null");
+  }
+  if (args->workspace_bytes < kWorkspaceBytes) {
+    return Invalid("QSA decode workspace is smaller than 128 MiB");
+  }
+  if (!(args->bmm1_scale > 0.0f && args->bmm1_scale < 1.0e6f) ||
+      !(args->bmm2_scale > 0.0f && args->bmm2_scale < 1.0e6f)) {
+    return Invalid("QSA decode scales must be finite and positive");
+  }
+#ifdef SPARKSERVE_WITH_FLASHINFER_XQA_DECODE
+  return sparkserve_flashinfer_xqa_decode_cuda_launch(args);
+#else
+  return Unavailable("FlashInfer XQA decode donor is not linked");
 #endif
 }
 

@@ -175,8 +175,12 @@ complete: four BF16 rows, including their fixed page padding, match every bit
 and take 46.33 microseconds on SM121. Each graph row reserves 33 64-token pages
 (2112 positions), and Rust allocates the packed K/V, valid counts, immutable
 block table, output, and shared 128-MiB attention workspace at fixed addresses.
-Sparse decode next wraps the FlashInfer TRT-LLM-gen kernel that SGLang itself
-selects on SM121. Rust retains ownership of logical-to-physical KV maps,
+The attention kernel is now borrowed too. A direct probe established that
+FlashInfer 0.6.17 `auto` selects XQA on SM121 and that forced TRT-LLM-gen is not
+supported. SparkServe directly compiles the pinned BF16 XQA specialization
+behind its raw ABI; batch-one output is bit-exact and takes 7.55 microseconds.
+The 128-MiB fixed workspace is split into XQA's 8-MiB semaphore region and
+120-MiB scratch region. Rust retains ownership of logical-to-physical KV maps,
 residency, graph buckets, and replay.
 
 ### GGUF

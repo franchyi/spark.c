@@ -32,6 +32,16 @@ entrypoint = "flashinfer/gdn_kernels/gdn_decode_pretranspose.py"
 notes = "Defines Qwen GDN BF16 K-last state recurrence and pool layout. SparkServe reimplements the fixed K=V=128 decode contract in raw CUDA and does not link Python or CuTe DSL."
 
 [[source]]
+id = "flashinfer-xqa-qsa-decode"
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "external-source-specialization"
+status = "linked-framework-free-sm121-bit-parity-passed"
+entrypoint = "csrc/xqa/mha.cu"
+notes = "BF16 Qwen QSA decode specialization: H=256, 24 query heads, two K/V heads, 64-token pages, batch-one output bit-exact at 7.55 us. FlashInfer auto resolves to XQA on SM121; forced trtllm-gen rejects the architecture. Rust owns fixed scratch, page tables, lengths, and scheduling."
+
+[[source]]
 id = "flashinfer-cute-silu-nvfp4"
 repository = "https://github.com/flashinfer-ai/flashinfer"
 revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"

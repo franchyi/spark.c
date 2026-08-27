@@ -144,6 +144,13 @@ the `sm_121a` GPU test compares updated state and output against an independent
 reference implementation. This is a correctness kernel; profiling and fusion
 with QKV extraction come after real-tensor parity with SGLang.
 
+QSA sparse decode now borrows its proven arithmetic rather than reimplementing
+attention. SGLang-derived fused index prep, radix top-k, and selected-K/V pack
+feed FlashInfer's pinned BF16 XQA kernel through raw C ABIs. On GB10, all packed
+K/V bits and the batch-one attention output match their framework oracles;
+the XQA launch itself takes 7.55 microseconds. Rust owns the fixed 64-token page
+tables, graph-bucket addresses, valid lengths, and 128-MiB workspace split.
+
 The Flash-Next storage path now has a cross-language `SSPLEIDX` contract, a
 zero-copy safetensors indexer, bounded Python and Rust caches, cross-page row
 assembly, batch-page admission limits, corruption checks, and a parallel Rust

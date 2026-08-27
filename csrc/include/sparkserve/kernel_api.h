@@ -59,6 +59,8 @@ typedef enum SparkServeKernelBackend {
   // QSA valid-count and selected-K/V compaction adapted from SGLang's Triton
   // sparse-attention path. Rust owns the page-aligned output layout.
   SPARKSERVE_BACKEND_SGLANG_QSA_KV_PACK = 10,
+  // FlashInfer XQA BF16 paged decode specialized to Qwen QSA on SM121.
+  SPARKSERVE_BACKEND_FLASHINFER_XQA_DECODE = 11,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -480,6 +482,47 @@ typedef struct SparkServeQsaKvPackArgs {
   void* cuda_stream;
 } SparkServeQsaKvPackArgs;
 
+typedef struct SparkServeQsaDecodePlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t batch_size;
+  uint32_t multiprocessor_count;
+  uint32_t num_q_heads;
+  uint32_t num_kv_heads;
+  uint32_t head_dim;
+  uint32_t page_size;
+  uint32_t pages_per_row;
+  uint32_t packed_row_stride;
+  uint32_t dtype;
+  uint32_t requested_backend;
+  uint32_t enable_pdl;
+  uint32_t reserved;
+} SparkServeQsaDecodePlan;
+
+typedef struct SparkServeQsaDecodeArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeQsaDecodePlan plan;
+  // BF16 [batch_size,num_q_heads,head_dim].
+  const void* query;
+  // BF16 NHD scratch, viewed as
+  // [batch_size*pages_per_row,page_size,num_kv_heads,head_dim].
+  const void* packed_key;
+  const void* packed_value;
+  // INT32 [batch_size,pages_per_row] and [batch_size].
+  const int32_t* block_tables;
+  const int32_t* sequence_lengths;
+  // BF16 [batch_size,num_q_heads,head_dim].
+  void* output;
+  // Zero-initialize once before first use. XQA reserves its first 8 MiB for
+  // semaphores and uses the remainder as fixed scratch.
+  void* workspace;
+  uint64_t workspace_bytes;
+  float bmm1_scale;
+  float bmm2_scale;
+  void* cuda_stream;
+} SparkServeQsaDecodeArgs;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -659,6 +702,18 @@ SparkServeStatus sparkserve_qsa_kv_pack_query(
 SparkServeStatus sparkserve_qsa_kv_pack_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeQsaKvPackArgs* args);
+
+SparkServeStatus sparkserve_qsa_decode_validate(
+    const SparkServeQsaDecodePlan* plan);
+
+SparkServeStatus sparkserve_qsa_decode_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaDecodePlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_qsa_decode_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaDecodeArgs* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);

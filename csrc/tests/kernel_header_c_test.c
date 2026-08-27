@@ -32,6 +32,10 @@ _Static_assert(sizeof(SparkServeQsaKvPackPlan) == 48u,
                "C QSA K/V-pack plan layout drifted");
 _Static_assert(sizeof(SparkServeQsaKvPackArgs) == 136u,
                "C QSA K/V-pack arguments layout drifted");
+_Static_assert(sizeof(SparkServeQsaDecodePlan) == 56u,
+               "C QSA decode plan layout drifted");
+_Static_assert(sizeof(SparkServeQsaDecodeArgs) == 144u,
+               "C QSA decode arguments layout drifted");
 _Static_assert(sizeof(SparkServeCoherentRegionConfig) == 48u,
                "C coherent region config layout drifted");
 _Static_assert(sizeof(SparkServeCoherentRegionView) == 80u,

@@ -455,6 +455,54 @@ int main() {
   assert(sparkserve_qsa_kv_pack_validate(&qsa_pack).code ==
          SPARKSERVE_STATUS_UNSUPPORTED);
 
+  SparkServeQsaDecodePlan qsa_decode = {
+      sizeof(SparkServeQsaDecodePlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      4,
+      48,
+      24,
+      2,
+      256,
+      64,
+      33,
+      2112,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_BACKEND_AUTO,
+      1,
+      0,
+  };
+  assert(sparkserve_qsa_decode_validate(&qsa_decode).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo qsa_decode_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_qsa_decode_query(&caps, &qsa_decode, &qsa_decode_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(qsa_decode_info.backend == SPARKSERVE_BACKEND_FLASHINFER_XQA_DECODE);
+  assert(qsa_decode_info.workspace_bytes == 128ULL * 1024 * 1024);
+  assert(qsa_decode_info.available == 0);
+  SparkServeQsaDecodeArgs qsa_decode_args = {};
+  qsa_decode_args.struct_size = sizeof(qsa_decode_args);
+  qsa_decode_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  qsa_decode_args.plan = qsa_decode;
+  qsa_decode_args.query = &output;
+  qsa_decode_args.packed_key = &output;
+  qsa_decode_args.packed_value = &output;
+  qsa_decode_args.block_tables = &qsa_start;
+  qsa_decode_args.sequence_lengths = &qsa_length;
+  qsa_decode_args.output = &output;
+  qsa_decode_args.workspace = &output;
+  qsa_decode_args.workspace_bytes = 128ULL * 1024 * 1024;
+  qsa_decode_args.bmm1_scale = 0.0625f;
+  qsa_decode_args.bmm2_scale = 1.0f;
+  assert(sparkserve_qsa_decode_launch(&caps, &qsa_decode_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  qsa_decode.page_size = 32;
+  assert(sparkserve_qsa_decode_validate(&qsa_decode).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,
