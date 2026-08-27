@@ -41,6 +41,9 @@ typedef enum SparkServeKernelBackend {
   // FlashInfer's grouped SM120/121 NVFP4 GEMM. SparkServe owns routing and
   // token permutation; the donor kernel owns only the tensor-core matmul.
   SPARKSERVE_BACKEND_FLASHINFER_GROUP_MM_FP4 = 3,
+  // FlashInfer CuTe-DSL fused SiLU/multiply/NVFP4 quantizer. Its exported
+  // artifact is consumed without Python, PyTorch, or SGLang at serving time.
+  SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4 = 4,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -171,6 +174,40 @@ typedef struct SparkServeGroupedNvfp4Args {
   void* cuda_stream;
 } SparkServeGroupedNvfp4Args;
 
+// Expert-major fused activation and requantization between the two MoE GEMMs.
+// Input is BF16 [E,M,2K] in [gate,up] order. Output is packed E2M1
+// [E,M,K/2], plus one CUTLASS 128x4 scale tile per expert. `active_rows`
+// is a host array that masks unused capacity; a later scheduler-owned
+// compaction step forms the variable-row grouped-GEMM input without copying
+// model weights. Scales remain device-resident and may vary by expert.
+typedef struct SparkServeSiluNvfp4Plan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_experts;
+  uint32_t rows_per_expert;
+  uint64_t hidden_size;
+  uint32_t group_size;
+  uint32_t input_dtype;
+  uint32_t output_scale_layout;
+  uint32_t requested_backend;
+  uint32_t reserved;
+} SparkServeSiluNvfp4Plan;
+
+typedef struct SparkServeSiluNvfp4Args {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeSiluNvfp4Plan plan;
+  const void* input;
+  const float* input_global_scales;
+  const int32_t* active_rows;
+  void* packed_output;
+  void* output_scales;
+  uint64_t input_expert_stride_bytes;
+  uint64_t output_expert_stride_bytes;
+  uint64_t scale_expert_stride_bytes;
+  void* cuda_stream;
+} SparkServeSiluNvfp4Args;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -250,6 +287,18 @@ SparkServeStatus sparkserve_grouped_nvfp4_query(
 SparkServeStatus sparkserve_grouped_nvfp4_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeGroupedNvfp4Args* args);
+
+SparkServeStatus sparkserve_silu_nvfp4_validate(
+    const SparkServeSiluNvfp4Plan* plan);
+
+SparkServeStatus sparkserve_silu_nvfp4_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSiluNvfp4Plan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_silu_nvfp4_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSiluNvfp4Args* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);

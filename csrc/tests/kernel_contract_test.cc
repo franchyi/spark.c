@@ -123,6 +123,48 @@ int main() {
   assert(sparkserve_grouped_nvfp4_launch(&caps, &grouped_args).code ==
          SPARKSERVE_STATUS_INVALID_ARGUMENT);
 
+  SparkServeSiluNvfp4Plan silu = {
+      sizeof(SparkServeSiluNvfp4Plan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      2,
+      4,
+      640,
+      16,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4,
+      SPARKSERVE_BACKEND_AUTO,
+      0,
+  };
+  assert(sparkserve_silu_nvfp4_validate(&silu).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo silu_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_silu_nvfp4_query(&caps, &silu, &silu_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(silu_info.backend == SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4);
+  assert(silu_info.available == 0);
+
+  SparkServeSiluNvfp4Args silu_args = {};
+  silu_args.struct_size = sizeof(silu_args);
+  silu_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  silu_args.plan = silu;
+  silu_args.input = &packed;
+  silu_args.input_global_scales = alpha;
+  silu_args.active_rows = indptr;
+  silu_args.packed_output = &packed;
+  silu_args.output_scales = &scale;
+  silu_args.input_expert_stride_bytes = 4 * 640 * 4;
+  silu_args.output_expert_stride_bytes = 4 * 640 / 2;
+  silu_args.scale_expert_stride_bytes = 128 * (640 / 16);
+  assert(sparkserve_silu_nvfp4_launch(&caps, &silu_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  silu_args.scale_expert_stride_bytes += 1;
+  assert(sparkserve_silu_nvfp4_launch(&caps, &silu_args).code ==
+         SPARKSERVE_STATUS_INVALID_ARGUMENT);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,

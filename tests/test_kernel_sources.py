@@ -47,8 +47,15 @@ def test_first_nvfp4_candidate_is_framework_free_and_pinned() -> None:
         "linked-framework-free-sm121-real-tensor-parity-passed"
     )
     assert grouped["revision"] == flashinfer["revision"]
+    fused = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "flashinfer-cute-silu-nvfp4"
+    )
+    assert fused["status"] == "linked-aot-sm121-synthetic-bit-parity-passed"
+    assert fused["revision"] == flashinfer["revision"]
     vendor = ROOT / "third_party" / "flashinfer-nvfp4"
     assert (vendor / "VENDOR.md").is_file()
     hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
-    assert len(hashes) == 7
+    assert len(hashes) == 11
     assert all(re.fullmatch(r"[0-9a-f]{64}  .+", line) for line in hashes)

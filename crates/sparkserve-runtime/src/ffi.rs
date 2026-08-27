@@ -1,6 +1,8 @@
 use std::ffi::{c_char, c_void};
 
-use crate::kernel::{DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION};
+use crate::kernel::{
+    DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION, SiluNvfp4Spec,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -170,6 +172,55 @@ pub struct GroupedNvfp4Args {
     pub cuda_stream: *mut c_void,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SiluNvfp4Plan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_experts: u32,
+    pub rows_per_expert: u32,
+    pub hidden_size: u64,
+    pub group_size: u32,
+    pub input_dtype: u32,
+    pub output_scale_layout: u32,
+    pub requested_backend: u32,
+    pub reserved: u32,
+}
+
+impl From<SiluNvfp4Spec> for SiluNvfp4Plan {
+    fn from(spec: SiluNvfp4Spec) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_experts: spec.num_experts,
+            rows_per_expert: spec.rows_per_expert,
+            hidden_size: spec.hidden_size,
+            group_size: spec.group_size,
+            input_dtype: spec.input_dtype as u32,
+            output_scale_layout: spec.output_scale_layout as u32,
+            requested_backend: spec.requested_backend as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SiluNvfp4Args {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: SiluNvfp4Plan,
+    pub input: *const c_void,
+    pub input_global_scales: *const f32,
+    pub active_rows: *const i32,
+    pub packed_output: *mut c_void,
+    pub output_scales: *mut c_void,
+    pub input_expert_stride_bytes: u64,
+    pub output_expert_stride_bytes: u64,
+    pub scale_expert_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GdnBackend {
@@ -279,6 +330,16 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const GroupedNvfp4Args,
     ) -> Status;
+    pub fn sparkserve_silu_nvfp4_validate(plan: *const SiluNvfp4Plan) -> Status;
+    pub fn sparkserve_silu_nvfp4_query(
+        caps: *const DeviceCaps,
+        plan: *const SiluNvfp4Plan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_silu_nvfp4_launch(
+        caps: *const DeviceCaps,
+        args: *const SiluNvfp4Args,
+    ) -> Status;
     pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn sparkserve_gdn_decode_query(
         caps: *const DeviceCaps,
@@ -309,6 +370,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<GroupedNvfp4Plan>(), 80);
         assert_eq!(std::mem::size_of::<GroupedNvfp4WeightView>(), 32);
         assert_eq!(std::mem::size_of::<GroupedNvfp4Args>(), 224);
+        assert_eq!(std::mem::size_of::<SiluNvfp4Plan>(), 48);
+        assert_eq!(std::mem::size_of::<SiluNvfp4Args>(), 128);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
@@ -350,6 +413,21 @@ mod tests {
         assert_eq!(
             plan.requested_backend,
             KernelBackend::FlashInferGroupMmFp4 as u32
+        );
+    }
+
+    #[test]
+    fn fused_spec_converts_to_cute_aot_contract() {
+        use crate::kernel::SiluNvfp4Spec;
+
+        let native = SiluNvfp4Spec::qwen_flash(10, 4).expect("fused spec");
+        let plan = SiluNvfp4Plan::from(native);
+        assert_eq!(plan.hidden_size, 640);
+        assert_eq!(plan.num_experts, 10);
+        assert_eq!(plan.rows_per_expert, 4);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::FlashInferCuteSiluNvfp4 as u32
         );
     }
 }

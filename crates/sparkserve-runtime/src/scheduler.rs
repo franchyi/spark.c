@@ -1,0 +1,443 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt::{Display, Formatter};
+
+const ARENA_ALIGNMENT: u64 = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchedulerConfig {
+    pub sequence_slots: u32,
+    pub max_context_tokens: u32,
+    pub max_prefill_tokens: u32,
+    pub prefill_buckets: Vec<u32>,
+    pub kv_bytes_per_token: u64,
+    pub recurrent_state_bytes: u64,
+    pub shared_workspace_bytes: u64,
+    pub fabric_committed_bytes: u64,
+    pub safety_reserve_bytes: u64,
+    pub physical_memory_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceArena {
+    pub slot: u32,
+    pub offset: u64,
+    pub bytes: u64,
+    pub kv_offset: u64,
+    pub kv_bytes: u64,
+    pub recurrent_state_offset: u64,
+    pub recurrent_state_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaPlan {
+    pub sequence_stride_bytes: u64,
+    pub sequence_arenas_bytes: u64,
+    pub shared_workspace_offset: u64,
+    pub shared_workspace_bytes: u64,
+    pub runtime_committed_bytes: u64,
+    pub total_committed_bytes: u64,
+    sequence_slots: u32,
+    kv_bytes: u64,
+    recurrent_state_bytes: u64,
+}
+
+impl ArenaPlan {
+    pub fn build(config: &SchedulerConfig) -> Result<Self, SchedulerError> {
+        validate_config(config)?;
+        let kv_bytes = checked_mul(
+            u64::from(config.max_context_tokens),
+            config.kv_bytes_per_token,
+        )?;
+        let state_offset = align_up(kv_bytes, ARENA_ALIGNMENT)?;
+        let sequence_stride_bytes = align_up(
+            checked_add(state_offset, config.recurrent_state_bytes)?,
+            ARENA_ALIGNMENT,
+        )?;
+        let sequence_arenas_bytes =
+            checked_mul(sequence_stride_bytes, u64::from(config.sequence_slots))?;
+        let shared_workspace_offset = align_up(sequence_arenas_bytes, ARENA_ALIGNMENT)?;
+        let runtime_committed_bytes = checked_add(
+            shared_workspace_offset,
+            align_up(config.shared_workspace_bytes, ARENA_ALIGNMENT)?,
+        )?;
+        let total_committed_bytes = checked_add(
+            checked_add(config.fabric_committed_bytes, runtime_committed_bytes)?,
+            config.safety_reserve_bytes,
+        )?;
+        if total_committed_bytes > config.physical_memory_bytes {
+            return Err(SchedulerError::MemoryBudget {
+                required: total_committed_bytes,
+                available: config.physical_memory_bytes,
+            });
+        }
+        Ok(Self {
+            sequence_stride_bytes,
+            sequence_arenas_bytes,
+            shared_workspace_offset,
+            shared_workspace_bytes: config.shared_workspace_bytes,
+            runtime_committed_bytes,
+            total_committed_bytes,
+            sequence_slots: config.sequence_slots,
+            kv_bytes,
+            recurrent_state_bytes: config.recurrent_state_bytes,
+        })
+    }
+
+    pub fn sequence(&self, slot: u32) -> Result<SequenceArena, SchedulerError> {
+        if slot >= self.sequence_slots {
+            return Err(SchedulerError::InvalidSlot(slot));
+        }
+        let offset = checked_mul(u64::from(slot), self.sequence_stride_bytes)?;
+        let recurrent_state_offset =
+            checked_add(offset, align_up(self.kv_bytes, ARENA_ALIGNMENT)?)?;
+        Ok(SequenceArena {
+            slot,
+            offset,
+            bytes: self.sequence_stride_bytes,
+            kv_offset: offset,
+            kv_bytes: self.kv_bytes,
+            recurrent_state_offset,
+            recurrent_state_bytes: self.recurrent_state_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphShape {
+    Decode,
+    Prefill { bucket_tokens: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestSpec {
+    pub id: u64,
+    pub prompt_tokens: u32,
+    pub max_new_tokens: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceLease {
+    pub request_id: u64,
+    pub slot: u32,
+    pub generation: u64,
+    pub prompt_tokens: u32,
+    pub max_new_tokens: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveSequence {
+    lease: SequenceLease,
+    generated_tokens: u32,
+}
+
+pub struct StaticScheduler {
+    config: SchedulerConfig,
+    arena: ArenaPlan,
+    free_slots: VecDeque<u32>,
+    slot_generations: Vec<u64>,
+    active: BTreeMap<u64, ActiveSequence>,
+}
+
+impl StaticScheduler {
+    pub fn new(config: SchedulerConfig) -> Result<Self, SchedulerError> {
+        let arena = ArenaPlan::build(&config)?;
+        let free_slots = (0..config.sequence_slots).collect();
+        let slot_generations = vec![0; config.sequence_slots as usize];
+        Ok(Self {
+            config,
+            arena,
+            free_slots,
+            slot_generations,
+            active: BTreeMap::new(),
+        })
+    }
+
+    pub fn arena(&self) -> &ArenaPlan {
+        &self.arena
+    }
+
+    pub fn graph_for_prefill(&self, tokens: u32) -> Result<GraphShape, SchedulerError> {
+        if tokens == 0 || tokens > self.config.max_prefill_tokens {
+            return Err(SchedulerError::PrefillLength(tokens));
+        }
+        let bucket_tokens = self
+            .config
+            .prefill_buckets
+            .iter()
+            .copied()
+            .find(|bucket| *bucket >= tokens)
+            .ok_or(SchedulerError::PrefillLength(tokens))?;
+        Ok(GraphShape::Prefill { bucket_tokens })
+    }
+
+    pub fn admit(&mut self, request: RequestSpec) -> Result<SequenceLease, SchedulerError> {
+        if request.prompt_tokens == 0 {
+            return Err(SchedulerError::PromptLength(0));
+        }
+        let total_tokens = request
+            .prompt_tokens
+            .checked_add(request.max_new_tokens)
+            .ok_or(SchedulerError::IntegerOverflow)?;
+        if total_tokens > self.config.max_context_tokens {
+            return Err(SchedulerError::ContextLimit {
+                requested: total_tokens,
+                maximum: self.config.max_context_tokens,
+            });
+        }
+        self.graph_for_prefill(request.prompt_tokens)?;
+        if self.active.contains_key(&request.id) {
+            return Err(SchedulerError::DuplicateRequest(request.id));
+        }
+        let slot = self
+            .free_slots
+            .pop_front()
+            .ok_or(SchedulerError::NoSequenceSlot)?;
+        let generation = self.slot_generations[slot as usize]
+            .checked_add(1)
+            .ok_or(SchedulerError::IntegerOverflow)?;
+        self.slot_generations[slot as usize] = generation;
+        let lease = SequenceLease {
+            request_id: request.id,
+            slot,
+            generation,
+            prompt_tokens: request.prompt_tokens,
+            max_new_tokens: request.max_new_tokens,
+        };
+        self.active.insert(
+            request.id,
+            ActiveSequence {
+                lease,
+                generated_tokens: 0,
+            },
+        );
+        Ok(lease)
+    }
+
+    pub fn record_decode(&mut self, lease: SequenceLease) -> Result<GraphShape, SchedulerError> {
+        let active = self
+            .active
+            .get_mut(&lease.request_id)
+            .ok_or(SchedulerError::StaleLease)?;
+        if active.lease != lease {
+            return Err(SchedulerError::StaleLease);
+        }
+        if active.generated_tokens >= active.lease.max_new_tokens {
+            return Err(SchedulerError::GenerationLimit);
+        }
+        active.generated_tokens += 1;
+        Ok(GraphShape::Decode)
+    }
+
+    pub fn release(&mut self, lease: SequenceLease) -> Result<(), SchedulerError> {
+        let active = self
+            .active
+            .get(&lease.request_id)
+            .ok_or(SchedulerError::StaleLease)?;
+        if active.lease != lease {
+            return Err(SchedulerError::StaleLease);
+        }
+        self.active.remove(&lease.request_id);
+        self.free_slots.push_back(lease.slot);
+        Ok(())
+    }
+
+    pub fn active_sequences(&self) -> usize {
+        self.active.len()
+    }
+}
+
+fn validate_config(config: &SchedulerConfig) -> Result<(), SchedulerError> {
+    if config.sequence_slots == 0
+        || config.max_context_tokens == 0
+        || config.max_prefill_tokens == 0
+        || config.kv_bytes_per_token == 0
+        || config.recurrent_state_bytes == 0
+        || config.physical_memory_bytes == 0
+    {
+        return Err(SchedulerError::InvalidConfig);
+    }
+    if config.max_prefill_tokens > config.max_context_tokens
+        || config.prefill_buckets.is_empty()
+        || config.prefill_buckets.last().copied() != Some(config.max_prefill_tokens)
+        || config.prefill_buckets.iter().any(|bucket| *bucket == 0)
+        || config
+            .prefill_buckets
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(SchedulerError::InvalidPrefillBuckets);
+    }
+    Ok(())
+}
+
+fn align_up(value: u64, alignment: u64) -> Result<u64, SchedulerError> {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        checked_add(value, alignment - remainder)
+    }
+}
+
+fn checked_add(left: u64, right: u64) -> Result<u64, SchedulerError> {
+    left.checked_add(right)
+        .ok_or(SchedulerError::IntegerOverflow)
+}
+
+fn checked_mul(left: u64, right: u64) -> Result<u64, SchedulerError> {
+    left.checked_mul(right)
+        .ok_or(SchedulerError::IntegerOverflow)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchedulerError {
+    InvalidConfig,
+    InvalidPrefillBuckets,
+    IntegerOverflow,
+    MemoryBudget { required: u64, available: u64 },
+    InvalidSlot(u32),
+    PrefillLength(u32),
+    PromptLength(u32),
+    ContextLimit { requested: u32, maximum: u32 },
+    DuplicateRequest(u64),
+    NoSequenceSlot,
+    StaleLease,
+    GenerationLimit,
+}
+
+impl Display for SchedulerError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfig => formatter.write_str("invalid scheduler configuration"),
+            Self::InvalidPrefillBuckets => formatter.write_str("invalid prefill graph buckets"),
+            Self::IntegerOverflow => formatter.write_str("scheduler size overflow"),
+            Self::MemoryBudget {
+                required,
+                available,
+            } => write!(
+                formatter,
+                "scheduler requires {required} committed bytes, only {available} are available"
+            ),
+            Self::InvalidSlot(slot) => write!(formatter, "invalid sequence slot {slot}"),
+            Self::PrefillLength(tokens) => write!(formatter, "unsupported prefill length {tokens}"),
+            Self::PromptLength(tokens) => write!(formatter, "invalid prompt length {tokens}"),
+            Self::ContextLimit { requested, maximum } => write!(
+                formatter,
+                "request needs {requested} tokens, context limit is {maximum}"
+            ),
+            Self::DuplicateRequest(id) => write!(formatter, "request {id} is already active"),
+            Self::NoSequenceSlot => formatter.write_str("no fixed sequence slot is available"),
+            Self::StaleLease => formatter.write_str("stale or unknown sequence lease"),
+            Self::GenerationLimit => formatter.write_str("request generation limit reached"),
+        }
+    }
+}
+
+impl std::error::Error for SchedulerError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> SchedulerConfig {
+        SchedulerConfig {
+            sequence_slots: 2,
+            max_context_tokens: 8_192,
+            max_prefill_tokens: 4_096,
+            prefill_buckets: vec![128, 512, 1_024, 2_048, 4_096],
+            kv_bytes_per_token: 4_096,
+            recurrent_state_bytes: 3 * 1024 * 1024,
+            shared_workspace_bytes: 64 * 1024 * 1024,
+            fabric_committed_bytes: 80 * 1024 * 1024,
+            safety_reserve_bytes: 16 * 1024 * 1024,
+            physical_memory_bytes: 512 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn arena_addresses_do_not_move_when_slots_are_reused() {
+        let mut scheduler = StaticScheduler::new(config()).expect("valid scheduler");
+        let first = scheduler
+            .admit(RequestSpec {
+                id: 1,
+                prompt_tokens: 100,
+                max_new_tokens: 20,
+            })
+            .expect("first lease");
+        let _second = scheduler
+            .admit(RequestSpec {
+                id: 2,
+                prompt_tokens: 100,
+                max_new_tokens: 20,
+            })
+            .expect("second lease");
+        let address = scheduler.arena().sequence(first.slot).expect("arena");
+        scheduler.release(first).expect("release");
+        let reused = scheduler
+            .admit(RequestSpec {
+                id: 3,
+                prompt_tokens: 200,
+                max_new_tokens: 20,
+            })
+            .expect("reused lease");
+        assert_eq!(first.slot, reused.slot);
+        assert_ne!(first.generation, reused.generation);
+        assert_eq!(
+            address,
+            scheduler.arena().sequence(reused.slot).expect("arena")
+        );
+        assert_eq!(
+            scheduler.record_decode(first),
+            Err(SchedulerError::StaleLease)
+        );
+    }
+
+    #[test]
+    fn selects_smallest_prefill_graph_and_enforces_context() {
+        let mut scheduler = StaticScheduler::new(config()).expect("valid scheduler");
+        assert_eq!(
+            scheduler.graph_for_prefill(513),
+            Ok(GraphShape::Prefill {
+                bucket_tokens: 1_024
+            })
+        );
+        assert_eq!(
+            scheduler.admit(RequestSpec {
+                id: 1,
+                prompt_tokens: 4_096,
+                max_new_tokens: 4_097,
+            }),
+            Err(SchedulerError::ContextLimit {
+                requested: 8_193,
+                maximum: 8_192,
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_to_start_when_the_full_fixed_plan_does_not_fit() {
+        let mut config = config();
+        config.physical_memory_bytes = 1;
+        assert!(matches!(
+            StaticScheduler::new(config),
+            Err(SchedulerError::MemoryBudget { .. })
+        ));
+    }
+
+    #[test]
+    fn lease_cannot_generate_past_its_limit() {
+        let mut scheduler = StaticScheduler::new(config()).expect("valid scheduler");
+        let lease = scheduler
+            .admit(RequestSpec {
+                id: 7,
+                prompt_tokens: 10,
+                max_new_tokens: 1,
+            })
+            .expect("lease");
+        assert_eq!(scheduler.record_decode(lease), Ok(GraphShape::Decode));
+        assert_eq!(
+            scheduler.record_decode(lease),
+            Err(SchedulerError::GenerationLimit)
+        );
+    }
+}

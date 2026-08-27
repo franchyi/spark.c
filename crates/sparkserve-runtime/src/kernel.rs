@@ -31,6 +31,7 @@ pub enum KernelBackend {
     FlashInferMmFp4 = 1,
     CutlassSm121 = 2,
     FlashInferGroupMmFp4 = 3,
+    FlashInferCuteSiluNvfp4 = 4,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,6 +313,87 @@ pub struct GroupedNvfp4Buffers {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SiluNvfp4Spec {
+    pub num_experts: u32,
+    pub rows_per_expert: u32,
+    pub hidden_size: u64,
+    pub group_size: u32,
+    pub input_dtype: DataType,
+    pub output_scale_layout: ScaleLayout,
+    pub requested_backend: KernelBackend,
+}
+
+impl SiluNvfp4Spec {
+    pub fn qwen_flash(num_experts: u32, rows_per_expert: u32) -> Result<Self, KernelContractError> {
+        let spec = Self {
+            num_experts,
+            rows_per_expert,
+            hidden_size: 640,
+            group_size: NVFP4_GROUP_SIZE,
+            input_dtype: DataType::BFloat16,
+            output_scale_layout: ScaleLayout::Cutlass128x4,
+            requested_backend: KernelBackend::FlashInferCuteSiluNvfp4,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn validate(self) -> Result<(), KernelContractError> {
+        if self.num_experts == 0 || self.num_experts > 512 {
+            return Err(KernelContractError::InvalidExpertCount(
+                self.num_experts as usize,
+            ));
+        }
+        if self.rows_per_expert == 0 || self.rows_per_expert % 4 != 0 {
+            return Err(KernelContractError::InvalidRoutedPadding);
+        }
+        if self.hidden_size == 0 || self.hidden_size % 128 != 0 {
+            return Err(KernelContractError::GroupedAlignment);
+        }
+        if self.group_size != NVFP4_GROUP_SIZE {
+            return Err(KernelContractError::UnsupportedGroupSize(self.group_size));
+        }
+        if self.input_dtype != DataType::BFloat16 {
+            return Err(KernelContractError::UnsupportedInputType);
+        }
+        if self.output_scale_layout != ScaleLayout::Cutlass128x4 {
+            return Err(KernelContractError::UnsupportedScaleLayout);
+        }
+        if !matches!(
+            self.requested_backend,
+            KernelBackend::Auto | KernelBackend::FlashInferCuteSiluNvfp4
+        ) {
+            return Err(KernelContractError::UnsupportedFusedTactic);
+        }
+        self.buffer_requirements()?;
+        Ok(())
+    }
+
+    pub fn buffer_requirements(self) -> Result<SiluNvfp4Buffers, KernelContractError> {
+        let experts = u64::from(self.num_experts);
+        let rows = u64::from(self.rows_per_expert);
+        let scale_rows = align_up(rows, 128)?;
+        let scale_columns = align_up(self.hidden_size / u64::from(self.group_size), 4)?;
+        Ok(SiluNvfp4Buffers {
+            input_bytes: checked_product(&[experts, rows, self.hidden_size, 4])?,
+            packed_output_bytes: checked_product(&[experts, rows, self.hidden_size / 2])?,
+            output_scale_bytes: checked_product(&[experts, scale_rows, scale_columns])?,
+            global_scale_bytes: checked_product(&[experts, 4])?,
+            active_rows_bytes: checked_product(&[experts, 4])?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SiluNvfp4Buffers {
+    pub input_bytes: u64,
+    pub packed_output_bytes: u64,
+    pub output_scale_bytes: u64,
+    pub global_scale_bytes: u64,
+    pub active_rows_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCaps {
     pub sm: u32,
     pub supports_fp4_tensor_cores: bool,
@@ -395,6 +477,8 @@ pub enum KernelContractError {
     InvalidRoutedPadding,
     GroupedAlignment,
     UnsupportedGroupedTactic,
+    UnsupportedInputType,
+    UnsupportedFusedTactic,
 }
 
 impl fmt::Display for KernelContractError {
@@ -451,6 +535,10 @@ impl fmt::Display for KernelContractError {
                 formatter,
                 "linked grouped NVFP4 tactic is 128x128x256 with swap_ab=false"
             ),
+            Self::UnsupportedInputType => write!(formatter, "expected BF16 input"),
+            Self::UnsupportedFusedTactic => {
+                write!(formatter, "expected the FlashInfer CuTe fused NVFP4 donor")
+            }
         }
     }
 }
@@ -577,6 +665,21 @@ mod tests {
         assert_eq!(
             buffers.int_workspace_bytes + buffers.float_workspace_bytes,
             64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn qwen_fused_activation_preserves_per_expert_scale_tiles() {
+        let spec = SiluNvfp4Spec::qwen_flash(10, 4).expect("fused activation");
+        assert_eq!(
+            spec.buffer_requirements().expect("buffer sizes"),
+            SiluNvfp4Buffers {
+                input_bytes: 102_400,
+                packed_output_bytes: 12_800,
+                output_scale_bytes: 51_200,
+                global_scale_bytes: 40,
+                active_rows_bytes: 40,
+            }
         );
     }
 }

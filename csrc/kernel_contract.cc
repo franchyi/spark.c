@@ -11,6 +11,9 @@
 #ifdef SPARKSERVE_WITH_FLASHINFER_GROUPED_NVFP4
 #include "internal/nvfp4_grouped_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_SILU_NVFP4
+#include "internal/nvfp4_silu_backend.h"
+#endif
 
 namespace {
 
@@ -180,6 +183,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       break;
     case SPARKSERVE_BACKEND_FLASHINFER_GROUP_MM_FP4:
       return Invalid("grouped FlashInfer backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4:
+      return Invalid("fused SiLU backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -367,6 +372,116 @@ extern "C" SparkServeStatus sparkserve_grouped_nvfp4_launch(
 #else
   return Unavailable(
       "grouped NVFP4 contract is valid but no CUDA backend is linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_silu_nvfp4_validate(
+    const SparkServeSiluNvfp4Plan* plan) {
+  if (plan == nullptr) return Invalid("fused SiLU NVFP4 plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_experts == 0 || plan->num_experts > 512) {
+    return Invalid("fused SiLU NVFP4 requires between 1 and 512 experts");
+  }
+  if (plan->rows_per_expert == 0 || plan->rows_per_expert % 4 != 0) {
+    return Invalid("fused SiLU NVFP4 expert capacity must align to four rows");
+  }
+  if (plan->hidden_size == 0 || plan->hidden_size % 128 != 0) {
+    return Invalid("fused SiLU NVFP4 hidden size must align to 128");
+  }
+  if (plan->hidden_size > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+      static_cast<uint64_t>(plan->num_experts) * plan->rows_per_expert >
+          static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    return Invalid("fused SiLU NVFP4 dimensions exceed the donor INT32 range");
+  }
+  if (plan->group_size != kNvfp4GroupSize) {
+    return Unsupported("fused SiLU NVFP4 group size must be 16");
+  }
+  if (plan->input_dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("first fused SiLU NVFP4 donor accepts BF16 input");
+  }
+  if (plan->output_scale_layout !=
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4) {
+    return Unsupported("fused SiLU NVFP4 requires CUTLASS 128x4 scales");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4) {
+    return Invalid("unknown fused SiLU NVFP4 backend");
+  }
+  const uint64_t scale_rows =
+      (static_cast<uint64_t>(plan->rows_per_expert) + 127) / 128 * 128;
+  const uint64_t scale_columns =
+      (plan->hidden_size / kNvfp4GroupSize + 3) / 4 * 4;
+  if (!CanMultiply(plan->num_experts, plan->rows_per_expert) ||
+      !CanMultiply(plan->hidden_size, 4) ||
+      !CanMultiply(static_cast<uint64_t>(plan->num_experts) *
+                       plan->rows_per_expert,
+                   plan->hidden_size * 4) ||
+      !CanMultiply(plan->num_experts, scale_rows) ||
+      !CanMultiply(static_cast<uint64_t>(plan->num_experts) * scale_rows,
+                   scale_columns)) {
+    return Invalid("fused SiLU NVFP4 buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_silu_nvfp4_query(
+    const SparkServeDeviceCaps* caps, const SparkServeSiluNvfp4Plan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  SparkServeStatus plan_status = sparkserve_silu_nvfp4_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "flashinfer-cute-silu-mul-nvfp4";
+  info->source_revision =
+      "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+#ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_SILU_NVFP4
+  info->available = plan->hidden_size == 640 ? 1 : 0;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_silu_nvfp4_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeSiluNvfp4Args* args) {
+  SparkServeStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (args == nullptr) return Invalid("fused SiLU NVFP4 arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeStatus plan_status = sparkserve_silu_nvfp4_validate(&args->plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (args->input == nullptr || args->input_global_scales == nullptr ||
+      args->active_rows == nullptr || args->packed_output == nullptr ||
+      args->output_scales == nullptr) {
+    return Invalid("fused SiLU NVFP4 launch pointers cannot be null");
+  }
+  const uint64_t input_stride = static_cast<uint64_t>(args->plan.rows_per_expert) *
+                                args->plan.hidden_size * 4;
+  const uint64_t output_stride =
+      static_cast<uint64_t>(args->plan.rows_per_expert) *
+      args->plan.hidden_size / 2;
+  const uint64_t scale_rows =
+      (static_cast<uint64_t>(args->plan.rows_per_expert) + 127) / 128 * 128;
+  const uint64_t scale_columns =
+      (args->plan.hidden_size / args->plan.group_size + 3) / 4 * 4;
+  if (args->input_expert_stride_bytes != input_stride ||
+      args->output_expert_stride_bytes != output_stride ||
+      args->scale_expert_stride_bytes != scale_rows * scale_columns) {
+    return Invalid("fused SiLU NVFP4 donor requires contiguous expert strides");
+  }
+#ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_SILU_NVFP4
+  return sparkserve_flashinfer_cute_silu_nvfp4_launch(args);
+#else
+  return Unavailable("FlashInfer CuTe fused SiLU NVFP4 artifact is not linked");
 #endif
 }
 

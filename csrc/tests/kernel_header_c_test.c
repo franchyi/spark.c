@@ -11,6 +11,10 @@ _Static_assert(sizeof(SparkServeGroupedNvfp4WeightView) == 32u,
                "C grouped weight view layout drifted");
 _Static_assert(sizeof(SparkServeGroupedNvfp4Args) == 224u,
                "C grouped arguments layout drifted");
+_Static_assert(sizeof(SparkServeSiluNvfp4Plan) == 48u,
+               "C fused SiLU plan layout drifted");
+_Static_assert(sizeof(SparkServeSiluNvfp4Args) == 128u,
+               "C fused SiLU arguments layout drifted");
 
 int main(void) {
   SparkServeDenseNvfp4Plan plan = {0};
