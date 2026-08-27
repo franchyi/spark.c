@@ -6,6 +6,7 @@ import random
 import time
 
 from sparkserve.manifest import fetch_manifest
+from sparkserve.model_lock import load_model_lock, verify_model_files
 from sparkserve.planner import PROFILES, plan_memory
 from sparkserve.ple_store import PleIndex, PleReader, build_ple_index
 
@@ -29,6 +30,14 @@ def build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("repo")
     manifest.add_argument("--endpoint", default="https://hf-mirror.com")
     manifest.add_argument("--json", action="store_true")
+
+    lock_check = subparsers.add_parser(
+        "lock-check", help="validate an immutable model lock and optionally its local files"
+    )
+    lock_check.add_argument("lock", nargs="?", default="models.lock.json")
+    lock_check.add_argument("--model")
+    lock_check.add_argument("--model-root")
+    lock_check.add_argument("--json", action="store_true")
 
     ple_index = subparsers.add_parser(
         "ple-index",
@@ -61,6 +70,41 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.command == "lock-check":
+        lock = load_model_lock(args.lock)
+        selected = lock.models if args.model is None else (lock.model(args.model),)
+        if args.model_root and len(selected) != 1:
+            raise SystemExit("--model-root requires --model")
+        if args.model_root:
+            verify_model_files(selected[0], args.model_root)
+        result = {
+            "schema_version": lock.schema_version,
+            "mirror": lock.mirror,
+            "models": [
+                {
+                    "id": model.id,
+                    "revision": model.revision,
+                    "format": model.format,
+                    "inventory": model.inventory,
+                    "files": len(model.files),
+                    "checkpoint_bytes": model.checkpoint_bytes,
+                    "files_verified": bool(args.model_root),
+                }
+                for model in selected
+            ],
+        }
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for model in result["models"]:
+                suffix = " (files verified)" if model["files_verified"] else ""
+                print(f"{model['id']} @ {model['revision']}{suffix}")
+                print(f"  format            {model['format']}")
+                print(f"  inventory         {model['inventory']}")
+                print(f"  locked files      {model['files']:12d}")
+                print(f"  checkpoint bytes  {model['checkpoint_bytes']:12d}")
+        return
+
     if args.command == "manifest":
         summary = fetch_manifest(args.repo, endpoint=args.endpoint)
         if args.json:

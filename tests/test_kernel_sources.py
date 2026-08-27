@@ -27,12 +27,19 @@ def test_kernel_sources_are_immutable_or_explicitly_blocked() -> None:
         assert source["license"] in {"Apache-2.0", "BSD-3-Clause", "MIT"}
 
 
-def test_first_nvfp4_candidate_is_contract_only() -> None:
+def test_first_nvfp4_candidate_is_framework_free_and_pinned() -> None:
     payload = tomllib.loads(
         (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
     )
     flashinfer = next(
         source for source in payload["source"] if source["id"] == "flashinfer-mm-fp4"
     )
-    assert flashinfer["status"] == "contract-defined-not-linked"
-    assert flashinfer["entrypoint"] == "flashinfer.mm_fp4"
+    assert flashinfer["status"] == "linked-framework-free-sm121-smoke-passed"
+    assert flashinfer["entrypoint"] == (
+        "include/flashinfer/gemm/fp4_gemm_template_sm120.h"
+    )
+    vendor = ROOT / "third_party" / "flashinfer-nvfp4"
+    assert (vendor / "VENDOR.md").is_file()
+    hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
+    assert len(hashes) == 4
+    assert all(re.fullmatch(r"[0-9a-f]{64}  .+", line) for line in hashes)

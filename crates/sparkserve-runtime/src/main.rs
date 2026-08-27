@@ -1,6 +1,7 @@
 use sparkserve_runtime::checkpoint::{CheckpointPlan, load_flash_next_plan};
 use sparkserve_runtime::kernel::{DenseNvfp4Spec, DeviceCaps, select_dense_nvfp4_candidate};
 use sparkserve_runtime::model::{plan_memory, profile};
+use sparkserve_runtime::model_lock::{LockedModel, load_model_lock};
 use sparkserve_runtime::storage::{ClockPageCache, FilePageSource, PleIndex};
 use std::path::Path;
 use std::time::Instant;
@@ -9,6 +10,7 @@ fn usage() -> ! {
     eprintln!("usage:");
     eprintln!("  sparkserve-runtime plan <model> [system-gib]");
     eprintln!("  sparkserve-runtime checkpoint-plan <model-root>");
+    eprintln!("  sparkserve-runtime model-lock <lock-file> [model-id]");
     eprintln!("  sparkserve-runtime kernel-plan nvfp4-dense <M> <N> <K> [SM]");
     eprintln!("  sparkserve-runtime ple-inspect <index>");
     eprintln!(
@@ -22,11 +24,50 @@ fn main() {
     match args.next().as_deref() {
         Some("plan") => run_memory_plan(args),
         Some("checkpoint-plan") => run_checkpoint_plan(args),
+        Some("model-lock") => run_model_lock(args),
         Some("kernel-plan") => run_kernel_plan(args),
         Some("ple-inspect") => run_ple_inspect(args),
         Some("ple-bench") => run_ple_bench(args),
         _ => usage(),
     }
+}
+
+fn run_model_lock(mut args: impl Iterator<Item = String>) {
+    let path = args.next().unwrap_or_else(|| usage());
+    let model_id = args.next();
+    if args.next().is_some() {
+        usage();
+    }
+    let lock = load_model_lock(Path::new(&path)).unwrap_or_else(|error| {
+        eprintln!("invalid model lock: {error}");
+        std::process::exit(1);
+    });
+    println!("SparkServe immutable model lock v{}", lock.schema_version);
+    println!("  mirror             {}", lock.mirror);
+    if let Some(model_id) = model_id {
+        let model = lock.model(&model_id).unwrap_or_else(|error| {
+            eprintln!("invalid model selection: {error}");
+            std::process::exit(1);
+        });
+        print_locked_model(model);
+    } else {
+        for model in &lock.models {
+            print_locked_model(model);
+        }
+    }
+}
+
+fn print_locked_model(model: &LockedModel) {
+    println!("{} @ {}", model.id, model.revision);
+    println!("  repository         {}", model.repo);
+    println!("  architecture       {}", model.architecture);
+    println!(
+        "  format             {} / {}",
+        model.format, model.quantization
+    );
+    println!("  inventory          {}", model.inventory);
+    println!("  locked files       {:12}", model.files.len());
+    println!("  checkpoint bytes   {:12}", model.checkpoint_bytes);
 }
 
 fn run_checkpoint_plan(mut args: impl Iterator<Item = String>) {

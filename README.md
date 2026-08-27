@@ -53,6 +53,7 @@ so moving a tensor to "CPU memory" does not create capacity.
 
 ```bash
 uv sync
+uv run sparkserve lock-check models.lock.json
 uv run sparkserve manifest RadixArk/Qwen3.8-Flash-Next-NVFP4
 uv run sparkserve plan qwen38-flash-next-nvfp4
 uv run pytest
@@ -92,6 +93,8 @@ cargo run -p sparkserve-runtime -- kernel-plan nvfp4-dense 1 4096 4096 121
 make test-cpp
 # Inside a CUDA 13 environment on Spark:
 make test-cuda-gdn
+scripts/fetch-kernel-sources.sh
+make test-cuda-nvfp4
 ```
 
 The defaults reserve 8 GiB for KV cache, 12 GiB for the runtime, 8 GiB as a hard
@@ -99,6 +102,8 @@ safety margin, and 2 GiB for sparse PLE rows. They are intentionally conservativ
 and will be replaced by measurements from the target machine.
 
 See [docs/architecture.md](docs/architecture.md) for the runtime design and gates.
+See [docs/acceptance.md](docs/acceptance.md) for the exact definition of done for
+both standalone models.
 The manifest command defaults to `https://hf-mirror.com` and downloads metadata
 only. See [docs/prior-art.md](docs/prior-art.md) for the measured one-Spark oracle.
 See [docs/kernel-sourcing.md](docs/kernel-sourcing.md) for the reuse boundary.
@@ -107,17 +112,20 @@ tensor contracts, and accuracy gates.
 
 ## Current implementation status
 
-Milestone zero now has a versioned, C-compatible dense-NVFP4 ABI, matching Rust
-FFI structs, checked buffer-size calculations, SM121 kernel-candidate selection,
-and a compiled C++ contract test. The ABI models the observed SGLang/ModelOpt
-contract: packed E2M1 weights and activations, FP8-E4M3 scales in CUTLASS 128x4
-layout, group size 16, independent packed-weight/scale padding, FP32 global
-alpha, and BF16 output.
+The dense-NVFP4 ABI now links one framework-free FlashInfer/CUTLASS SM121 tactic
+for BF16 output. SparkServe instantiates the donor's `128x128x256` arithmetic
+kernel directly and supplies only its raw-pointer adapter, validation, workspace,
+stream, and error translation. The GPU smoke test compiles and executes without
+Torch, TVM-FFI, Python, or SGLang. Its source and transitive CUTLASS commits,
+licenses, and critical hashes are locked in `third_party/flashinfer-nvfp4`.
 
-The dense NVFP4 CUDA backend is not linked yet. A valid dense launch returns
-`UNAVAILABLE` until the pinned FlashInfer `mm_fp4` adapter is compiled into the
-runtime. This keeps the control plane and tests honest while oracle tensors are
-captured.
+The ABI models the observed SGLang/ModelOpt contract: packed E2M1 weights and
+activations, FP8-E4M3 group-16 scales in CUTLASS 128x4 physical layout, separate
+packed-weight/scale padding, a GPU-addressable FP32 global alpha, and BF16 output.
+Activation scale allocation now includes the mandatory 128-row physical tile:
+for `M=1,K=4096` it is 32 KiB, not the 256-byte logical element count. Nonzero
+real-tensor parity and tactic tuning remain promotion gates before this path is
+used for the full model.
 
 The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
 a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real

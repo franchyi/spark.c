@@ -7,11 +7,23 @@ BUILD_DIR := build
 CONTRACT_TEST := $(BUILD_DIR)/kernel-contract-test
 HEADER_C_TEST := $(BUILD_DIR)/kernel-header-c-test
 CUDA_GDN_TEST := $(BUILD_DIR)/gdn-decode-cuda-test
+CUDA_NVFP4_TEST := $(BUILD_DIR)/nvfp4-dense-cuda-test
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_121a
 NVCCFLAGS ?= -O2 -std=c++20 -arch=$(CUDA_ARCH)
+FLASHINFER_ROOT ?= third_party/_deps/flashinfer
+FLASHINFER_INCLUDE ?= $(FLASHINFER_ROOT)/include
+CUTLASS_ROOT ?= $(FLASHINFER_ROOT)/3rdparty/cutlass
+# CUDA 13.0 exposes exact sm_121 code generation but does not set the helper
+# macro checked by this FlashInfer revision's architecture guard.
+FLASHINFER_ARCH_FLAGS ?= -D__CUDA_ARCH_SPECIFIC__ --expt-relaxed-constexpr \
+	-diag-suppress 20012 -diag-suppress 20013 -diag-suppress 20015 \
+	-diag-suppress 2908
+FLASHINFER_INCLUDES := -I$(FLASHINFER_INCLUDE) \
+	-I$(CUTLASS_ROOT)/include \
+	-I$(CUTLASS_ROOT)/tools/util/include
 
-.PHONY: test test-cpp test-cuda test-cuda-gdn docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -19,10 +31,13 @@ test-cpp: $(CONTRACT_TEST) $(HEADER_C_TEST)
 	$(CONTRACT_TEST)
 	$(HEADER_C_TEST)
 
-test-cuda: test-cuda-gdn
+test-cuda: test-cuda-gdn test-cuda-nvfp4
 
 test-cuda-gdn: $(CUDA_GDN_TEST)
 	$(CUDA_GDN_TEST)
+
+test-cuda-nvfp4: $(CUDA_NVFP4_TEST)
+	$(CUDA_NVFP4_TEST)
 
 docker-flash-next-sm121:
 	docker build -t sparkserve/sglang:qwen38flashnext-sm121 -f docker/flashnext-sm121/Dockerfile .
@@ -41,5 +56,12 @@ $(CUDA_GDN_TEST): csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu csrc/internal/
 		csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu \
 		csrc/tests/gdn_decode_cuda_test.cu -o $(CUDA_GDN_TEST)
 
+$(CUDA_NVFP4_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashinfer.cu csrc/internal/nvfp4_dense_backend.h csrc/tests/nvfp4_dense_cuda_test.cu csrc/include/sparkserve/kernel_api.h
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_ARCH_FLAGS) -DSPARKSERVE_WITH_FLASHINFER_NVFP4 \
+		-Icsrc/include -Icsrc $(FLASHINFER_INCLUDES) \
+		csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashinfer.cu \
+		csrc/tests/nvfp4_dense_cuda_test.cu -o $(CUDA_NVFP4_TEST)
+
 clean:
-	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST)
+	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST)

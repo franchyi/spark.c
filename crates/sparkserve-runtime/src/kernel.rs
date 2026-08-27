@@ -98,8 +98,11 @@ impl DenseNvfp4Spec {
     pub fn buffer_requirements(self) -> Result<DenseNvfp4Buffers, KernelContractError> {
         let packed_input_bytes = checked_product(&[self.m, self.padded_k / 2])?;
         let packed_weight_bytes = checked_product(&[self.padded_n, self.padded_k / 2])?;
+        // CUTLASS stores scale factors in 512-byte tiles: 128 logical rows by
+        // four K-block columns. Even M=1 therefore owns a full 128-row scale
+        // tile; using the logical M*K/16 size would under-allocate by 128x.
         let input_scale_bytes =
-            checked_product(&[self.m, self.padded_k / u64::from(self.group_size)])?;
+            swizzled_scale_bytes(self.m, self.padded_k / u64::from(self.group_size))?;
         let weight_scale_bytes = checked_product(&[
             self.scale_padded_n,
             self.padded_k / u64::from(self.group_size),
@@ -263,6 +266,18 @@ fn checked_product(values: &[u64]) -> Result<u64, KernelContractError> {
     })
 }
 
+fn swizzled_scale_bytes(rows: u64, scale_columns: u64) -> Result<u64, KernelContractError> {
+    let row_tiles = rows
+        .checked_add(127)
+        .ok_or(KernelContractError::DimensionOverflow)?
+        / 128;
+    let column_tiles = scale_columns
+        .checked_add(3)
+        .ok_or(KernelContractError::DimensionOverflow)?
+        / 4;
+    checked_product(&[row_tiles, column_tiles, 512])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +298,7 @@ mod tests {
             spec.buffer_requirements().expect("sizes fit"),
             DenseNvfp4Buffers {
                 packed_input_bytes: 2048,
-                input_scale_bytes: 256,
+                input_scale_bytes: 32_768,
                 packed_weight_bytes: 8_388_608,
                 weight_scale_bytes: 1_048_576,
                 output_bytes: 8192,

@@ -95,6 +95,7 @@ pub struct DenseNvfp4Args {
     pub workspace: *mut c_void,
     pub workspace_bytes: u64,
     pub cuda_stream: *mut c_void,
+    pub alpha_device: *const f32,
 }
 
 #[repr(u32)]
@@ -222,7 +223,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<DeviceCaps>(), 24);
         assert_eq!(std::mem::size_of::<DenseNvfp4Plan>(), 80);
         assert_eq!(std::mem::size_of::<Nvfp4MatrixView>(), 32);
-        assert_eq!(std::mem::size_of::<DenseNvfp4Args>(), 200);
+        assert_eq!(std::mem::size_of::<DenseNvfp4Args>(), 208);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);

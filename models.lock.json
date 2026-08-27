@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "mirror": "https://hf-mirror.com",
+  "models": [
+    {
+      "id": "qwen38-flash-next-nvfp4",
+      "repo": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+      "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+      "architecture": "Qwen4ExpForConditionalGeneration",
+      "format": "modelopt_nvfp4_safetensors",
+      "quantization": "NVFP4",
+      "inventory": "critical_metadata",
+      "checkpoint_bytes": 135156121594,
+      "storage": {
+        "resident_bytes": 77843712026,
+        "nvme_bytes": 51200245760,
+        "deferred_bytes": 5214301696,
+        "ignored_bytes": 897862112,
+        "paged_tensor_class": "ple_embedding"
+      },
+      "files": [
+        {
+          "path": "config.json",
+          "size": 4983,
+          "sha256": "e765305daba0951974308f4d32c075b52a6a45974730d273f2216718a994d624",
+          "role": "config"
+        },
+        {
+          "path": "tokenizer.json",
+          "size": 12809320,
+          "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+          "role": "tokenizer"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "size": 17928,
+          "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+          "role": "tokenizer_config"
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "size": 34258807,
+          "sha256": "da5ca9c3b65e48e151329e64e141c2fa700bf2f99aec53cc014e4b52a6ff7a84",
+          "role": "tensor_index"
+        }
+      ]
+    },
+    {
+      "id": "glm53-flash-iq3-xxs",
+      "repo": "unsloth/GLM-5.3-Flash-GGUF",
+      "revision": "d45e959d75bf3e0e809e2c7e461f111a8efa1f83",
+      "architecture": "GLM5NextForConditionalGeneration",
+      "format": "gguf",
+      "quantization": "UD-IQ3_XXS",
+      "inventory": "complete_checkpoint",
+      "checkpoint_bytes": 120367571715,
+      "storage": {
+        "paged_tensor_class": "routed_expert"
+      },
+      "files": [
+        {
+          "path": "UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf",
+          "size": 9429859,
+          "sha256": "b3282af0711eec07a0462a6126dc75b32bc14b698a39efec1b3b34d3c4217dc5",
+          "role": "gguf_shard"
+        },
+        {
+          "path": "UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00002-of-00004.gguf",
+          "size": 49261511584,
+          "sha256": "a4dba331fe92ffbd71317839cc1452c57f0b5b3f971a9e96ee5107f9a615cdac",
+          "role": "gguf_shard"
+        },
+        {
+          "path": "UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00003-of-00004.gguf",
+          "size": 49075832480,
+          "sha256": "5b728b5b263c662201ef4a4a2b12fb509fe230d012418d0ed37c220a8a5aa230",
+          "role": "gguf_shard"
+        },
+        {
+          "path": "UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00004-of-00004.gguf",
+          "size": 22020797792,
+          "sha256": "4b6d16e0d1381e1b4b7eeb6c9799671bf98153a995be12e75e3da93cd97981d2",
+          "role": "gguf_shard"
+        }
+      ]
+    }
+  ]
+}

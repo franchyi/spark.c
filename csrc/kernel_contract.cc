@@ -5,6 +5,9 @@
 #ifdef SPARKSERVE_WITH_CUDA
 #include "internal/gdn_decode_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_FLASHINFER_NVFP4
+#include "internal/nvfp4_dense_backend.h"
+#endif
 
 namespace {
 
@@ -149,6 +152,14 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       info->name = "flashinfer-mm-fp4";
       info->source_revision =
           "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+#ifdef SPARKSERVE_WITH_FLASHINFER_NVFP4
+      info->workspace_bytes =
+          sparkserve_flashinfer_nvfp4_workspace_bytes(plan);
+      if (info->workspace_bytes == std::numeric_limits<size_t>::max()) {
+        return Unsupported("FlashInfer NVFP4 rejected this shape");
+      }
+      info->available = 1;
+#endif
       break;
     case SPARKSERVE_BACKEND_CUTLASS_SM121:
       if (caps->sm != 121) {
@@ -202,8 +213,12 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_launch(
       args->alpha > std::numeric_limits<float>::max()) {
     return Invalid("dense NVFP4 alpha must be finite and positive");
   }
-  return Unavailable(
-      "NVFP4 contract is valid but no CUDA backend is linked in milestone zero");
+#ifdef SPARKSERVE_WITH_FLASHINFER_NVFP4
+  if (info.backend == SPARKSERVE_BACKEND_FLASHINFER_MM_FP4) {
+    return sparkserve_flashinfer_nvfp4_launch(args);
+  }
+#endif
+  return Unavailable("NVFP4 contract is valid but no CUDA backend is linked");
 }
 
 extern "C" SparkServeStatus sparkserve_gdn_decode_validate(

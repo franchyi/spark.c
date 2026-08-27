@@ -2,4 +2,5 @@ pub mod checkpoint;
 pub mod ffi;
 pub mod kernel;
 pub mod model;
+pub mod model_lock;
 pub mod storage;

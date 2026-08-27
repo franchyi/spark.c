@@ -110,6 +110,10 @@ typedef struct SparkServeDenseNvfp4Args {
   uint64_t workspace_bytes;
   // Opaque cudaStream_t. No CUDA header crosses the stable ABI.
   void* cuda_stream;
+  // GPU-addressable copy of alpha. The runtime allocates these immutable
+  // scalars with the model so FlashInfer can dereference them inside GEMM and
+  // CUDA graph capture never performs a host-to-device scalar copy.
+  const float* alpha_device;
 } SparkServeDenseNvfp4Args;
 
 typedef struct SparkServeKernelInfo {
