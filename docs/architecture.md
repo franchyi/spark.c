@@ -163,6 +163,15 @@ own scheduling and placement.
 The first resident target is Qwen3.8 27B because the existing SGLang service gives
 golden logits and a measured target of about 50 decode tokens/s.
 
+For Flash-Next QSA, the runtime follows SGLang's current GB10 split rather than
+building a new attention algorithm. The first imported primitive is SGLang's
+radix top-k specialized to 512 compressed blocks. Its raw-CUDA adapter matches
+the complete selected index sets for four ragged 65,536-column rows and measures
+26.79 microseconds on SM121. Next, the small fused Q/K norm+MRoPE+compression
+kernel is adapted the same way, while sparse decode wraps the FlashInfer
+TRT-LLM-gen kernel that SGLang itself selects on SM121. Rust retains ownership
+of logical-to-physical KV maps, valid lengths, fixed scratch, and graph replay.
+
 ### GGUF
 
 GGUF is a storage contract, not a second execution engine. The loader maps GGUF

@@ -14,6 +14,7 @@ pub enum DataType {
     Nvfp4E2m1Packed = 2,
     Fp8E4m3 = 3,
     Float32 = 4,
+    Int32 = 5,
 }
 
 #[repr(u32)]
@@ -35,6 +36,7 @@ pub enum KernelBackend {
     FlashInferCuteNvfp4Quantize = 5,
     FlashInferMoeRoute = 6,
     SglangPleGather = 7,
+    SglangQsaTopk = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

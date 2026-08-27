@@ -24,6 +24,7 @@ typedef enum SparkServeDataType {
   SPARKSERVE_DTYPE_NVFP4_E2M1_PACKED = 2,
   SPARKSERVE_DTYPE_FP8_E4M3 = 3,
   SPARKSERVE_DTYPE_F32 = 4,
+  SPARKSERVE_DTYPE_INT32 = 5,
 } SparkServeDataType;
 
 typedef enum SparkServeScaleLayout {
@@ -51,6 +52,8 @@ typedef enum SparkServeKernelBackend {
   SPARKSERVE_BACKEND_FLASHINFER_MOE_ROUTE = 6,
   // FP8 PLE row gather matching SGLang's Qwen4 pinned-host Triton arithmetic.
   SPARKSERVE_BACKEND_SGLANG_PLE_GATHER = 7,
+  // Radix-select QSA block top-k adapted from SGLang's JIT CUDA kernel.
+  SPARKSERVE_BACKEND_SGLANG_QSA_TOPK = 8,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -354,6 +357,33 @@ typedef struct SparkServePleGatherArgs {
   void* cuda_stream;
 } SparkServePleGatherArgs;
 
+typedef struct SparkServeQsaTopkPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t rows;
+  uint32_t columns;
+  uint32_t topk;
+  uint32_t input_dtype;
+  uint32_t output_dtype;
+  uint32_t requested_backend;
+  // FP32 elements between score rows; must be at least columns.
+  uint64_t input_stride;
+} SparkServeQsaTopkPlan;
+
+typedef struct SparkServeQsaTopkArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeQsaTopkPlan plan;
+  const float* scores;
+  // Device int32 [rows]. Indices are relative to each row start.
+  const int32_t* row_starts;
+  // Device int32 [rows]. Every start + length must be <= columns.
+  const int32_t* lengths;
+  // Device int32 [rows,topk]. Order is intentionally unspecified.
+  int32_t* indices;
+  void* cuda_stream;
+} SparkServeQsaTopkArgs;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -497,6 +527,18 @@ SparkServeStatus sparkserve_ple_gather_query(
 SparkServeStatus sparkserve_ple_gather_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServePleGatherArgs* args);
+
+SparkServeStatus sparkserve_qsa_topk_validate(
+    const SparkServeQsaTopkPlan* plan);
+
+SparkServeStatus sparkserve_qsa_topk_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaTopkPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_qsa_topk_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaTopkArgs* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);

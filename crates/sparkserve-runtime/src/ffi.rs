@@ -514,6 +514,49 @@ pub struct PleGatherArgs {
     pub cuda_stream: *mut c_void,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QsaTopkPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub rows: u32,
+    pub columns: u32,
+    pub topk: u32,
+    pub input_dtype: u32,
+    pub output_dtype: u32,
+    pub requested_backend: u32,
+    pub input_stride: u64,
+}
+
+impl QsaTopkPlan {
+    pub fn qwen38_flash(rows: u32, columns: u32, input_stride: u64) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            rows,
+            columns,
+            topk: 512,
+            input_dtype: DataType::Float32 as u32,
+            output_dtype: DataType::Int32 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangQsaTopk as u32,
+            input_stride,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QsaTopkArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: QsaTopkPlan,
+    pub scores: *const f32,
+    pub row_starts: *const i32,
+    pub lengths: *const i32,
+    pub indices: *mut i32,
+    pub cuda_stream: *mut c_void,
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GdnBackend {
@@ -689,6 +732,13 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const PleGatherArgs,
     ) -> Status;
+    pub fn sparkserve_qsa_topk_validate(plan: *const QsaTopkPlan) -> Status;
+    pub fn sparkserve_qsa_topk_query(
+        caps: *const DeviceCaps,
+        plan: *const QsaTopkPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_qsa_topk_launch(caps: *const DeviceCaps, args: *const QsaTopkArgs) -> Status;
     pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn sparkserve_gdn_decode_query(
         caps: *const DeviceCaps,
@@ -732,6 +782,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<PleRowFragment>(), 24);
         assert_eq!(std::mem::size_of::<PleGatherPlan>(), 32);
         assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);
+        assert_eq!(std::mem::size_of::<QsaTopkPlan>(), 40);
+        assert_eq!(std::mem::size_of::<QsaTopkArgs>(), 88);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
@@ -789,6 +841,15 @@ mod tests {
             }
         );
         assert!(PleRowFragment::from_fixed(row, 159).is_err());
+    }
+
+    #[test]
+    fn qwen_qsa_topk_plan_freezes_the_donor_shape() {
+        let plan = QsaTopkPlan::qwen38_flash(16, 65_536, 65_536);
+        assert_eq!(plan.topk, 512);
+        assert_eq!(plan.input_dtype, DataType::Float32 as u32);
+        assert_eq!(plan.output_dtype, DataType::Int32 as u32);
+        assert_eq!(plan.requested_backend, KernelBackend::SglangQsaTopk as u32);
     }
 
     #[test]

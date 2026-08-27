@@ -114,3 +114,33 @@ def test_sglang_ple_oracle_is_pinned_and_hashed() -> None:
         "f406977eb2373937393241f453477867f7dc943bd4839216db8fe66fa9f921d8  "
         "python/sglang/srt/models/qwen4_exp.py"
     ]
+
+
+def test_sglang_qsa_topk_donor_is_pinned_and_hashed() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qsa-radix-topk"
+    )
+    assert donor["revision"] == "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["mode"] == "source-adaptation"
+    assert donor["status"] == (
+        "linked-raw-cuda-sm121-selected-set-parity-passed"
+    )
+    assert donor["entrypoint"] == (
+        "python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh"
+    )
+
+    vendor = ROOT / "third_party" / "sglang-qsa-topk"
+    assert (vendor / "VENDOR.md").is_file()
+    hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
+    assert hashes == [
+        "8f2dd6ae5647f44473a1666978906581c635ebc44d4e8ff6c7977d5522ab911f  "
+        "python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh",
+        "77780478c7b48517fbe9240d62d8a71371203a1acea42d27d44022cc1e9863be  "
+        "python/sglang/kernels/ops/elementwise/fast_topk.py",
+    ]

@@ -77,8 +77,10 @@ has passed CUDA reads from both the registered cache slab and a protected
 file-backed mapping. PLE now adds bit-exact scaled-BF16 gather parity on 16 real
 boundary rows plus simultaneous CUDA and `io_uring` registration of the same
 4 MiB physical slab. Its Rust two-window lease scheduler now fixes every graph
-address and prevents refill before compute completion. This document remains a
-completion checklist: storage-thread/CUDA-event overlap integration, the joined
-QSA/full-token graph, tokenizer/server, GGUF, GLM graph, and end-to-end
-continuation gates are not implied to be finished by isolated kernel and fabric
-tests.
+address and prevents refill before compute completion. QSA now has its first
+borrowed primitive: SGLang's 512-block radix selector matches every selected
+index in the 65,536-column ragged fixture on SM121. This document remains a
+completion checklist: storage-thread/CUDA-event overlap integration, fused QSA
+prep and sparse attention, the joined full-token graph, tokenizer/server, GGUF,
+GLM graph, and end-to-end continuation gates are not implied to be finished by
+isolated kernel and fabric tests.

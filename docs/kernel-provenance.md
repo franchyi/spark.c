@@ -125,7 +125,7 @@ retaining a switch back to the legacy dispatch.
 | Qwen3.8 27B dense NVFP4 linear | live SGLang ModelOpt path | FlashInfer `mm_fp4` or direct CUTLASS 79a instantiation | wrap first; specialize later | packed bytes/scales exact, real-tensor output parity, greedy-token parity |
 | Flash-Next routed NVFP4 MoE | SGLang Qwen4-exp + ModelOpt | FlashInfer grouped NVFP4 GEMMs, AOT CuTe input/fused-activation quantizers, and adapted FlashInfer route/finalize kernels | pinned framework-free instantiations/objects behind C ABI; Rust owns the shared padded layout, route map, graph bucket, and residency | two-token/two-expert real-weight dispatch → quantize → gate/up → activation → down → weighted finalize is byte-exact at every intermediate; next router/top-k and shared-expert parity |
 | GDN projection and recurrence | SGLang Qwen4-exp + FlashInfer GDN | local raw CUDA K=V=128 BF16-state decode; later fuse QKV extraction | correctness kernel implemented; optimize behind the same ABI | CPU-reference parity now; real SGLang tensor/state and multi-step parity next |
-| QSA indexer and sparse attention | SGLang QSA backend | SGLang JIT CUDA indexer plus proven SM121 sparse-decode kernel | vendor small CUDA pieces; wrap external attention kernel | exact selected indices/masks/cache writes; dense-attention comparison on small cases |
+| QSA indexer and sparse attention | SGLang QSA backend at `7c66045` | SGLang fused Q/K prep and radix top-k, plus FlashInfer TRT-LLM-gen sparse decode selected upstream on SM121 | adapt the small JIT CUDA pieces; wrap the pinned external attention kernel; Rust owns ranges, cache, scratch, and graphs | radix top-k complete: all four 65,536-column ragged selected sets match SGLang, 26.79 us mean; fused prep, KV pack, and attention parity next |
 | Hyperconnection mix/combine | SGLang Qwen4-exp | small SGLang CUDA/Triton kernels | port or vendor after license audit | per-stream output and residual-state parity |
 | PLE lookup | SGLang Qwen4-exp at `7c66045` + checkpoint | raw CUDA adapter matching the SGLang FP8-E4M3 load, BF16 conversion, and BF16 scaling; Rust supplies NVMe row residency | linked framework-free adapter plus original one-copy storage policy | passed: 16 real boundary rows, 2,560/2,560 scaled BF16 values bit-exact; 2.06 us mean on SM121 |
 | RMSNorm/RoPE/top-k/sampling | SGLang, FlashInfer, ds4 | smallest fastest proven candidate | benchmark and adopt independently | exact discrete ids; numerical parity for continuous outputs |
@@ -203,8 +203,9 @@ kernels—without importing either framework's scheduler, allocator, or graph.
    continuations from the live SGLang service.
 2. Double-buffer the completed PLE gather and fixed-slab reader, then connect its
    fixed descriptors to the token graph; keep routing/top-k separately tested.
-3. Borrow the smallest pinned QSA attention/indexer primitives, complete
-   QSA/GDN/mHC model-state parity, and join the full native token graph.
+3. Continue the pinned QSA path after the completed radix top-k: adapt fused
+   Q/K norm+MRoPE+compress prep, borrow the SM121 TRT-LLM-gen decode kernel,
+   then complete QSA/GDN/mHC state parity and join the full native token graph.
 4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
 5. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
 6. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed

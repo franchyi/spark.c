@@ -317,6 +317,46 @@ int main() {
   assert(sparkserve_ple_gather_validate(&ple).code ==
          SPARKSERVE_STATUS_UNSUPPORTED);
 
+  SparkServeQsaTopkPlan qsa_topk = {
+      sizeof(SparkServeQsaTopkPlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      16,
+      65'536,
+      512,
+      SPARKSERVE_DTYPE_F32,
+      SPARKSERVE_DTYPE_INT32,
+      SPARKSERVE_BACKEND_AUTO,
+      65'536,
+  };
+  assert(sparkserve_qsa_topk_validate(&qsa_topk).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo qsa_topk_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_qsa_topk_query(&caps, &qsa_topk, &qsa_topk_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(qsa_topk_info.backend == SPARKSERVE_BACKEND_SGLANG_QSA_TOPK);
+  assert(qsa_topk_info.available == 0);
+  float qsa_score = 1.0f;
+  int32_t qsa_start = 0;
+  int32_t qsa_length = 1;
+  int32_t qsa_index = -1;
+  SparkServeQsaTopkArgs qsa_topk_args = {};
+  qsa_topk_args.struct_size = sizeof(qsa_topk_args);
+  qsa_topk_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  qsa_topk_args.plan = qsa_topk;
+  qsa_topk_args.scores = &qsa_score;
+  qsa_topk_args.row_starts = &qsa_start;
+  qsa_topk_args.lengths = &qsa_length;
+  qsa_topk_args.indices = &qsa_index;
+  assert(sparkserve_qsa_topk_launch(&caps, &qsa_topk_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  qsa_topk.topk = 2048;
+  assert(sparkserve_qsa_topk_validate(&qsa_topk).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,

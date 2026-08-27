@@ -16,6 +16,7 @@ CUDA_QWEN_MOE_FIXTURE_TEST := $(BUILD_DIR)/qwen-moe-fixture-test
 CUDA_MOE_ROUTE_TEST := $(BUILD_DIR)/moe-route-cuda-test
 CUDA_COHERENT_REGION_TEST := $(BUILD_DIR)/coherent-region-cuda-test
 CUDA_PLE_GATHER_FIXTURE_TEST := $(BUILD_DIR)/ple-gather-fixture-test
+CUDA_QSA_TOPK_FIXTURE_TEST := $(BUILD_DIR)/qsa-topk-fixture-test
 CUDA_FABRIC_SHARED := $(BUILD_DIR)/libsparkserve-fabric.so
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_121a
@@ -36,7 +37,7 @@ CUTE_NVFP4_QUANTIZE_OBJECT ?=
 TVM_FFI_ROOT ?=
 CUTE_DSL_ROOT ?=
 
-.PHONY: test test-cpp test-cuda fabric-shared test-cuda-fabric test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-ple-gather-fixture test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda fabric-shared test-cuda-fabric test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-ple-gather-fixture test-cuda-qsa-topk-fixture test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -81,6 +82,10 @@ test-cuda-moe-route: $(CUDA_MOE_ROUTE_TEST)
 test-cuda-ple-gather-fixture: $(CUDA_PLE_GATHER_FIXTURE_TEST)
 	test -n "$(PLE_GATHER_FIXTURE)"
 	$(CUDA_PLE_GATHER_FIXTURE_TEST) "$(PLE_GATHER_FIXTURE)"
+
+test-cuda-qsa-topk-fixture: $(CUDA_QSA_TOPK_FIXTURE_TEST)
+	test -n "$(QSA_TOPK_FIXTURE)"
+	$(CUDA_QSA_TOPK_FIXTURE_TEST) "$(QSA_TOPK_FIXTURE)"
 
 test-cuda-qwen-moe-fixture: $(CUDA_QWEN_MOE_FIXTURE_TEST)
 	test -n "$(QWEN_MOE_FIXTURE)"
@@ -173,6 +178,12 @@ $(CUDA_PLE_GATHER_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/ple_gather.cu
 		csrc/fabric/coherent_region.cc \
 		csrc/tests/ple_gather_fixture_test.cu -o $(CUDA_PLE_GATHER_FIXTURE_TEST)
 
+$(CUDA_QSA_TOPK_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/qsa_topk_sglang.cu csrc/internal/qsa_topk_backend.h csrc/tests/qsa_topk_fixture_test.cu csrc/include/sparkserve/kernel_api.h
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -DSPARKSERVE_WITH_SGLANG_QSA_TOPK \
+		-Icsrc/include -Icsrc csrc/kernel_contract.cc csrc/cuda/qsa_topk_sglang.cu \
+		csrc/tests/qsa_topk_fixture_test.cu -o $(CUDA_QSA_TOPK_FIXTURE_TEST)
+
 $(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/internal/nvfp4_grouped_backend.h csrc/internal/nvfp4_silu_backend.h csrc/internal/nvfp4_quantize_backend.h csrc/internal/moe_route_backend.h csrc/tests/qwen_moe_fixture_test.cc csrc/include/sparkserve/kernel_api.h
 	test -n "$(CUTE_NVFP4_OBJECT)"
 	test -n "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
@@ -196,4 +207,4 @@ $(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_f
 		-Xcompiler=-pthread -o $(CUDA_QWEN_MOE_FIXTURE_TEST)
 
 clean:
-	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_COHERENT_REGION_TEST) $(CUDA_PLE_GATHER_FIXTURE_TEST) $(CUDA_FABRIC_SHARED) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_MOE_ROUTE_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)
+	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_COHERENT_REGION_TEST) $(CUDA_PLE_GATHER_FIXTURE_TEST) $(CUDA_QSA_TOPK_FIXTURE_TEST) $(CUDA_FABRIC_SHARED) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_MOE_ROUTE_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)
