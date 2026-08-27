@@ -24,6 +24,7 @@ is tested first in the upstream layout.
 | SGLang Qwen3.8 Flash-Next support | PR `sgl-project/sglang#36497`, initial implementation `73a255206f916366c8d26d4022f82ddfb0ab558d`; current integration helper `02d38b77db92699e5d4f1a78226bf711e9cc762a` | Qwen4-exp graph, PLE, QSA, GDN, mHC, MTP, and memory-state oracle |
 | DwarfStar / `ds4.c` | `c1d4597a80e300b803dc642519718f2c999589da` | Minimal-runtime design and GGUF validation oracle |
 | llama.cpp kernels vendored by `ds4.c` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a` | Q8/Q2/IQ MMQ implementation donor |
+| llama.cpp GLM5Next support | Draft PR `ggml-org/llama.cpp#27754`; branch `unslothai/llama.cpp:glm5next/upstream`; revision deliberately `UNFROZEN` | Temporary GLM-5.3-Flash semantic oracle only; current CUDA and quantized verification is incomplete |
 
 These are evidence pins, not automatic dependency pins. A source becomes a
 SparkServe dependency only after its license, file hash, build flags, SM121
@@ -121,7 +122,30 @@ retaining a switch back to the legacy dispatch.
 | PLE lookup | SGLang Qwen4-exp + checkpoint | local mmap-aware gather/scale/accumulate kernel | reimplement for the one-copy store | exact row ids and scale; BF16 result against SGLang for cold/hot rows |
 | RMSNorm/RoPE/top-k/sampling | SGLang, FlashInfer, ds4 | smallest fastest proven candidate | benchmark and adopt independently | exact discrete ids; numerical parity for continuous outputs |
 | MTP/speculative commit | SGLang Qwen4-exp | local scheduler using shared forward kernels | reimplement state machine | target-only greedy identity; verifier logit and committed-state parity |
-| GGUF Q8/Q4/Q2/IQ | llama.cpp and ds4 | selected `ggml-cuda` MMQ files | ds4-style pinned vendor + raw C shim | per-format dense/MoE parity, llama continuation fixtures, performance within target |
+| GGUF Q8/IQ3/Q3 | llama.cpp and ds4 | selected `ggml-cuda` MMQ files | ds4-style pinned vendor + raw C shim | per-format dense/MoE parity, llama continuation fixtures, performance within target |
+| GLM KDA recurrence | pinned GLM5Next oracle | fixed-shape CUDA port behind the common recurrent-state ABI | reimplement from frozen equations and fixtures | multi-token state parity at every KDA layer |
+| GLM DSA/MLA and sparse indexer | pinned GLM5Next oracle | smallest proven CUDA primitives plus local orchestration | vendor or wrap only after quantized CUDA verification | exact pooled top-k indices; FP32 reference logits; no accidental RoPE |
+| GLM mHC and routing | pinned GLM5Next oracle | local small kernels plus common MoE dispatcher | reimplement; share Qwen hyperconnection/top-k primitives where contracts match | exact 288-expert top-8 ids/order/weights and stream coefficients |
+| GLM IQ3 routed MoE | pinned llama.cpp GGUF oracle | `ggml-cuda` IQ3 MMQ `_id` path | pinned ds4-style vendor and raw C shim | selected-slice byte offsets, dequant parity, expert-cache hit/miss parity, continuation fixtures |
+
+### GLM oracle invariants
+
+The draft GLM5Next implementation is useful precisely because it exposes model
+details that generic operator names hide. Before it can become a frozen oracle,
+fixtures must preserve all of the following:
+
+- 45 trunk layers plus the MTP block, with the exact KDA/DSA layer pattern;
+- no RoPE anywhere in the text tower;
+- DSA as MLA and the indexer run with the reference precision policy;
+- pooled top-k selection semantics rather than an ordinary flat top-k;
+- 288 routed experts plus one shared expert, sigmoid/no-aux routing, top-8 order,
+  and routing scale;
+- mHC stream mixing and persistent-state updates.
+
+The draft branch currently requests `NVIDIA_TF32_OVERRIDE=0` and Flash Attention
+off for its correctness path. Those are oracle controls, not permanent runtime
+requirements. SparkServe can enable faster math only after operator and
+continuation parity demonstrate that the replacement is safe.
 
 ## Accuracy ladder
 
@@ -172,10 +196,14 @@ kernels—without importing either framework's scheduler, allocator, or graph.
    block-interleaved scale layout and alpha convention.
 3. Wrap the existing kernel unchanged and prove parity before replacing its
    Python/Torch launch layer.
-4. Repeat for Flash-Next MoE once the reference image and checkpoint are ready;
-   keep routing/top-k as a separately tested stage.
-5. Lift the ds4 llama-MMQ subset for the first GGUF format only, preserving its
-   upstream pin and parity-test structure.
+4. Complete Flash-Next MoE and PLE parity; keep routing/top-k as a separately
+   tested stage.
+5. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
+6. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
+7. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed
+   expert ids, while preserving its upstream pin and parity-test structure.
+8. Add the explicit NVMe expert cache and measure bytes/token before setting a
+   GLM decode-speed target. Add Q3_K only after the IQ3 path is stable.
 
 Do not begin with fusion. First reproduce the unfused SGLang graph and its
 intermediates; fuse only adjacent operations whose joint contract is already

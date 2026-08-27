@@ -16,9 +16,10 @@ contracts, and promotion gates are recorded in
 | PLE row gather | SGLang Qwen4 gather; SGLang PR 36567 storage design | Rust reads original safetensors; use a tiny CUDA gather × scalar-scale × BF16-accumulate kernel | cold-page tail latency during long prefill |
 | QSA decode | SGLang Qwen4 backend plus FlashInfer TRT-LLM sparse decode | Extract and pin the working SM120/121 path | architecture gates and FP8-KV edge cases |
 | GDN recurrent update | SGLang Qwen4 implementation as oracle | Port the fixed Qwen shape to CUDA and capture it in the decode graph | state-stride correctness and FP32 state contract |
+| GLM KDA/DSA state and sparse indexer | pinned GLM5Next llama.cpp oracle | Port only after exact index, state, and FP32-reference fixtures are frozen | draft upstream CUDA path, pooled top-k semantics, accidental RoPE |
 | Hyperconnection mix/combine | SGLang fused kernels as oracle | Small shape-specialized CUDA kernels | silent stream-index errors |
 | RMSNorm, RoPE, sampling | FlashInfer or compact local CUDA | Reuse only when it wins a GB10 microbenchmark | launch overhead at batch one |
-| GGUF Q8/Q4/Q2/IQ | llama.cpp `ggml-cuda` MMQ kernels | Vendor selected format structs and kernels behind our ABI | coupling to ggml tensor metadata |
+| GGUF Q8/IQ3/Q3 | llama.cpp `ggml-cuda` MMQ kernels | Use Q8_0 as the reference, then vendor only IQ3_XXS and Q3_K pieces behind our ABI | coupling to ggml metadata and selected-expert slice layout |
 
 ## License boundary
 
@@ -38,8 +39,9 @@ Only the Spark-specific glue and kernels whose specialization is the product:
 1. original-safetensors PLE address index and asynchronous row reader;
 2. fused 160-byte FP8 row gather, per-table scaling, and BF16 accumulation;
 3. one-copy mapped-weight allocator and residency controller;
-4. adaptive MTP width tied to measured acceptance and QSA ring capacity;
-5. Rust scheduler/state machine and stable C ABI.
+4. fixed-address GGUF expert-block cache with async NVMe admission and telemetry;
+5. adaptive MTP width tied to measured acceptance and QSA ring capacity;
+6. Rust scheduler/state machine and stable C ABI.
 
 Everything else starts as an upstream kernel candidate and earns replacement
 only through a repeatable GB10 benchmark.
@@ -51,3 +53,5 @@ only through a repeatable GB10 benchmark.
 - [SGLang Flash-Next support PR](https://github.com/sgl-project/sglang/pull/36497)
 - [SGLang explicit NVMe PLE PR](https://github.com/sgl-project/sglang/pull/36567)
 - [llama.cpp/ggml CUDA MMQ kernels](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/mmq.cu)
+- [Draft llama.cpp GLM5Next support](https://github.com/ggml-org/llama.cpp/pull/27754)
+- [Unsloth GLM-5.3-Flash GGUF artifacts](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)

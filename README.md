@@ -7,12 +7,16 @@ It is deliberately not an SGLang fork. SGLang and llama.cpp are correctness and
 performance oracles; SparkServe owns the memory hierarchy, scheduler, model IR,
 and kernels needed to make models fit and run well on coherent-memory GB10.
 
-The first targets are:
+The ordered model targets are:
 
 1. `Qwen3.8-27B-SGLang-NVFP4` as the resident, measurable baseline.
 2. `RadixArk/Qwen3.8-Flash-Next-NVFP4` with its sparse PLE table on NVMe.
-3. Larger GGUF models using quantized, model-aware paging rather than whole-model
-   dequantization.
+3. `unsloth/GLM-5.3-Flash-GGUF:UD-IQ3_XXS` as the first explicitly paged
+   3-bit MoE target; `UD-Q3_K_XL` follows as a higher-quality stretch target.
+
+SparkServe intentionally has two checkpoint-format families: ModelOpt NVFP4 in
+safetensors and quantized GGUF blocks. Qwen4-exp and GLM5Next are model graphs
+inside the same runtime, not separate serving stacks.
 
 ## Highlights
 
@@ -29,6 +33,8 @@ The first targets are:
 - **Borrow kernels, not frameworks:** CUTLASS, selected FlashInfer/SGLang kernels,
   and ggml CUDA kernels sit behind our small C ABI; their Python schedulers,
   allocators, and servers are not runtime dependencies.
+- **Two formats, one execution core:** NVFP4 and GGUF tensors feed the same model
+  IR, scheduler, state manager, and OpenAI-compatible server.
 
 ## The key bet
 
@@ -170,3 +176,21 @@ Pure C remains valuable as a baseline and for tiny GGUF executors. Flash-Next ha
 enough stateful and failure-sensitive machinery that Rust gives us a smaller
 operational system than hand-building networking, JSON, concurrency, and I/O
 safety around a monolithic C inference loop.
+
+## After Qwen Flash: GLM-5.3-Flash
+
+The first GLM target is Unsloth's `UD-IQ3_XXS` GGUF. Its advertised 120 GB file
+is about 111.8 GiB, leaving less than 10 GiB on the 121.7-GiB Spark after the
+weights alone. That is not enough for the OS, runtime, recurrent/attention state,
+workspaces, and KV cache, so whole-model residency is explicitly unsupported.
+
+The loader will keep the dense trunk, routers, KDA/DSA state, mHC parameters,
+and a measured hot-expert set resident. Remaining IQ3 expert blocks stay on NVMe
+and enter a fixed-size encoded-block cache after routing. The first acceptance
+gate is correctness plus deterministic memory use; performance is gated on
+measured cache hit rate and NVMe bytes/token. We will not claim that 18B active
+parameters make an out-of-core 321B model fast without those measurements.
+
+The current llama.cpp GLM5Next implementation is a draft semantic oracle, not a
+runtime dependency. We will freeze an exact revision only after its CUDA and
+quantized paths have reproducible fixtures on Spark.

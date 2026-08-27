@@ -26,8 +26,8 @@ revision can be queried before weights are mapped.
 
 The runtime has five components:
 
-- **Model IR:** a small set of operations covering GDN, QSA, hyper-connections,
-  top-k MoE, sparse PLE lookup, MTP, and quantized linear layers.
+- **Model IR:** a small set of operations covering GDN, QSA, KDA, DSA/MLA,
+  hyper-connections, top-k MoE, sparse PLE lookup, MTP, and quantized linears.
 - **Spark Weight Fabric:** explicit resident, sparse-row, and block-paged stores.
 - **Graph scheduler:** fixed-address CUDA graphs for decode and bounded prefill
   shapes, with a single latency-oriented request lane first.
@@ -48,7 +48,7 @@ The runtime makes placement explicit:
 | --- | --- | --- |
 | Resident coherent DRAM | dense paths, shared experts, GDN/QSA, routers, hot MoE weights | fixed addresses for CUDA graphs |
 | Sparse row cache | PLE rows plus decoded BF16 staging | gather 16 rows/token; admission and prefetch by n-gram id |
-| Quantized block cache | GGUF layers or routed expert blocks | retain encoded Q4/Q2/IQ blocks; evict by reuse cost |
+| Quantized block cache | GGUF layers or routed expert blocks | retain encoded Q/IQ blocks; evict by reuse cost |
 | NVMe store | cold PLE shards and out-of-core GGUF blocks | aligned async reads with checksummed manifests |
 
 Host offload is not a tier because host and device share physical capacity on
@@ -104,13 +104,39 @@ golden logits and a measured target of about 50 decode tokens/s.
 ### GGUF
 
 GGUF is a storage contract, not a second execution engine. The loader maps GGUF
-metadata and tensor blocks into the same Model IR. Initial kernel order is Q8_0,
-Q4_K_M, Q4_0, then Q2_K/IQ2 variants. Quantized blocks remain quantized in memory.
+metadata and tensor blocks into the same Model IR. The initial reference kernel
+is Q8_0, followed by the production GLM formats IQ3_XXS and Q3_K. Quantized
+blocks remain encoded in memory and are consumed directly by CUDA MMQ kernels;
+the runtime never expands a whole GGUF model to BF16.
 
 Dense models larger than resident memory require every layer to cross NVMe each
 token and will be I/O-bound. Large MoE models are viable only when the resident
 expert set plus routing locality keeps misses low. SparkServe reports predicted
 and measured bytes/token instead of promising that every oversized GGUF is fast.
+
+The first oversized target is `GLM-5.3-Flash-GGUF:UD-IQ3_XXS`: 321B total and
+18B active parameters in a roughly 120-GB file. On a single Spark, the weights
+alone consume about 111.8 GiB of a roughly 121.7-GiB usable-memory machine. The
+runtime therefore uses this placement policy:
+
+1. keep the dense trunk, routers, KDA/DSA parameters and state, mHC parameters,
+   embeddings, and output head resident when the measured plan permits it;
+2. assign the remaining budget to an encoded hot-expert cache;
+3. after each layer's router produces its exact top-8 selection, fetch missing
+   expert slices into fixed-address slots and overlap work across layer stages;
+4. expose miss bytes, useful bytes, hit rate, read amplification, and stall time
+   for every run.
+
+Prefetch cannot hide a cold miss whose expert choice is not known yet. Routing
+locality and cache capacity, not unified-memory marketing, determine performance.
+If GGUF packs experts so that a selected slice cannot be read without large
+amplification, an offline aligned `sspack` repack may be generated; GGUF remains
+the source artifact and the repack is revision- and checksum-bound.
+
+GLM5Next adds model semantics rather than a third storage path: a 46-block graph
+(45 trunk blocks plus MTP), hybrid KDA and DSA/MLA attention, no text-tower RoPE,
+a pooled top-k sparse indexer, mHC, and 288 routed plus one shared expert with
+top-8 routing. Each invariant is frozen in oracle fixtures before optimization.
 
 ## 5. Scheduler
 
@@ -160,11 +186,23 @@ configured safety reserve.
 - Gate: peak committed memory below 105 GiB, deterministic cold-cache behavior,
   and PLE stalls hidden for at least 95% of decode steps.
 
-### M4 — native GGUF
+### M4 — native GGUF and GLM-5.3-Flash
 
-- Add formats one kernel at a time with llama.cpp golden logits.
-- Gate: resident Q4 models within 10% of llama.cpp decode performance before any
-  out-of-core work; expose cache hit rate and NVMe bytes/token for larger models.
+- Implement a strict GGUF metadata/tensor index and a CPU Q8_0 reference path
+  before importing optimized quantized kernels.
+- Establish a pinned GLM5Next oracle only after its CUDA and quantized outputs
+  are reproducible on Spark. Freeze graph, routing, state, logits, and greedy
+  continuations, not merely final text.
+- Add IQ3_XXS dense and routed-MoE MMQ first; add Q3_K after correctness and
+  storage telemetry are stable.
+- Run `UD-IQ3_XXS` with an explicit resident plan and expert-block cache. Never
+  rely on implicit whole-file mmap residency.
+- Gate: exact discrete routing/index results, accepted numerical tolerances per
+  operator, peak committed memory below 105 GiB, no OOM under cold cache, and
+  reported cache hit rate/read amplification/NVMe bytes per generated token.
+- The performance gate is conditional: set a tokens/s target only after a trace
+  proves the cache working set can achieve it. A slow but bounded baseline is
+  preferable to an unverifiable speed claim.
 
 ## 7. Non-goals for the first release
 
@@ -174,8 +212,8 @@ configured safety reserve.
 - transparent oversubscription through CUDA unified-memory faults;
 - a second copy of SGLang's Python server internals.
 
-The project wins by making two unusual cases excellent: NVFP4 Qwen on GB10 and
-explicit sparse/out-of-core weights on a coherent-memory workstation.
+The project wins by making two format paths excellent: NVFP4 Qwen on GB10 and
+explicit GGUF sparse/out-of-core weights on a coherent-memory workstation.
 
 Measured prior art and the performance targets derived from it are documented
 in [prior-art.md](prior-art.md).

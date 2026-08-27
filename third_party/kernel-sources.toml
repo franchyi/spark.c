@@ -51,6 +51,16 @@ entrypoint = "ggml/src/ggml-cuda/mmq.cuh"
 notes = "Pin proven by ds4 dense and routed-MoE parity fixtures. Import one GGUF format at a time."
 
 [[source]]
+id = "llama-cpp-glm5next-oracle"
+repository = "https://github.com/ggml-org/llama.cpp"
+revision = "UNFROZEN"
+license = "MIT"
+mode = "semantic-oracle"
+status = "blocked-draft-pr-cuda-quantized-verification-pending"
+entrypoint = "https://github.com/ggml-org/llama.cpp/pull/27754"
+notes = "GLM-5.3-Flash/GLM5Next draft on unslothai/llama.cpp:glm5next/upstream. Do not vendor until an immutable revision passes Spark CUDA and quantized parity fixtures."
+
+[[source]]
 id = "cutlass-sm121-nvfp4"
 repository = "https://github.com/NVIDIA/cutlass"
 revision = "UNFROZEN"
