@@ -1,6 +1,6 @@
 use std::ffi::{c_char, c_void};
 
-use crate::kernel::{DataType, DenseNvfp4Spec, KERNEL_ABI_VERSION};
+use crate::kernel::{DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +96,78 @@ pub struct DenseNvfp4Args {
     pub workspace_bytes: u64,
     pub cuda_stream: *mut c_void,
     pub alpha_device: *const f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupedNvfp4Plan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_groups: u32,
+    pub group_size: u32,
+    pub total_rows: u64,
+    pub input_scale_rows: u64,
+    pub n: u64,
+    pub k: u64,
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub tile_k: u32,
+    pub swap_ab: u32,
+    pub input_scale_layout: u32,
+    pub weight_scale_layout: u32,
+    pub output_dtype: u32,
+    pub requested_backend: u32,
+}
+
+impl From<GroupedNvfp4Spec> for GroupedNvfp4Plan {
+    fn from(spec: GroupedNvfp4Spec) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_groups: spec.num_groups,
+            group_size: spec.group_size,
+            total_rows: spec.total_rows,
+            input_scale_rows: spec.input_scale_rows,
+            n: spec.n,
+            k: spec.k,
+            tile_m: spec.tile_m,
+            tile_n: spec.tile_n,
+            tile_k: spec.tile_k,
+            swap_ab: u32::from(spec.swap_ab),
+            input_scale_layout: spec.input_scale_layout as u32,
+            weight_scale_layout: spec.weight_scale_layout as u32,
+            output_dtype: spec.output_dtype as u32,
+            requested_backend: spec.requested_backend as u32,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GroupedNvfp4WeightView {
+    pub packed_data: *const c_void,
+    pub block_scales: *const c_void,
+    pub packed_group_stride_bytes: u64,
+    pub scale_group_stride_bytes: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GroupedNvfp4Args {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: GroupedNvfp4Plan,
+    pub input: Nvfp4MatrixView,
+    pub weights: GroupedNvfp4WeightView,
+    pub m_indptr: *const i32,
+    pub alpha_device: *const f32,
+    pub output: *mut c_void,
+    pub output_row_stride_bytes: u64,
+    pub int_workspace: *mut c_void,
+    pub int_workspace_bytes: u64,
+    pub float_workspace: *mut c_void,
+    pub float_workspace_bytes: u64,
+    pub cuda_stream: *mut c_void,
 }
 
 #[repr(u32)]
@@ -197,6 +269,16 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const DenseNvfp4Args,
     ) -> Status;
+    pub fn sparkserve_grouped_nvfp4_validate(plan: *const GroupedNvfp4Plan) -> Status;
+    pub fn sparkserve_grouped_nvfp4_query(
+        caps: *const DeviceCaps,
+        plan: *const GroupedNvfp4Plan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_grouped_nvfp4_launch(
+        caps: *const DeviceCaps,
+        args: *const GroupedNvfp4Args,
+    ) -> Status;
     pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn sparkserve_gdn_decode_query(
         caps: *const DeviceCaps,
@@ -224,6 +306,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<DenseNvfp4Plan>(), 80);
         assert_eq!(std::mem::size_of::<Nvfp4MatrixView>(), 32);
         assert_eq!(std::mem::size_of::<DenseNvfp4Args>(), 208);
+        assert_eq!(std::mem::size_of::<GroupedNvfp4Plan>(), 80);
+        assert_eq!(std::mem::size_of::<GroupedNvfp4WeightView>(), 32);
+        assert_eq!(std::mem::size_of::<GroupedNvfp4Args>(), 224);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
@@ -249,5 +334,22 @@ mod tests {
         assert_eq!(plan.value_dim, 128);
         assert_eq!(plan.state_dtype, DataType::BFloat16 as u32);
         assert_eq!(plan.requested_backend, GdnBackend::Auto as u32);
+    }
+
+    #[test]
+    fn grouped_spec_converts_to_flashinfer_donor_contract() {
+        use crate::kernel::{GroupedExpertLayout, GroupedNvfp4Spec};
+
+        let layout = GroupedExpertLayout::from_expert_rows(&[4, 0]).expect("layout");
+        let native = GroupedNvfp4Spec::qwen_expert_projection(&layout, 640, 2560).expect("spec");
+        let plan = GroupedNvfp4Plan::from(native);
+        assert_eq!(plan.num_groups, 2);
+        assert_eq!(plan.total_rows, 4);
+        assert_eq!(plan.input_scale_rows, 256);
+        assert_eq!(plan.tile_k, 256);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::FlashInferGroupMmFp4 as u32
+        );
     }
 }

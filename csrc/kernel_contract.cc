@@ -8,6 +8,9 @@
 #ifdef SPARKSERVE_WITH_FLASHINFER_NVFP4
 #include "internal/nvfp4_dense_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_FLASHINFER_GROUPED_NVFP4
+#include "internal/nvfp4_grouped_backend.h"
+#endif
 
 namespace {
 
@@ -76,6 +79,13 @@ SparkServeKernelBackend ResolveBackend(const SparkServeDeviceCaps& caps,
   if (requested != SPARKSERVE_BACKEND_AUTO) return requested;
   (void)caps;
   return SPARKSERVE_BACKEND_FLASHINFER_MM_FP4;
+}
+
+SparkServeKernelBackend ResolveGroupedBackend(
+    SparkServeKernelBackend requested) {
+  return requested == SPARKSERVE_BACKEND_AUTO
+             ? SPARKSERVE_BACKEND_FLASHINFER_GROUP_MM_FP4
+             : requested;
 }
 
 }  // namespace
@@ -168,6 +178,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       info->name = "cutlass-sm121-nvfp4";
       info->source_revision = "unfrozen-candidate";
       break;
+    case SPARKSERVE_BACKEND_FLASHINFER_GROUP_MM_FP4:
+      return Invalid("grouped FlashInfer backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -219,6 +231,143 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_launch(
   }
 #endif
   return Unavailable("NVFP4 contract is valid but no CUDA backend is linked");
+}
+
+extern "C" SparkServeStatus sparkserve_grouped_nvfp4_validate(
+    const SparkServeGroupedNvfp4Plan* plan) {
+  if (plan == nullptr) return Invalid("grouped NVFP4 plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_groups == 0 || plan->num_groups > 512) {
+    return Invalid("grouped NVFP4 requires between 1 and 512 experts");
+  }
+  if (plan->total_rows == 0 || plan->n == 0 || plan->k == 0) {
+    return Invalid("grouped NVFP4 rows, N, and K must be non-zero");
+  }
+  if (plan->group_size != kNvfp4GroupSize) {
+    return Unsupported("grouped NVFP4 group size must be 16");
+  }
+  if (plan->total_rows % 4 != 0) {
+    return Invalid("grouped NVFP4 routed rows must include four-row padding");
+  }
+  if (plan->input_scale_rows < plan->total_rows ||
+      plan->input_scale_rows % 128 != 0) {
+    return Invalid(
+        "grouped NVFP4 input scale rows must include 128-row expert padding");
+  }
+  if (plan->n % 128 != 0 || plan->k % 128 != 0) {
+    return Invalid("first grouped NVFP4 tactic requires N and K aligned to 128");
+  }
+  if (plan->tile_m != 128 || plan->tile_n != 128 ||
+      plan->tile_k != 256 || plan->swap_ab != 0) {
+    return Unsupported(
+        "linked grouped NVFP4 tactic is 128x128x256 with swap_ab=false");
+  }
+  if (plan->input_scale_layout !=
+          SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4 ||
+      plan->weight_scale_layout !=
+          SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4) {
+    return Unsupported("grouped NVFP4 requires CUTLASS 128x4 scales");
+  }
+  if (plan->output_dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("grouped NVFP4 output must be BF16");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend !=
+          SPARKSERVE_BACKEND_FLASHINFER_GROUP_MM_FP4) {
+    return Invalid("unknown grouped NVFP4 backend");
+  }
+  if (!CanMultiply(plan->total_rows, plan->k / 2) ||
+      !CanMultiply(plan->input_scale_rows, plan->k / kNvfp4GroupSize) ||
+      !CanMultiply(plan->num_groups, plan->n) ||
+      !CanMultiply(static_cast<uint64_t>(plan->num_groups) * plan->n,
+                   plan->k / 2) ||
+      !CanMultiply(plan->total_rows, plan->n) ||
+      !CanMultiply(plan->total_rows * plan->n, 2)) {
+    return Invalid("grouped NVFP4 buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_grouped_nvfp4_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGroupedNvfp4Plan* plan, SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  SparkServeStatus plan_status = sparkserve_grouped_nvfp4_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+
+  const auto backend = ResolveGroupedBackend(
+      static_cast<SparkServeKernelBackend>(plan->requested_backend));
+  info->backend = backend;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "flashinfer-group-gemm-nvfp4";
+  info->source_revision =
+      "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+#ifdef SPARKSERVE_WITH_FLASHINFER_GROUPED_NVFP4
+  info->workspace_bytes =
+      sparkserve_flashinfer_grouped_nvfp4_int_workspace_bytes() +
+      sparkserve_flashinfer_grouped_nvfp4_float_workspace_bytes();
+  if (caps->workspace_limit_bytes != 0 &&
+      info->workspace_bytes > caps->workspace_limit_bytes) {
+    return Unsupported("grouped NVFP4 workspace exceeds the device budget");
+  }
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_grouped_nvfp4_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGroupedNvfp4Args* args) {
+  SparkServeStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (args == nullptr) return Invalid("grouped NVFP4 arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeStatus plan_status = sparkserve_grouped_nvfp4_validate(&args->plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (args->input.packed_data == nullptr ||
+      args->input.block_scales == nullptr ||
+      args->weights.packed_data == nullptr ||
+      args->weights.block_scales == nullptr || args->m_indptr == nullptr ||
+      args->alpha_device == nullptr || args->output == nullptr) {
+    return Invalid("grouped NVFP4 launch pointers cannot be null");
+  }
+  const uint64_t packed_group_bytes = args->plan.n * args->plan.k / 2;
+  const uint64_t scale_group_bytes =
+      args->plan.n * args->plan.k / args->plan.group_size;
+  if (args->input.packed_row_stride_bytes != args->plan.k / 2 ||
+      args->input.scale_row_stride_bytes !=
+          args->plan.k / args->plan.group_size ||
+      args->weights.packed_group_stride_bytes != packed_group_bytes ||
+      args->weights.scale_group_stride_bytes != scale_group_bytes ||
+      args->output_row_stride_bytes != args->plan.n * 2) {
+    return Invalid("grouped NVFP4 donor requires contiguous physical strides");
+  }
+#ifdef SPARKSERVE_WITH_FLASHINFER_GROUPED_NVFP4
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query_status =
+      sparkserve_grouped_nvfp4_query(caps, &args->plan, &info);
+  if (query_status.code != SPARKSERVE_STATUS_OK) return query_status;
+  return sparkserve_flashinfer_grouped_nvfp4_launch(args);
+#else
+  return Unavailable(
+      "grouped NVFP4 contract is valid but no CUDA backend is linked");
+#endif
 }
 
 extern "C" SparkServeStatus sparkserve_gdn_decode_validate(

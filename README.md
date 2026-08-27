@@ -126,8 +126,15 @@ Activation scale allocation now includes the mandatory 128-row physical tile:
 for `M=1,K=4096` it is 32 KiB, not the 256-byte logical element count. The first
 real checkpoint fixture (`layer 0 / expert 0 / gate_proj`,
 `M=1,N=640,K=2560`) now matches the raw FlashInfer oracle bit-for-bit across all
-640 BF16 outputs. Prefill tactics and the fused routed-MoE path remain promotion
-gates before this path is used for the full model.
+640 BF16 outputs.
+
+The routed-MoE arithmetic boundary now links FlashInfer's grouped SM120/121
+NVFP4 GEMM through a second raw C ABI. Rust builds per-expert row ranges with
+separate four-row GEMM padding and 128-row scale padding, so fixed 512-expert
+graphs retain stable addresses even when most experts are empty. A two-expert
+fixture using real layer-0 gate projections matches all 5,120 BF16 outputs
+bit-for-bit. Routing/top-k, the borrowed fused SiLU/quantizer, the down
+projection, and weighted scatter-add remain before a complete MoE layer token.
 
 The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
 a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real

@@ -30,6 +30,7 @@ pub enum KernelBackend {
     Auto = 0,
     FlashInferMmFp4 = 1,
     CutlassSm121 = 2,
+    FlashInferGroupMmFp4 = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +128,189 @@ pub struct DenseNvfp4Buffers {
     pub output_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupedExpertLayout {
+    pub m_indptr: Vec<i32>,
+    pub scale_row_offsets: Vec<u64>,
+    pub total_rows: u64,
+    pub input_scale_rows: u64,
+}
+
+impl GroupedExpertLayout {
+    /// Build FlashInfer's routed-row layout from one unpadded token count per
+    /// expert. The four-row GEMM padding and 128-row scale padding are kept
+    /// separate because they are different physical address spaces.
+    pub fn from_expert_rows(expert_rows: &[u32]) -> Result<Self, KernelContractError> {
+        if expert_rows.is_empty() || expert_rows.len() > 512 {
+            return Err(KernelContractError::InvalidExpertCount(expert_rows.len()));
+        }
+
+        let mut m_indptr = Vec::with_capacity(expert_rows.len() + 1);
+        let mut scale_row_offsets = Vec::with_capacity(expert_rows.len());
+        m_indptr.push(0);
+        let mut total_rows = 0_u64;
+        let mut input_scale_rows = 0_u64;
+        for (expert_index, rows) in expert_rows.iter().copied().enumerate() {
+            let padded_rows = if rows == 0 {
+                0
+            } else {
+                align_up(u64::from(rows), 4)?
+            };
+            let scale_offset_numerator = total_rows
+                .checked_add(
+                    u64::try_from(expert_index)
+                        .map_err(|_| KernelContractError::DimensionOverflow)?
+                        .checked_mul(127)
+                        .ok_or(KernelContractError::DimensionOverflow)?,
+                )
+                .ok_or(KernelContractError::DimensionOverflow)?;
+            let scale_offset = scale_offset_numerator / 128 * 128;
+            scale_row_offsets.push(scale_offset);
+            // Keep even an empty expert's pointer inside an allocated scale
+            // tile. This lets a fixed 512-expert CUDA graph remain valid as
+            // the set of hot experts changes between batches.
+            input_scale_rows = input_scale_rows.max(
+                scale_offset
+                    .checked_add(128)
+                    .ok_or(KernelContractError::DimensionOverflow)?,
+            );
+            total_rows = total_rows
+                .checked_add(padded_rows)
+                .ok_or(KernelContractError::DimensionOverflow)?;
+            m_indptr.push(
+                i32::try_from(total_rows)
+                    .map_err(|_| KernelContractError::RoutedRowCountOverflow)?,
+            );
+        }
+        if total_rows == 0 {
+            return Err(KernelContractError::ZeroDimension);
+        }
+        Ok(Self {
+            m_indptr,
+            scale_row_offsets,
+            total_rows,
+            input_scale_rows,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupedNvfp4Spec {
+    pub num_groups: u32,
+    pub total_rows: u64,
+    pub input_scale_rows: u64,
+    pub n: u64,
+    pub k: u64,
+    pub group_size: u32,
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub tile_k: u32,
+    pub swap_ab: bool,
+    pub input_scale_layout: ScaleLayout,
+    pub weight_scale_layout: ScaleLayout,
+    pub output_dtype: DataType,
+    pub requested_backend: KernelBackend,
+}
+
+impl GroupedNvfp4Spec {
+    pub fn qwen_expert_projection(
+        layout: &GroupedExpertLayout,
+        n: u64,
+        k: u64,
+    ) -> Result<Self, KernelContractError> {
+        let num_groups = u32::try_from(layout.scale_row_offsets.len())
+            .map_err(|_| KernelContractError::DimensionOverflow)?;
+        let spec = Self {
+            num_groups,
+            total_rows: layout.total_rows,
+            input_scale_rows: layout.input_scale_rows,
+            n,
+            k,
+            group_size: NVFP4_GROUP_SIZE,
+            tile_m: 128,
+            tile_n: 128,
+            tile_k: 256,
+            swap_ab: false,
+            input_scale_layout: ScaleLayout::Cutlass128x4,
+            weight_scale_layout: ScaleLayout::Cutlass128x4,
+            output_dtype: DataType::BFloat16,
+            requested_backend: KernelBackend::FlashInferGroupMmFp4,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn validate(self) -> Result<(), KernelContractError> {
+        if self.num_groups == 0 || self.num_groups > 512 {
+            return Err(KernelContractError::InvalidExpertCount(
+                self.num_groups as usize,
+            ));
+        }
+        if self.total_rows == 0 || self.n == 0 || self.k == 0 {
+            return Err(KernelContractError::ZeroDimension);
+        }
+        if self.total_rows % 4 != 0
+            || self.input_scale_rows < self.total_rows
+            || self.input_scale_rows % 128 != 0
+        {
+            return Err(KernelContractError::InvalidRoutedPadding);
+        }
+        if self.n % 128 != 0 || self.k % 128 != 0 {
+            return Err(KernelContractError::GroupedAlignment);
+        }
+        if self.group_size != NVFP4_GROUP_SIZE {
+            return Err(KernelContractError::UnsupportedGroupSize(self.group_size));
+        }
+        if self.tile_m != 128 || self.tile_n != 128 || self.tile_k != 256 || self.swap_ab {
+            return Err(KernelContractError::UnsupportedGroupedTactic);
+        }
+        if self.input_scale_layout != ScaleLayout::Cutlass128x4
+            || self.weight_scale_layout != ScaleLayout::Cutlass128x4
+        {
+            return Err(KernelContractError::UnsupportedScaleLayout);
+        }
+        if self.output_dtype != DataType::BFloat16 {
+            return Err(KernelContractError::UnsupportedOutputType);
+        }
+        self.buffer_requirements()?;
+        Ok(())
+    }
+
+    pub fn buffer_requirements(self) -> Result<GroupedNvfp4Buffers, KernelContractError> {
+        Ok(GroupedNvfp4Buffers {
+            packed_input_bytes: checked_product(&[self.total_rows, self.k / 2])?,
+            input_scale_bytes: checked_product(&[
+                self.input_scale_rows,
+                self.k / u64::from(self.group_size),
+            ])?,
+            packed_weight_bytes: checked_product(&[
+                u64::from(self.num_groups),
+                self.n,
+                self.k / 2,
+            ])?,
+            weight_scale_bytes: checked_product(&[
+                u64::from(self.num_groups),
+                self.n,
+                self.k / u64::from(self.group_size),
+            ])?,
+            output_bytes: checked_product(&[self.total_rows, self.n, 2])?,
+            int_workspace_bytes: 32 * 1024 * 1024,
+            float_workspace_bytes: 32 * 1024 * 1024,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupedNvfp4Buffers {
+    pub packed_input_bytes: u64,
+    pub input_scale_bytes: u64,
+    pub packed_weight_bytes: u64,
+    pub weight_scale_bytes: u64,
+    pub output_bytes: u64,
+    pub int_workspace_bytes: u64,
+    pub float_workspace_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCaps {
     pub sm: u32,
@@ -206,6 +390,11 @@ pub enum KernelContractError {
     UnsupportedOutputType,
     DeviceUnsupported(u32),
     NoKernelCandidate,
+    InvalidExpertCount(usize),
+    RoutedRowCountOverflow,
+    InvalidRoutedPadding,
+    GroupedAlignment,
+    UnsupportedGroupedTactic,
 }
 
 impl fmt::Display for KernelContractError {
@@ -239,6 +428,29 @@ impl fmt::Display for KernelContractError {
                 )
             }
             Self::NoKernelCandidate => write!(formatter, "no kernel candidate matches the plan"),
+            Self::InvalidExpertCount(count) => {
+                write!(
+                    formatter,
+                    "grouped NVFP4 requires 1..=512 experts, got {count}"
+                )
+            }
+            Self::RoutedRowCountOverflow => {
+                write!(
+                    formatter,
+                    "routed expert rows exceed the INT32 kernel index range"
+                )
+            }
+            Self::InvalidRoutedPadding => write!(
+                formatter,
+                "routed rows require four-row GEMM padding and 128-row scale padding"
+            ),
+            Self::GroupedAlignment => {
+                write!(formatter, "grouped NVFP4 N and K must align to 128")
+            }
+            Self::UnsupportedGroupedTactic => write!(
+                formatter,
+                "linked grouped NVFP4 tactic is 128x128x256 with swap_ab=false"
+            ),
         }
     }
 }
@@ -336,6 +548,35 @@ mod tests {
                 }
             ),
             Err(KernelContractError::DeviceUnsupported(90))
+        );
+    }
+
+    #[test]
+    fn routed_expert_layout_separates_gemm_and_scale_padding() {
+        let layout = GroupedExpertLayout::from_expert_rows(&[1, 0, 5]).expect("layout");
+        assert_eq!(layout.m_indptr, vec![0, 4, 4, 12]);
+        assert_eq!(layout.scale_row_offsets, vec![0, 128, 256]);
+        assert_eq!(layout.total_rows, 12);
+        assert_eq!(layout.input_scale_rows, 384);
+    }
+
+    #[test]
+    fn qwen_grouped_projection_sizes_include_all_experts() {
+        let mut rows = vec![0; 512];
+        rows[3] = 1;
+        rows[300] = 2;
+        let layout = GroupedExpertLayout::from_expert_rows(&rows).expect("layout");
+        let spec = GroupedNvfp4Spec::qwen_expert_projection(&layout, 640, 2560)
+            .expect("Qwen gate projection");
+        let buffers = spec.buffer_requirements().expect("buffer sizes");
+        assert_eq!(spec.num_groups, 512);
+        assert_eq!(spec.total_rows, 8);
+        assert_eq!(spec.input_scale_rows, 65_024);
+        assert_eq!(buffers.packed_weight_bytes, 419_430_400);
+        assert_eq!(buffers.weight_scale_bytes, 52_428_800);
+        assert_eq!(
+            buffers.int_workspace_bytes + buffers.float_workspace_bytes,
+            64 * 1024 * 1024
         );
     }
 }

@@ -11,6 +11,16 @@ entrypoint = "include/flashinfer/gemm/fp4_gemm_template_sm120.h"
 notes = "One upstream 128x128x256 tactic is explicitly instantiated behind SparkServe's raw C ABI. No Python, Torch, TVM-FFI, or SGLang runtime dependency."
 
 [[source]]
+id = "flashinfer-group-gemm-nvfp4"
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "external-oracle"
+status = "linked-framework-free-sm121-real-tensor-parity-passed"
+entrypoint = "include/flashinfer/gemm/group_gemm_nvfp4_groupwise_sm120.cuh"
+notes = "One upstream 128x128x256 non-swapped grouped tactic is instantiated behind a raw C ABI. Rust owns expert row layout and scheduling; two real Qwen experts match the FlashInfer oracle bit-for-bit."
+
+[[source]]
 id = "flashinfer-gdn-decode-oracle"
 repository = "https://github.com/flashinfer-ai/flashinfer"
 revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
@@ -78,4 +88,4 @@ license = "BSD-3-Clause"
 mode = "transitive-build-source"
 status = "pinned-via-flashinfer-submodule"
 entrypoint = "include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp"
-notes = "Exact FlashInfer submodule pin used by the linked dense NVFP4 tactic."
+notes = "Exact FlashInfer submodule pin used by the linked dense and grouped NVFP4 tactics."

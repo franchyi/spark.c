@@ -5,6 +5,12 @@
 _Static_assert(SPARKSERVE_KERNEL_ABI_VERSION == 1u, "unexpected ABI version");
 _Static_assert(sizeof(SparkServeDenseNvfp4Plan) == 80u,
                "C plan layout drifted");
+_Static_assert(sizeof(SparkServeGroupedNvfp4Plan) == 80u,
+               "C grouped plan layout drifted");
+_Static_assert(sizeof(SparkServeGroupedNvfp4WeightView) == 32u,
+               "C grouped weight view layout drifted");
+_Static_assert(sizeof(SparkServeGroupedNvfp4Args) == 224u,
+               "C grouped arguments layout drifted");
 
 int main(void) {
   SparkServeDenseNvfp4Plan plan = {0};

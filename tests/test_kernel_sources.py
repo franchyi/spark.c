@@ -38,8 +38,17 @@ def test_first_nvfp4_candidate_is_framework_free_and_pinned() -> None:
     assert flashinfer["entrypoint"] == (
         "include/flashinfer/gemm/fp4_gemm_template_sm120.h"
     )
+    grouped = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "flashinfer-group-gemm-nvfp4"
+    )
+    assert grouped["status"] == (
+        "linked-framework-free-sm121-real-tensor-parity-passed"
+    )
+    assert grouped["revision"] == flashinfer["revision"]
     vendor = ROOT / "third_party" / "flashinfer-nvfp4"
     assert (vendor / "VENDOR.md").is_file()
     hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
-    assert len(hashes) == 4
+    assert len(hashes) == 7
     assert all(re.fullmatch(r"[0-9a-f]{64}  .+", line) for line in hashes)

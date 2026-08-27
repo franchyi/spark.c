@@ -24,6 +24,27 @@ SparkServeDenseNvfp4Plan ValidPlan() {
   };
 }
 
+SparkServeGroupedNvfp4Plan ValidGroupedPlan() {
+  return {
+      sizeof(SparkServeGroupedNvfp4Plan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      512,
+      16,
+      2048,
+      65'536,
+      640,
+      2560,
+      128,
+      128,
+      256,
+      0,
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4,
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_BACKEND_AUTO,
+  };
+}
+
 }  // namespace
 
 int main() {
@@ -63,6 +84,43 @@ int main() {
          SPARKSERVE_STATUS_UNAVAILABLE);
   args.alpha = 0.0f;
   assert(sparkserve_dense_nvfp4_launch(&caps, &args).code ==
+         SPARKSERVE_STATUS_INVALID_ARGUMENT);
+
+  auto grouped = ValidGroupedPlan();
+  assert(sparkserve_grouped_nvfp4_validate(&grouped).code ==
+         SPARKSERVE_STATUS_OK);
+  grouped.total_rows -= 1;
+  assert(sparkserve_grouped_nvfp4_validate(&grouped).code ==
+         SPARKSERVE_STATUS_INVALID_ARGUMENT);
+  grouped = ValidGroupedPlan();
+  SparkServeKernelInfo grouped_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_grouped_nvfp4_query(&caps, &grouped, &grouped_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(grouped_info.backend ==
+         SPARKSERVE_BACKEND_FLASHINFER_GROUP_MM_FP4);
+  assert(grouped_info.available == 0);
+
+  int32_t indptr[513] = {};
+  float alpha[512] = {};
+  SparkServeGroupedNvfp4Args grouped_args = {};
+  grouped_args.struct_size = sizeof(grouped_args);
+  grouped_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  grouped_args.plan = grouped;
+  grouped_args.input = {&packed, &scale, grouped.k / 2, grouped.k / 16};
+  grouped_args.weights = {&packed, &scale, grouped.n * grouped.k / 2,
+                          grouped.n * grouped.k / 16};
+  grouped_args.m_indptr = indptr;
+  grouped_args.alpha_device = alpha;
+  grouped_args.output = &output;
+  grouped_args.output_row_stride_bytes = grouped.n * 2;
+  assert(sparkserve_grouped_nvfp4_launch(&caps, &grouped_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  grouped_args.weights.packed_group_stride_bytes += 1;
+  assert(sparkserve_grouped_nvfp4_launch(&caps, &grouped_args).code ==
          SPARKSERVE_STATUS_INVALID_ARGUMENT);
 
   SparkServeGdnDecodePlan gdn = {

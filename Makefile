@@ -9,6 +9,8 @@ HEADER_C_TEST := $(BUILD_DIR)/kernel-header-c-test
 CUDA_GDN_TEST := $(BUILD_DIR)/gdn-decode-cuda-test
 CUDA_NVFP4_TEST := $(BUILD_DIR)/nvfp4-dense-cuda-test
 CUDA_NVFP4_FIXTURE_TEST := $(BUILD_DIR)/nvfp4-dense-fixture-test
+CUDA_GROUPED_NVFP4_TEST := $(BUILD_DIR)/nvfp4-grouped-cuda-test
+CUDA_GROUPED_NVFP4_FIXTURE_TEST := $(BUILD_DIR)/nvfp4-grouped-fixture-test
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_121a
 NVCCFLAGS ?= -O2 -std=c++20 -arch=$(CUDA_ARCH)
@@ -24,7 +26,7 @@ FLASHINFER_INCLUDES := -I$(FLASHINFER_INCLUDE) \
 	-I$(CUTLASS_ROOT)/include \
 	-I$(CUTLASS_ROOT)/tools/util/include
 
-.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -32,7 +34,7 @@ test-cpp: $(CONTRACT_TEST) $(HEADER_C_TEST)
 	$(CONTRACT_TEST)
 	$(HEADER_C_TEST)
 
-test-cuda: test-cuda-gdn test-cuda-nvfp4
+test-cuda: test-cuda-gdn test-cuda-nvfp4 test-cuda-grouped-nvfp4
 
 test-cuda-gdn: $(CUDA_GDN_TEST)
 	$(CUDA_GDN_TEST)
@@ -43,6 +45,13 @@ test-cuda-nvfp4: $(CUDA_NVFP4_TEST)
 test-cuda-nvfp4-fixture: $(CUDA_NVFP4_FIXTURE_TEST)
 	test -n "$(NVFP4_FIXTURE)"
 	$(CUDA_NVFP4_FIXTURE_TEST) "$(NVFP4_FIXTURE)"
+
+test-cuda-grouped-nvfp4: $(CUDA_GROUPED_NVFP4_TEST)
+	$(CUDA_GROUPED_NVFP4_TEST)
+
+test-cuda-grouped-nvfp4-fixture: $(CUDA_GROUPED_NVFP4_FIXTURE_TEST)
+	test -n "$(NVFP4_GROUPED_FIXTURE)"
+	$(CUDA_GROUPED_NVFP4_FIXTURE_TEST) "$(NVFP4_GROUPED_FIXTURE)"
 
 docker-flash-next-sm121:
 	docker build -t sparkserve/sglang:qwen38flashnext-sm121 -f docker/flashnext-sm121/Dockerfile .
@@ -75,5 +84,22 @@ $(CUDA_NVFP4_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashi
 		csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashinfer.cu \
 		csrc/tests/nvfp4_dense_fixture_test.cu -o $(CUDA_NVFP4_FIXTURE_TEST)
 
+$(CUDA_GROUPED_NVFP4_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/internal/nvfp4_grouped_backend.h csrc/tests/nvfp4_grouped_cuda_test.cu csrc/include/sparkserve/kernel_api.h
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_ARCH_FLAGS) -DCUTLASS_ENABLE_GDC_FOR_SM100=1 \
+		-DSPARKSERVE_WITH_FLASHINFER_GROUPED_NVFP4 -Icsrc/include -Icsrc \
+		$(FLASHINFER_INCLUDES) csrc/kernel_contract.cc \
+		csrc/cuda/nvfp4_grouped_flashinfer.cu \
+		csrc/tests/nvfp4_grouped_cuda_test.cu -o $(CUDA_GROUPED_NVFP4_TEST)
+
+$(CUDA_GROUPED_NVFP4_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/internal/nvfp4_grouped_backend.h csrc/tests/nvfp4_grouped_fixture_test.cu csrc/include/sparkserve/kernel_api.h
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_ARCH_FLAGS) -DCUTLASS_ENABLE_GDC_FOR_SM100=1 \
+		-DSPARKSERVE_WITH_FLASHINFER_GROUPED_NVFP4 -Icsrc/include -Icsrc \
+		$(FLASHINFER_INCLUDES) csrc/kernel_contract.cc \
+		csrc/cuda/nvfp4_grouped_flashinfer.cu \
+		csrc/tests/nvfp4_grouped_fixture_test.cu \
+		-o $(CUDA_GROUPED_NVFP4_FIXTURE_TEST)
+
 clean:
-	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST)
+	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST)

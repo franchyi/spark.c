@@ -122,7 +122,7 @@ retaining a switch back to the legacy dispatch.
 | SparkServe operation | Semantic oracle | Initial implementation candidate | Reuse mode | Required gate |
 | --- | --- | --- | --- | --- |
 | Qwen3.8 27B dense NVFP4 linear | live SGLang ModelOpt path | FlashInfer `mm_fp4` or direct CUTLASS 79a instantiation | wrap first; specialize later | packed bytes/scales exact, real-tensor output parity, greedy-token parity |
-| Flash-Next routed NVFP4 MoE | SGLang Qwen4-exp + ModelOpt | FlashInfer CUTLASS fused MoE / CUTLASS grouped GEMM | wrap with a frozen raw C contract | exact expert ids/order/weights, two GEMMs and activation checked separately, then fused parity |
+| Flash-Next routed NVFP4 MoE | SGLang Qwen4-exp + ModelOpt | linked FlashInfer SM120 grouped NVFP4 GEMM; borrow activation/quantization next | first GEMM linked behind frozen raw C contract | two real experts bit-exact for GEMM1; next exact expert ids/order/weights, activation, GEMM2, and scatter parity |
 | GDN projection and recurrence | SGLang Qwen4-exp + FlashInfer GDN | local raw CUDA K=V=128 BF16-state decode; later fuse QKV extraction | correctness kernel implemented; optimize behind the same ABI | CPU-reference parity now; real SGLang tensor/state and multi-step parity next |
 | QSA indexer and sparse attention | SGLang QSA backend | SGLang JIT CUDA indexer plus proven SM121 sparse-decode kernel | vendor small CUDA pieces; wrap external attention kernel | exact selected indices/masks/cache writes; dense-attention comparison on small cases |
 | Hyperconnection mix/combine | SGLang Qwen4-exp | small SGLang CUDA/Triton kernels | port or vendor after license audit | per-stream output and residual-state parity |
@@ -197,19 +197,17 @@ kernels—without importing either framework's scheduler, allocator, or graph.
 
 ## Immediate implementation order
 
-1. Freeze a small corpus of inputs, packed weights/scales, intermediate outputs,
-   logits, and greedy continuations from the live 27B SGLang service.
-2. Define the dense NVFP4 raw C ABI to match FlashInfer `mm_fp4`, including the
-   block-interleaved scale layout and alpha convention.
-3. Wrap the existing kernel unchanged and prove parity before replacing its
-   Python/Torch launch layer.
-4. Complete Flash-Next MoE and PLE parity; keep routing/top-k as a separately
+1. Extend the existing real-tensor dense/grouped NVFP4 fixtures to a complete
+   MoE layer, logits, and greedy continuations from the live SGLang service.
+2. Borrow the fused SiLU/multiply/FP4 quantizer, then run the linked grouped
+   donor for the down projection without importing a framework dispatcher.
+3. Complete Flash-Next MoE and PLE parity; keep routing/top-k as a separately
    tested stage.
-5. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
-6. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
-7. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed
+4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
+5. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
+6. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed
    expert ids, while preserving its upstream pin and parity-test structure.
-8. Add the explicit NVMe expert cache and measure bytes/token before setting a
+7. Add the explicit NVMe expert cache and measure bytes/token before setting a
    GLM decode-speed target. Add Q3_K only after the IQ3 path is stable.
 
 Do not begin with fusion. First reproduce the unfused SGLang graph and its

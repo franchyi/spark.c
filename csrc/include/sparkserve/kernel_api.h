@@ -38,6 +38,9 @@ typedef enum SparkServeKernelBackend {
   SPARKSERVE_BACKEND_AUTO = 0,
   SPARKSERVE_BACKEND_FLASHINFER_MM_FP4 = 1,
   SPARKSERVE_BACKEND_CUTLASS_SM121 = 2,
+  // FlashInfer's grouped SM120/121 NVFP4 GEMM. SparkServe owns routing and
+  // token permutation; the donor kernel owns only the tensor-core matmul.
+  SPARKSERVE_BACKEND_FLASHINFER_GROUP_MM_FP4 = 3,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -116,6 +119,58 @@ typedef struct SparkServeDenseNvfp4Args {
   const float* alpha_device;
 } SparkServeDenseNvfp4Args;
 
+// Grouped expert projection over already-routed rows. The scheduler supplies
+// `num_groups + 1` device INT32 offsets. Every group length is padded to a
+// multiple of four, as required by the pinned FlashInfer kernel.
+typedef struct SparkServeGroupedNvfp4Plan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_groups;
+  uint32_t group_size;
+  uint64_t total_rows;
+  uint64_t input_scale_rows;
+  uint64_t n;
+  uint64_t k;
+  uint32_t tile_m;
+  uint32_t tile_n;
+  uint32_t tile_k;
+  uint32_t swap_ab;
+  uint32_t input_scale_layout;
+  uint32_t weight_scale_layout;
+  uint32_t output_dtype;
+  uint32_t requested_backend;
+} SparkServeGroupedNvfp4Plan;
+
+typedef struct SparkServeGroupedNvfp4WeightView {
+  // Packed E2M1: [num_groups,N,K/2].
+  const void* packed_data;
+  // FP8-E4M3, CUTLASS 128x4: [num_groups,N,K/16].
+  const void* block_scales;
+  uint64_t packed_group_stride_bytes;
+  uint64_t scale_group_stride_bytes;
+} SparkServeGroupedNvfp4WeightView;
+
+typedef struct SparkServeGroupedNvfp4Args {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeGroupedNvfp4Plan plan;
+  // Packed routed activations [total_rows,K/2]. Scale rows include the
+  // per-expert 128-row physical padding described by input_scale_rows.
+  SparkServeNvfp4MatrixView input;
+  SparkServeGroupedNvfp4WeightView weights;
+  // Device INT32 [num_groups+1], starting at zero and ending at total_rows.
+  const int32_t* m_indptr;
+  // Device FP32 [num_groups].
+  const float* alpha_device;
+  void* output;
+  uint64_t output_row_stride_bytes;
+  void* int_workspace;
+  uint64_t int_workspace_bytes;
+  void* float_workspace;
+  uint64_t float_workspace_bytes;
+  void* cuda_stream;
+} SparkServeGroupedNvfp4Args;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -183,6 +238,18 @@ SparkServeStatus sparkserve_dense_nvfp4_query(
 SparkServeStatus sparkserve_dense_nvfp4_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeDenseNvfp4Args* args);
+
+SparkServeStatus sparkserve_grouped_nvfp4_validate(
+    const SparkServeGroupedNvfp4Plan* plan);
+
+SparkServeStatus sparkserve_grouped_nvfp4_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGroupedNvfp4Plan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_grouped_nvfp4_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGroupedNvfp4Args* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);

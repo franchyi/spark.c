@@ -12,7 +12,7 @@ contracts, and promotion gates are recorded in
 | Operation | Primary source | Plan | Main risk |
 | --- | --- | --- | --- |
 | NVFP4 dense GEMM | NVIDIA CUTLASS example 79a | Instantiate C++ templates for Qwen shapes; compile `sm_121a` | checkpoint alignment and small-M tile choice |
-| NVFP4 grouped MoE | CUTLASS example 79d; FlashInfer CUTLASS backend | Start from CUTLASS grouped GEMM and borrow routing/packing contracts from FlashInfer | SM121 autotune regressions and inefficient M=1 tiles |
+| NVFP4 grouped MoE | pinned FlashInfer CUTLASS backend | Grouped GEMM is linked and real-tensor bit-exact; next borrow fused activation/quantization while Rust retains routing | SM121 tactic tuning and padded small-M overhead |
 | PLE row gather | SGLang Qwen4 gather; SGLang PR 36567 storage design | Rust reads original safetensors; use a tiny CUDA gather × scalar-scale × BF16-accumulate kernel | cold-page tail latency during long prefill |
 | QSA decode | SGLang Qwen4 backend plus FlashInfer TRT-LLM sparse decode | Extract and pin the working SM120/121 path | architecture gates and FP8-KV edge cases |
 | GDN recurrent update | SGLang Qwen4 + pinned FlashInfer recurrence | Raw CUDA BF16 K-last decode is implemented for Qwen K=V=128; next fuse projection and add prefill | real-tensor parity, state-slot addressing, and reduction-order drift |

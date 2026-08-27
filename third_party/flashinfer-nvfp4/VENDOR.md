@@ -12,8 +12,9 @@ nor a JIT compiler is present in the serving process.
   `b46b16d003484063bca4ed365e44095c4c6ed633`, BSD-3-Clause.
 - Download transport defaults to `https://ghfast.top/`; canonical repository
   identities remain the two upstream GitHub repositories.
-- `source-files.sha256` locks the two directly included FlashInfer templates and
-  both license files. Git commits lock their transitive headers.
+- `source-files.sha256` locks the directly included dense/grouped templates,
+  the upstream grouped generator, its JIT type mapping, and both license files.
+  Git commits lock their transitive headers.
 
 Run `scripts/fetch-kernel-sources.sh` to materialize the ignored source tree at
 `third_party/_deps/flashinfer` and verify it before compilation.
@@ -36,6 +37,14 @@ workspace ownership, error translation, tactic selection, and CUDA stream.
 Additional tactics must be separately instantiated, measured on GB10, and
 added to the scheduler table; no framework dispatcher is linked.
 
+`csrc/cuda/nvfp4_grouped_flashinfer.cu` likewise invokes the upstream
+`INSTANTIATE_GROUP_GEMM_NVFP4_GROUPWISE_SM120` macro for BF16 output with CTA
+`128 x 128 x 256`, `swap_ab=false`, and per-group FP32 alpha. FlashInfer owns
+the grouped CUTLASS collective and its argument-preparation kernel. SparkServe
+owns routed-row permutation, expert `m_indptr`, scale-row offsets, workspace
+reuse, hot-expert placement, and paging. The serving process still links no
+Torch, TVM-FFI, Python, or SGLang code.
+
 ## Current gate
 
 CUDA 13.0.3 compiles the adapter for `sm_121a`. The zero GPU smoke test queries
@@ -51,3 +60,10 @@ weights. `scripts/capture-nvfp4-fixture.py` regenerates it from the locked local
 checkpoint, and `make test-cuda-nvfp4-fixture NVFP4_FIXTURE=...` reruns parity.
 Prefill shapes and additional tactics still require separate fixtures and GB10
 measurements.
+
+The grouped gate additionally uses experts 0 and 1 from layer 0, four routed
+rows per expert, and the locked checkpoint's independent input/weight global
+scales. `scripts/capture-grouped-nvfp4-fixture.py` records the upstream grouped
+result; `make test-cuda-grouped-nvfp4-fixture NVFP4_GROUPED_FIXTURE=...`
+rebuilds the framework-free adapter. All 5,120 BF16 values match bit-for-bit on
+GB10. Private payloads remain ignored because they contain model weights.
