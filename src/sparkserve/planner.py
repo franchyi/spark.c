@@ -32,11 +32,13 @@ class MemoryPlan:
         return asdict(self)
 
 
-# Exact values returned by the hf-mirror model API on 2026-08-27. Flash-Next's
-# PLE table is 20M x 2,560 FP8 values plus safetensors headers. Keeping it in
-# FP8 avoids the 2x BF16 expansion.
+# The payload total comes from the hf-mirror model API on 2026-08-27. Tensor
+# class sizes come from the standalone Rust safetensors-header scan: text-only
+# base weights exclude 4.856 GiB of deferred MTP and 0.836 GiB of ignored vision
+# tensors. Keeping PLE in FP8 avoids the 2x BF16 expansion.
 _FLASH_CHECKPOINT_GIB = 135_253_622_894 / GIB
-_FLASH_PLE_FP8_GIB = 51_201_395_381 / GIB
+_FLASH_RESIDENT_BASE_GIB = 77_843_712_026 / GIB
+_FLASH_PLE_FP8_GIB = 51_200_245_760 / GIB
 
 PROFILES = {
     "qwen38-27b-nvfp4": ModelProfile(
@@ -49,7 +51,7 @@ PROFILES = {
     "qwen38-flash-next-nvfp4": ModelProfile(
         key="qwen38-flash-next-nvfp4",
         checkpoint_gib=_FLASH_CHECKPOINT_GIB,
-        resident_weights_gib=_FLASH_CHECKPOINT_GIB - _FLASH_PLE_FP8_GIB,
+        resident_weights_gib=_FLASH_RESIDENT_BASE_GIB,
         sparse_store_gib=_FLASH_PLE_FP8_GIB,
         architecture="Qwen3.8 Flash-Next: 36 GDN + 12 QSA + 512-expert MoE + sparse PLE",
         quantization="NVFP4 routed experts; FP8 PLE; BF16 attention/shared paths",

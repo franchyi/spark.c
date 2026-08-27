@@ -1,3 +1,4 @@
+use sparkserve_runtime::checkpoint::{CheckpointPlan, load_flash_next_plan};
 use sparkserve_runtime::kernel::{DenseNvfp4Spec, DeviceCaps, select_dense_nvfp4_candidate};
 use sparkserve_runtime::model::{plan_memory, profile};
 use sparkserve_runtime::storage::{ClockPageCache, FilePageSource, PleIndex};
@@ -7,6 +8,7 @@ use std::time::Instant;
 fn usage() -> ! {
     eprintln!("usage:");
     eprintln!("  sparkserve-runtime plan <model> [system-gib]");
+    eprintln!("  sparkserve-runtime checkpoint-plan <model-root>");
     eprintln!("  sparkserve-runtime kernel-plan nvfp4-dense <M> <N> <K> [SM]");
     eprintln!("  sparkserve-runtime ple-inspect <index>");
     eprintln!(
@@ -19,11 +21,52 @@ fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("plan") => run_memory_plan(args),
+        Some("checkpoint-plan") => run_checkpoint_plan(args),
         Some("kernel-plan") => run_kernel_plan(args),
         Some("ple-inspect") => run_ple_inspect(args),
         Some("ple-bench") => run_ple_bench(args),
         _ => usage(),
     }
+}
+
+fn run_checkpoint_plan(mut args: impl Iterator<Item = String>) {
+    let model_root = args.next().unwrap_or_else(|| usage());
+    if args.next().is_some() {
+        usage();
+    }
+    let plan = load_flash_next_plan(Path::new(&model_root)).unwrap_or_else(|error| {
+        eprintln!("cannot build standalone checkpoint plan: {error}");
+        std::process::exit(1);
+    });
+    print_checkpoint_plan(&plan);
+}
+
+fn print_checkpoint_plan(plan: &CheckpointPlan) {
+    let config = &plan.config;
+    let total = plan.total();
+    println!("standalone Qwen3.8 Flash-Next NVFP4 checkpoint");
+    println!("  layers             {:12}", config.layers);
+    println!("  hidden size        {:12}", config.hidden_size);
+    println!(
+        "  experts / active   {:8} / {}",
+        config.experts, config.experts_per_token
+    );
+    println!("  checkpoint files   {:12}", plan.files);
+    print_tensor_class("resident", plan.resident);
+    print_tensor_class("PLE on NVMe", plan.ple_nvme);
+    print_tensor_class("MTP deferred", plan.mtp_deferred);
+    print_tensor_class("vision ignored", plan.vision_ignored);
+    print_tensor_class("indexed total", total);
+    println!("  production stack   Rust + C++/CUDA (no SGLang/Python/Torch)");
+}
+
+fn print_tensor_class(label: &str, stats: sparkserve_runtime::checkpoint::TensorStats) {
+    println!(
+        "  {label:<18} {:8} tensors {:12} bytes ({:9.3} GiB)",
+        stats.tensors,
+        stats.bytes,
+        stats.bytes as f64 / 1_073_741_824.0
+    );
 }
 
 fn run_ple_inspect(mut args: impl Iterator<Item = String>) {

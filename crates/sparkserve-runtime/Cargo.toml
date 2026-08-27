@@ -10,3 +10,4 @@ name = "sparkserve-runtime"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

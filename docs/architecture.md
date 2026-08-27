@@ -131,7 +131,9 @@ configured safety reserve.
 
 - Freeze golden prompts, token streams, logits, memory, TTFT, prefill, and decode
   measurements from SGLang and llama.cpp/DS4.
-- Parse safetensors/GGUF metadata without loading tensors.
+- The standalone Rust bootstrap validates the exact Flash-Next/ModelOpt-NVFP4
+  contract and classifies all 296,475 safetensors entries from headers without
+  loading tensor payloads. GGUF metadata remains pending.
 - Make the memory planner match observed peak allocation within 5%.
 
 ### M1 — resident Qwen3.8 27B NVFP4
@@ -152,8 +154,9 @@ configured safety reserve.
   implemented; Python and Rust agree on real-checkpoint row checksums.
 - Replace parallel positional reads with registered `io_uring` buffers and a
   fixed pinned slab, then connect the existing FP8-to-BF16 gather kernel.
-- Keep the approximately 78.3 GiB main checkpoint resident and cap PLE cache at
-  2-4 GiB. Never construct the full BF16 PLE tensor.
+- Keep the 72.498 GiB base checkpoint resident, add the 4.856 GiB MTP weights only
+  when speculation is enabled, and cap PLE cache at 2-4 GiB. Never construct the
+  full BF16 PLE tensor; the 0.836 GiB vision tower is excluded in text mode.
 - Gate: peak committed memory below 105 GiB, deterministic cold-cache behavior,
   and PLE stalls hidden for at least 95% of decode steps.
 

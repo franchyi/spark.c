@@ -4,7 +4,7 @@ from sparkserve.planner import PROFILES, plan_memory
 def test_flash_next_sparse_plan_fits_single_spark() -> None:
     plan = plan_memory(PROFILES["qwen38-flash-next-nvfp4"])
     assert plan.fits
-    assert 77 < plan.resident_weights_gib < 79
+    assert 72 < plan.resident_weights_gib < 73
     assert plan.required_gib < 110
 
 

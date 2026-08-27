@@ -22,8 +22,8 @@ pub const QWEN38_27B_NVFP4: ModelProfile = ModelProfile {
 
 pub const QWEN38_FLASH_NEXT_NVFP4: ModelProfile = ModelProfile {
     key: "qwen38-flash-next-nvfp4",
-    resident_weight_bytes: 84_052_227_513,
-    sparse_store_bytes: 51_201_395_381,
+    resident_weight_bytes: 77_843_712_026,
+    sparse_store_bytes: 51_200_245_760,
 };
 
 pub fn profile(key: &str) -> Option<ModelProfile> {
@@ -77,7 +77,7 @@ mod tests {
         let plan =
             plan_memory(QWEN38_FLASH_NEXT_NVFP4, 121.0, 2.0, 8.0, 12.0, 8.0).expect("valid plan");
         assert!(plan.fits);
-        assert!(plan.required_gib > 108.0 && plan.required_gib < 109.0);
+        assert!(plan.required_gib > 102.0 && plan.required_gib < 103.0);
     }
 
     #[test]

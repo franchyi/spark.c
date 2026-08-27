@@ -36,7 +36,9 @@ Flash-Next stores a 20-million-row, 2,560-wide PLE table in FP8. That table is
 about 47.7 GiB in the checkpoint and about 95.4 GiB if fully expanded to BF16,
 yet inference touches only 16 rows per token. SparkServe keeps the table compressed
 on NVMe, fetches only requested rows, and dequantizes into a small staging cache.
-The remaining checkpoint is roughly 78 GiB and can stay resident.
+The text-only base is 72.498 GiB and can stay resident; 4.856 GiB of MTP weights
+is admitted only when speculation is enabled, and the 0.836 GiB vision tower is
+excluded from text mode.
 
 This differs from CPU offload: on DGX Spark the CPU and GPU share the same 128 GB,
 so moving a tensor to "CPU memory" does not create capacity.
@@ -73,11 +75,13 @@ duplicates nor expands the weights. The Python reader is an offline correctness
 and storage benchmark. The shipping path consumes the same binary index from
 Rust and will replace `pread` workers with registered `io_uring` buffers.
 
-The same gate exists in the dependency-free Rust runtime:
+The same gate exists in the minimal standalone Rust runtime:
 
 ```bash
 cargo test --workspace
 cargo run -p sparkserve-runtime -- plan qwen38-flash-next-nvfp4
+cargo run -p sparkserve-runtime -- checkpoint-plan \
+  /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4
 cargo run -p sparkserve-runtime -- kernel-plan nvfp4-dense 1 4096 4096 121
 make test-cpp
 ```
@@ -113,6 +117,15 @@ reader. On the target Spark, the Rust reference reached 3,525 storage-only
 prefill tokens/s and about 0.52 ms per all-miss decode lookup. See
 [docs/ple-nvme.md](docs/ple-nvme.md) for the format, measurements, and the pinned
 slab/`io_uring` kernel boundary.
+
+The standalone Rust checkpoint bootstrap now validates the exact Qwen4 topology,
+ModelOpt NVFP4 group contract, shard paths, safetensors bounds, and PLE FP8
+shapes without reading weight payloads. Against the real model it classified
+296,475 tensors into 72.498 GiB resident base weights, 47.684 GiB NVMe PLE,
+4.856 GiB deferred MTP, and 0.836 GiB ignored vision weights. Its only parsing
+dependency is `serde_json`; SGLang, Python, Torch, Triton, and TileLang remain
+oracle-only dependencies. The current stripped AArch64 musl release binary is
+580 KiB before CUDA kernels are linked.
 
 ## Run the Flash-Next oracle on one Spark
 
