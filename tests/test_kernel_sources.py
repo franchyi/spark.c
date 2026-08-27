@@ -57,5 +57,9 @@ def test_first_nvfp4_candidate_is_framework_free_and_pinned() -> None:
     vendor = ROOT / "third_party" / "flashinfer-nvfp4"
     assert (vendor / "VENDOR.md").is_file()
     hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
-    assert len(hashes) == 11
+    assert len(hashes) == 12
     assert all(re.fullmatch(r"[0-9a-f]{64}  .+", line) for line in hashes)
+    assert (
+        "6703dc88cca6e85c40a317daa66c29ceeebde6a61654016df3e44b51bc37b474  "
+        "csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh"
+    ) in hashes

@@ -13,6 +13,7 @@ CUDA_GROUPED_NVFP4_TEST := $(BUILD_DIR)/nvfp4-grouped-cuda-test
 CUDA_GROUPED_NVFP4_FIXTURE_TEST := $(BUILD_DIR)/nvfp4-grouped-fixture-test
 CUDA_SILU_NVFP4_TEST := $(BUILD_DIR)/nvfp4-silu-cute-test
 CUDA_QWEN_MOE_FIXTURE_TEST := $(BUILD_DIR)/qwen-moe-fixture-test
+CUDA_MOE_ROUTE_TEST := $(BUILD_DIR)/moe-route-cuda-test
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_121a
 NVCCFLAGS ?= -O2 -std=c++20 -arch=$(CUDA_ARCH)
@@ -28,10 +29,11 @@ FLASHINFER_INCLUDES := -I$(FLASHINFER_INCLUDE) \
 	-I$(CUTLASS_ROOT)/include \
 	-I$(CUTLASS_ROOT)/tools/util/include
 CUTE_NVFP4_OBJECT ?=
+CUTE_NVFP4_QUANTIZE_OBJECT ?=
 TVM_FFI_ROOT ?=
 CUTE_DSL_ROOT ?=
 
-.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -39,7 +41,7 @@ test-cpp: $(CONTRACT_TEST) $(HEADER_C_TEST)
 	$(CONTRACT_TEST)
 	$(HEADER_C_TEST)
 
-test-cuda: test-cuda-gdn test-cuda-nvfp4 test-cuda-grouped-nvfp4
+test-cuda: test-cuda-gdn test-cuda-nvfp4 test-cuda-grouped-nvfp4 test-cuda-moe-route
 
 test-cuda-gdn: $(CUDA_GDN_TEST)
 	$(CUDA_GDN_TEST)
@@ -64,6 +66,9 @@ test-cuda-silu-nvfp4: $(CUDA_SILU_NVFP4_TEST)
 test-cuda-silu-nvfp4-fixture: $(CUDA_SILU_NVFP4_TEST)
 	test -n "$(NVFP4_SILU_FIXTURE)"
 	LD_LIBRARY_PATH=$(TVM_FFI_ROOT)/lib:$$LD_LIBRARY_PATH $(CUDA_SILU_NVFP4_TEST) "$(NVFP4_SILU_FIXTURE)"
+
+test-cuda-moe-route: $(CUDA_MOE_ROUTE_TEST)
+	$(CUDA_MOE_ROUTE_TEST)
 
 test-cuda-qwen-moe-fixture: $(CUDA_QWEN_MOE_FIXTURE_TEST)
 	test -n "$(QWEN_MOE_FIXTURE)"
@@ -132,22 +137,34 @@ $(CUDA_SILU_NVFP4_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_silu_cute.cc cs
 		-Xcompiler=-pthread \
 		-o $(CUDA_SILU_NVFP4_TEST)
 
-$(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/internal/nvfp4_grouped_backend.h csrc/internal/nvfp4_silu_backend.h csrc/tests/qwen_moe_fixture_test.cc csrc/include/sparkserve/kernel_api.h
+$(CUDA_MOE_ROUTE_TEST): csrc/kernel_contract.cc csrc/cuda/moe_route_flashinfer.cu csrc/internal/moe_route_backend.h csrc/tests/moe_route_cuda_test.cu csrc/include/sparkserve/kernel_api.h
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -DSPARKSERVE_WITH_FLASHINFER_MOE_ROUTE \
+		-Icsrc/include -Icsrc csrc/kernel_contract.cc \
+		csrc/cuda/moe_route_flashinfer.cu csrc/tests/moe_route_cuda_test.cu \
+		-o $(CUDA_MOE_ROUTE_TEST)
+
+$(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/internal/nvfp4_grouped_backend.h csrc/internal/nvfp4_silu_backend.h csrc/internal/nvfp4_quantize_backend.h csrc/internal/moe_route_backend.h csrc/tests/qwen_moe_fixture_test.cc csrc/include/sparkserve/kernel_api.h
 	test -n "$(CUTE_NVFP4_OBJECT)"
+	test -n "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
 	test -n "$(TVM_FFI_ROOT)"
 	test -n "$(CUTE_DSL_ROOT)"
 	test -f "$(CUTE_NVFP4_OBJECT)"
+	test -f "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
 	mkdir -p $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_ARCH_FLAGS) -diag-suppress 177 \
 		-diag-suppress 549 -DSPARKSERVE_WITH_FLASHINFER_GROUPED_NVFP4 \
 		-DSPARKSERVE_WITH_FLASHINFER_CUTE_SILU_NVFP4 \
+		-DSPARKSERVE_WITH_FLASHINFER_CUTE_NVFP4_QUANTIZE \
+		-DSPARKSERVE_WITH_FLASHINFER_MOE_ROUTE \
 		-Icsrc/include -Icsrc $(FLASHINFER_INCLUDES) -I$(TVM_FFI_ROOT)/include \
 		csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu \
-		csrc/cuda/nvfp4_silu_cute.cc csrc/tests/qwen_moe_fixture_test.cc \
-		"$(CUTE_NVFP4_OBJECT)" \
+		csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc \
+		csrc/cuda/moe_route_flashinfer.cu csrc/tests/qwen_moe_fixture_test.cc \
+		"$(CUTE_NVFP4_OBJECT)" "$(CUTE_NVFP4_QUANTIZE_OBJECT)" \
 		$(CUTE_DSL_ROOT)/lib/libcuda_dialect_runtime_static.a \
 		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lcuda -lcudart -ldl \
 		-Xcompiler=-pthread -o $(CUDA_QWEN_MOE_FIXTURE_TEST)
 
 clean:
-	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)
+	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_MOE_ROUTE_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)

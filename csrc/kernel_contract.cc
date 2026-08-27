@@ -14,6 +14,12 @@
 #ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_SILU_NVFP4
 #include "internal/nvfp4_silu_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_NVFP4_QUANTIZE
+#include "internal/nvfp4_quantize_backend.h"
+#endif
+#ifdef SPARKSERVE_WITH_FLASHINFER_MOE_ROUTE
+#include "internal/moe_route_backend.h"
+#endif
 
 namespace {
 
@@ -185,6 +191,10 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("grouped FlashInfer backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4:
       return Invalid("fused SiLU backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_FLASHINFER_CUTE_NVFP4_QUANTIZE:
+      return Invalid("activation quantizer cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_FLASHINFER_MOE_ROUTE:
+      return Invalid("MoE routing backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -608,6 +618,233 @@ extern "C" SparkServeStatus sparkserve_segmented_silu_nvfp4_launch(
   return sparkserve_flashinfer_cute_segmented_silu_nvfp4_launch(args);
 #else
   return Unavailable("FlashInfer CuTe fused SiLU NVFP4 artifact is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_segmented_nvfp4_quantize_validate(
+    const SparkServeSegmentedNvfp4QuantizePlan* plan) {
+  if (plan == nullptr) return Invalid("segmented NVFP4 quantize plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_experts == 0 || plan->num_experts > 512) {
+    return Invalid("segmented NVFP4 quantize requires 1 to 512 experts");
+  }
+  if (plan->total_rows == 0 || plan->total_rows % 4 != 0 ||
+      plan->input_scale_rows < plan->total_rows ||
+      plan->input_scale_rows % 128 != 0 ||
+      plan->total_rows >
+          static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+    return Invalid("segmented NVFP4 quantize row layout is invalid");
+  }
+  if (plan->hidden_size == 0 || plan->hidden_size % 128 != 0) {
+    return Invalid("segmented NVFP4 quantize hidden size must align to 128");
+  }
+  if (plan->group_size != kNvfp4GroupSize) {
+    return Unsupported("segmented NVFP4 quantize group size must be 16");
+  }
+  if (plan->input_dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("segmented NVFP4 quantize donor accepts BF16 input");
+  }
+  if (plan->output_scale_layout !=
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4) {
+    return Unsupported("segmented NVFP4 quantize requires CUTLASS 128x4 scales");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend !=
+          SPARKSERVE_BACKEND_FLASHINFER_CUTE_NVFP4_QUANTIZE) {
+    return Invalid("unknown segmented NVFP4 quantize backend");
+  }
+  const uint64_t scale_columns = plan->hidden_size / kNvfp4GroupSize;
+  if (!CanMultiply(plan->total_rows, plan->hidden_size) ||
+      !CanMultiply(plan->total_rows * plan->hidden_size, 2) ||
+      !CanMultiply(plan->total_rows, plan->hidden_size / 2) ||
+      !CanMultiply(plan->input_scale_rows, scale_columns)) {
+    return Invalid("segmented NVFP4 quantize buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_segmented_nvfp4_quantize_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSegmentedNvfp4QuantizePlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  SparkServeStatus plan_status =
+      sparkserve_segmented_nvfp4_quantize_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_FLASHINFER_CUTE_NVFP4_QUANTIZE;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "flashinfer-cute-segmented-bf16-nvfp4";
+  info->source_revision =
+      "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+#ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_NVFP4_QUANTIZE
+  info->available = plan->hidden_size == 2560 ? 1 : 0;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_segmented_nvfp4_quantize_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSegmentedNvfp4QuantizeArgs* args) {
+  SparkServeStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (args == nullptr) return Invalid("segmented NVFP4 quantize arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeStatus plan_status =
+      sparkserve_segmented_nvfp4_quantize_validate(&args->plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (args->input == nullptr || args->input_global_scales == nullptr ||
+      args->active_rows_host == nullptr || args->m_indptr_host == nullptr ||
+      args->scale_row_offsets_host == nullptr ||
+      args->packed_output == nullptr || args->output_scales == nullptr) {
+    return Invalid("segmented NVFP4 quantize launch pointers cannot be null");
+  }
+  if (args->input_row_stride_bytes != args->plan.hidden_size * 2 ||
+      args->output_row_stride_bytes != args->plan.hidden_size / 2 ||
+      args->scale_row_stride_bytes != args->plan.hidden_size / 16) {
+    return Invalid("segmented NVFP4 quantize requires compact row strides");
+  }
+  if (args->m_indptr_host[0] != 0) {
+    return Invalid("segmented NVFP4 quantize m_indptr must begin at zero");
+  }
+  for (uint32_t expert = 0; expert < args->plan.num_experts; ++expert) {
+    const int32_t begin = args->m_indptr_host[expert];
+    const int32_t end = args->m_indptr_host[expert + 1];
+    const int32_t active = args->active_rows_host[expert];
+    if (begin < 0 || end < begin || (end - begin) % 4 != 0 || active < 0 ||
+        active > end - begin) {
+      return Invalid("segmented NVFP4 quantize expert row metadata is invalid");
+    }
+    const uint64_t scale_offset = args->scale_row_offsets_host[expert];
+    const uint64_t active_scale_rows =
+        active == 0 ? 128 : (static_cast<uint64_t>(active) + 127) / 128 * 128;
+    if (scale_offset % 128 != 0 ||
+        scale_offset > args->plan.input_scale_rows ||
+        active_scale_rows > args->plan.input_scale_rows - scale_offset) {
+      return Invalid("segmented NVFP4 quantize scale-row metadata is invalid");
+    }
+  }
+  if (static_cast<uint64_t>(args->m_indptr_host[args->plan.num_experts]) !=
+      args->plan.total_rows) {
+    return Invalid("segmented NVFP4 quantize m_indptr does not cover total rows");
+  }
+#ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_NVFP4_QUANTIZE
+  return sparkserve_flashinfer_cute_segmented_nvfp4_quantize_launch(args);
+#else
+  return Unavailable("FlashInfer CuTe K=2560 quantizer artifact is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_moe_route_validate(
+    const SparkServeMoeRoutePlan* plan) {
+  if (plan == nullptr) return Invalid("MoE route plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_tokens == 0 || plan->top_k == 0 || plan->num_experts == 0 ||
+      plan->num_experts > 512 || plan->top_k > plan->num_experts ||
+      plan->top_k > 32) {
+    return Invalid("MoE route shape is invalid");
+  }
+  if (plan->hidden_size == 0 || plan->hidden_size % 8 != 0 ||
+      plan->total_rows == 0 || plan->total_rows % 4 != 0) {
+    return Invalid("MoE route row layout is invalid");
+  }
+  if (!CanMultiply(plan->num_tokens, plan->top_k)) {
+    return Invalid("MoE route count overflow");
+  }
+  const uint64_t routes =
+      static_cast<uint64_t>(plan->num_tokens) * plan->top_k;
+  if (plan->total_rows < routes ||
+      plan->total_rows > std::numeric_limits<uint32_t>::max() ||
+      !CanMultiply(plan->total_rows, plan->hidden_size) ||
+      !CanMultiply(plan->total_rows * plan->hidden_size, 2) ||
+      !CanMultiply(plan->num_tokens, plan->hidden_size)) {
+    return Invalid("MoE route buffers overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_moe_route_query(
+    const SparkServeDeviceCaps* caps, const SparkServeMoeRoutePlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  SparkServeStatus plan_status = sparkserve_moe_route_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_FLASHINFER_MOE_ROUTE;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "flashinfer-moe-row-dispatch-finalize";
+  info->source_revision =
+      "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+#ifdef SPARKSERVE_WITH_FLASHINFER_MOE_ROUTE
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_moe_route_dispatch(
+    const SparkServeDeviceCaps* caps, const SparkServeMoeRouteArgs* args) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (args == nullptr) return Invalid("MoE route arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeStatus plan_status = sparkserve_moe_route_validate(&args->plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (args->token_input == nullptr || args->route_to_packed_row == nullptr ||
+      args->packed_input == nullptr) {
+    return Invalid("MoE dispatch pointers cannot be null");
+  }
+  const uint64_t row_bytes = args->plan.hidden_size * 2;
+  if (args->token_input_row_stride_bytes != row_bytes ||
+      args->packed_row_stride_bytes != row_bytes) {
+    return Invalid("MoE dispatch requires compact BF16 rows");
+  }
+#ifdef SPARKSERVE_WITH_FLASHINFER_MOE_ROUTE
+  return sparkserve_flashinfer_moe_route_dispatch(args);
+#else
+  return Unavailable("FlashInfer-derived MoE dispatch kernel is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_moe_route_finalize(
+    const SparkServeDeviceCaps* caps, const SparkServeMoeRouteArgs* args) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (args == nullptr) return Invalid("MoE route arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeStatus plan_status = sparkserve_moe_route_validate(&args->plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (args->route_to_packed_row == nullptr || args->route_weights == nullptr ||
+      args->packed_expert_output == nullptr || args->token_output == nullptr) {
+    return Invalid("MoE finalize pointers cannot be null");
+  }
+  const uint64_t row_bytes = args->plan.hidden_size * 2;
+  if (args->expert_output_row_stride_bytes != row_bytes) {
+    return Invalid("MoE finalize requires compact BF16 expert rows");
+  }
+#ifdef SPARKSERVE_WITH_FLASHINFER_MOE_ROUTE
+  return sparkserve_flashinfer_moe_route_finalize(args);
+#else
+  return Unavailable("FlashInfer-derived MoE finalize kernel is not linked");
 #endif
 }
 

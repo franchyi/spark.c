@@ -115,11 +115,90 @@ impl RoutePlan {
             .checked_mul(packed_row_bytes)
             .ok_or(RouteError::IntegerOverflow)
     }
+
+    pub fn kernel_spec(&self, hidden_size: u64) -> Result<MoeRouteSpec, RouteError> {
+        let spec = MoeRouteSpec {
+            num_tokens: self.num_tokens,
+            top_k: self.top_k,
+            num_experts: self.num_experts,
+            hidden_size,
+            total_rows: self.grouped.total_rows,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoeRouteSpec {
+    pub num_tokens: u32,
+    pub top_k: u32,
+    pub num_experts: u32,
+    pub hidden_size: u64,
+    pub total_rows: u64,
+}
+
+impl MoeRouteSpec {
+    pub fn validate(self) -> Result<(), RouteError> {
+        if self.num_tokens == 0
+            || self.top_k == 0
+            || self.num_experts == 0
+            || self.num_experts > 512
+            || self.top_k > self.num_experts
+            || self.top_k > 32
+        {
+            return Err(RouteError::InvalidShape);
+        }
+        if self.hidden_size == 0
+            || self.hidden_size % 8 != 0
+            || self.total_rows == 0
+            || self.total_rows % 4 != 0
+            || self.total_rows < u64::from(self.num_tokens) * u64::from(self.top_k)
+        {
+            return Err(RouteError::InvalidLayout);
+        }
+        self.buffer_requirements()?;
+        Ok(())
+    }
+
+    pub fn buffer_requirements(self) -> Result<MoeRouteBuffers, RouteError> {
+        let routes = u64::from(self.num_tokens)
+            .checked_mul(u64::from(self.top_k))
+            .ok_or(RouteError::IntegerOverflow)?;
+        let token_bytes = u64::from(self.num_tokens)
+            .checked_mul(self.hidden_size)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or(RouteError::IntegerOverflow)?;
+        let packed_bytes = self
+            .total_rows
+            .checked_mul(self.hidden_size)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or(RouteError::IntegerOverflow)?;
+        Ok(MoeRouteBuffers {
+            token_input_bytes: token_bytes,
+            route_map_bytes: routes.checked_mul(4).ok_or(RouteError::IntegerOverflow)?,
+            packed_input_bytes: packed_bytes,
+            route_weight_bytes: routes.checked_mul(4).ok_or(RouteError::IntegerOverflow)?,
+            packed_expert_output_bytes: packed_bytes,
+            token_output_bytes: token_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoeRouteBuffers {
+    pub token_input_bytes: u64,
+    pub route_map_bytes: u64,
+    pub packed_input_bytes: u64,
+    pub route_weight_bytes: u64,
+    pub packed_expert_output_bytes: u64,
+    pub token_output_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteError {
     InvalidShape,
+    InvalidLayout,
     IntegerOverflow,
     RouteCount {
         expected: usize,
@@ -147,6 +226,7 @@ impl Display for RouteError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidShape => formatter.write_str("invalid MoE routing shape"),
+            Self::InvalidLayout => formatter.write_str("invalid MoE routed-row layout"),
             Self::IntegerOverflow => formatter.write_str("MoE routing index overflow"),
             Self::RouteCount { expected, actual } => {
                 write!(formatter, "expected {expected} routes, got {actual}")
@@ -209,5 +289,24 @@ mod tests {
             RoutePlan::build(1, 2, 4, &[1, 4]),
             Err(RouteError::ExpertOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn kernel_buffers_include_padded_expert_rows_but_not_duplicate_weights() {
+        let ids = [2, 0, 1, 2, 0, 3];
+        let plan = RoutePlan::build(2, 3, 4, &ids).expect("route plan");
+        let spec = plan.kernel_spec(2560).expect("kernel spec");
+        assert_eq!(spec.total_rows, 16);
+        assert_eq!(
+            spec.buffer_requirements().expect("buffers"),
+            MoeRouteBuffers {
+                token_input_bytes: 10_240,
+                route_map_bytes: 24,
+                packed_input_bytes: 81_920,
+                route_weight_bytes: 24,
+                packed_expert_output_bytes: 81_920,
+                token_output_bytes: 10_240,
+            }
+        );
     }
 }

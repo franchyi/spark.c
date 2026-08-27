@@ -109,19 +109,33 @@ def main() -> None:
     from flashinfer.quantization import silu_and_mul_nvfp4_quantize
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
-    packed_inputs = []
-    packed_input_scales = []
-    for group, input_scale in enumerate(w13_input_scales):
-        values = (
-            (torch.arange(4 * 2560, dtype=torch.float32) + group * 17) % 257 - 128
-        ) / 128
-        activation = values.to(torch.bfloat16).reshape(4, 2560).cuda()
-        packed, scales = fp4_quantize(activation, input_scale.reciprocal().cuda())
-        packed_inputs.append(packed)
-        packed_input_scales.append(scales)
+    token_values = (
+        (torch.arange(2 * 2560, dtype=torch.float32).reshape(2, 2560) * 13) % 257
+        - 128
+    ) / 128
+    token_input = token_values.to(torch.bfloat16).cuda()
+    route_experts = torch.tensor([[1, 0], [0, 1]], dtype=torch.int32)
+    route_weights = torch.tensor(
+        [[0.25, 0.75], [0.625, 0.375]], dtype=torch.float32
+    )
+    route_to_packed = torch.tensor([4, 0, 1, 5], dtype=torch.uint32)
+    packed_input_bf16 = torch.zeros((8, 2560), dtype=torch.bfloat16, device="cuda")
+    for route, packed_row in enumerate(route_to_packed.tolist()):
+        packed_input_bf16[packed_row] = token_input[route // 2]
 
-    input_fp4 = torch.cat(packed_inputs, dim=0)
-    input_scales = torch.cat(packed_input_scales, dim=0)
+    input_fp4 = torch.zeros((8, 1280), dtype=torch.uint8, device="cuda")
+    input_scales = torch.zeros((256, 160), dtype=torch.uint8, device="cuda")
+    w13_global_scales = torch.stack(
+        [input_scale.reciprocal() for input_scale in w13_input_scales]
+    ).reshape(-1).cuda()
+    for expert in range(len(EXPERTS)):
+        begin = expert * 4
+        packed, scales = fp4_quantize(
+            packed_input_bf16[begin : begin + 2],
+            w13_global_scales[expert : expert + 1],
+        )
+        input_fp4[begin : begin + 2] = packed
+        input_scales[expert * 128 : (expert + 1) * 128] = scales.view(torch.uint8)
     w13_fp4 = torch.stack(w13, dim=0).cuda()
     w13_block_scales = torch.stack(
         [interleave_128x4(scale) for scale in w13_scales], dim=0
@@ -149,21 +163,20 @@ def main() -> None:
         out_dtype=torch.bfloat16,
     )
 
-    down_input_fp4 = []
-    down_input_scales = []
+    down_input = torch.zeros((8, 320), dtype=torch.uint8, device="cuda")
+    down_scales = torch.zeros((256, 40), dtype=torch.uint8, device="cuda")
     down_global_scales = torch.stack(
         [input_scale.reciprocal() for input_scale in w2_input_scales]
     ).reshape(-1).cuda()
     for expert in range(len(EXPERTS)):
+        begin = expert * 4
         values, scales = silu_and_mul_nvfp4_quantize(
-            gateup[expert * 4 : (expert + 1) * 4],
+            gateup[begin : begin + 2],
             down_global_scales[expert : expert + 1],
             enable_pdl=False,
         )
-        down_input_fp4.append(values)
-        down_input_scales.append(scales)
-    down_input = torch.cat(down_input_fp4, dim=0)
-    down_scales = torch.cat(down_input_scales, dim=0)
+        down_input[begin : begin + 2] = values
+        down_scales[expert * 128 : (expert + 1) * 128] = scales.view(torch.uint8)
 
     w2_fp4 = torch.stack(w2, dim=0).cuda()
     w2_block_scales = torch.stack(
@@ -190,11 +203,33 @@ def main() -> None:
         swap_ab=False,
         out_dtype=torch.bfloat16,
     )
+    route_rows = route_to_packed.to(torch.long).cuda().reshape(2, 2)
+    final_output = (
+        output[route_rows].float() * route_weights.cuda().unsqueeze(-1)
+    ).sum(dim=1).to(torch.bfloat16)
     torch.cuda.synchronize()
 
     payloads = {
+        "token_input": write_tensor(
+            args.output, "token_input_bf16.bin", token_input
+        ),
+        "route_experts": write_tensor(
+            args.output, "route_experts_i32.bin", route_experts
+        ),
+        "route_to_packed": write_tensor(
+            args.output, "route_to_packed_u32.bin", route_to_packed
+        ),
+        "route_weights": write_tensor(
+            args.output, "route_weights_f32.bin", route_weights
+        ),
+        "packed_input_bf16": write_tensor(
+            args.output, "packed_input_bf16.bin", packed_input_bf16
+        ),
         "input_fp4": write_tensor(args.output, "input_fp4.bin", input_fp4),
         "input_scales": write_tensor(args.output, "input_scales.bin", input_scales),
+        "w13_global_scales": write_tensor(
+            args.output, "w13_global_scales_f32.bin", w13_global_scales
+        ),
         "w13_fp4": write_tensor(args.output, "w13_fp4.bin", w13_fp4),
         "w13_scales": write_tensor(args.output, "w13_scales.bin", w13_block_scales),
         "w13_alpha": write_tensor(args.output, "w13_alpha_f32.bin", w13_alpha),
@@ -211,13 +246,23 @@ def main() -> None:
         "w2_scales": write_tensor(args.output, "w2_scales.bin", w2_block_scales),
         "w2_alpha": write_tensor(args.output, "w2_alpha_f32.bin", w2_alpha),
         "output": write_tensor(args.output, "output_bf16.bin", output),
+        "final_output": write_tensor(
+            args.output, "final_output_bf16.bin", final_output
+        ),
     }
     manifest = {
         "schema_version": 1,
         "model_revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
         "experts": list(EXPERTS),
-        "shape": {"rows": 8, "scale_rows": 256, "hidden": 2560, "moe": 640},
-        "oracle": "flashinfer-grouped-gemm-plus-cute-silu-nvfp4-sm121",
+        "shape": {
+            "tokens": 2,
+            "top_k": 2,
+            "rows": 8,
+            "scale_rows": 256,
+            "hidden": 2560,
+            "moe": 640,
+        },
+        "oracle": "flashinfer-routed-grouped-gemm-plus-cute-nvfp4-sm121",
         "payloads": payloads,
     }
     (args.output / "fixture.json").write_text(

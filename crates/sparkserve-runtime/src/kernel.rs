@@ -32,6 +32,8 @@ pub enum KernelBackend {
     CutlassSm121 = 2,
     FlashInferGroupMmFp4 = 3,
     FlashInferCuteSiluNvfp4 = 4,
+    FlashInferCuteNvfp4Quantize = 5,
+    FlashInferMoeRoute = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -486,6 +488,98 @@ pub struct SegmentedSiluNvfp4Buffers {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentedNvfp4QuantizeSpec {
+    pub num_experts: u32,
+    pub total_rows: u64,
+    pub input_scale_rows: u64,
+    pub hidden_size: u64,
+    pub group_size: u32,
+    pub input_dtype: DataType,
+    pub output_scale_layout: ScaleLayout,
+    pub requested_backend: KernelBackend,
+}
+
+impl SegmentedNvfp4QuantizeSpec {
+    pub fn from_grouped_layout(
+        layout: &GroupedExpertLayout,
+        hidden_size: u64,
+    ) -> Result<Self, KernelContractError> {
+        let spec = Self {
+            num_experts: u32::try_from(layout.m_indptr.len() - 1)
+                .map_err(|_| KernelContractError::DimensionOverflow)?,
+            total_rows: layout.total_rows,
+            input_scale_rows: layout.input_scale_rows,
+            hidden_size,
+            group_size: NVFP4_GROUP_SIZE,
+            input_dtype: DataType::BFloat16,
+            output_scale_layout: ScaleLayout::Cutlass128x4,
+            requested_backend: KernelBackend::FlashInferCuteNvfp4Quantize,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn validate(self) -> Result<(), KernelContractError> {
+        if self.num_experts == 0 || self.num_experts > 512 {
+            return Err(KernelContractError::InvalidExpertCount(
+                self.num_experts as usize,
+            ));
+        }
+        if self.total_rows == 0
+            || self.total_rows % 4 != 0
+            || self.input_scale_rows < self.total_rows
+            || self.input_scale_rows % 128 != 0
+        {
+            return Err(KernelContractError::InvalidRoutedPadding);
+        }
+        if self.hidden_size == 0 || self.hidden_size % 128 != 0 {
+            return Err(KernelContractError::GroupedAlignment);
+        }
+        if self.group_size != NVFP4_GROUP_SIZE {
+            return Err(KernelContractError::UnsupportedGroupSize(self.group_size));
+        }
+        if self.input_dtype != DataType::BFloat16 {
+            return Err(KernelContractError::UnsupportedInputType);
+        }
+        if self.output_scale_layout != ScaleLayout::Cutlass128x4 {
+            return Err(KernelContractError::UnsupportedScaleLayout);
+        }
+        if !matches!(
+            self.requested_backend,
+            KernelBackend::Auto | KernelBackend::FlashInferCuteNvfp4Quantize
+        ) {
+            return Err(KernelContractError::UnsupportedFusedTactic);
+        }
+        self.buffer_requirements()?;
+        Ok(())
+    }
+
+    pub fn buffer_requirements(self) -> Result<SegmentedNvfp4QuantizeBuffers, KernelContractError> {
+        Ok(SegmentedNvfp4QuantizeBuffers {
+            input_bytes: checked_product(&[self.total_rows, self.hidden_size, 2])?,
+            packed_output_bytes: checked_product(&[self.total_rows, self.hidden_size / 2])?,
+            output_scale_bytes: checked_product(&[
+                self.input_scale_rows,
+                self.hidden_size / u64::from(self.group_size),
+            ])?,
+            global_scale_bytes: checked_product(&[u64::from(self.num_experts), 4])?,
+            host_metadata_bytes: checked_product(&[u64::from(self.num_experts), 16])?
+                .checked_add(4)
+                .ok_or(KernelContractError::DimensionOverflow)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentedNvfp4QuantizeBuffers {
+    pub input_bytes: u64,
+    pub packed_output_bytes: u64,
+    pub output_scale_bytes: u64,
+    pub global_scale_bytes: u64,
+    pub host_metadata_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCaps {
     pub sm: u32,
     pub supports_fp4_tensor_cores: bool,
@@ -788,6 +882,25 @@ mod tests {
                 input_bytes: 20_480,
                 packed_output_bytes: 2_560,
                 output_scale_bytes: 15_360,
+                global_scale_bytes: 12,
+                host_metadata_bytes: 52,
+            }
+        );
+    }
+
+    #[test]
+    fn qwen_input_quantizer_reuses_the_rust_expert_layout() {
+        let layout = GroupedExpertLayout::from_expert_rows(&[2, 0, 3]).expect("layout");
+        let spec = SegmentedNvfp4QuantizeSpec::from_grouped_layout(&layout, 2560)
+            .expect("segmented quantizer");
+        assert_eq!(spec.total_rows, 8);
+        assert_eq!(spec.input_scale_rows, 384);
+        assert_eq!(
+            spec.buffer_requirements().expect("buffers"),
+            SegmentedNvfp4QuantizeBuffers {
+                input_bytes: 40_960,
+                packed_output_bytes: 10_240,
+                output_scale_bytes: 61_440,
                 global_scale_bytes: 12,
                 host_metadata_bytes: 52,
             }

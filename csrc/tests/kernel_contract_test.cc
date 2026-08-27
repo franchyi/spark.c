@@ -202,6 +202,81 @@ int main() {
   segmented_indptr[2] = 7;
   assert(sparkserve_segmented_silu_nvfp4_launch(&caps, &segmented_args).code ==
          SPARKSERVE_STATUS_INVALID_ARGUMENT);
+  segmented_indptr[2] = 8;
+
+  SparkServeSegmentedNvfp4QuantizePlan quantize = {
+      sizeof(SparkServeSegmentedNvfp4QuantizePlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      2,
+      16,
+      8,
+      256,
+      2560,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4,
+      SPARKSERVE_BACKEND_AUTO,
+      0,
+  };
+  assert(sparkserve_segmented_nvfp4_quantize_validate(&quantize).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeSegmentedNvfp4QuantizeArgs quantize_args = {};
+  quantize_args.struct_size = sizeof(quantize_args);
+  quantize_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  quantize_args.plan = quantize;
+  quantize_args.input = &packed;
+  quantize_args.input_global_scales = alpha;
+  quantize_args.active_rows_host = segmented_active;
+  quantize_args.m_indptr_host = segmented_indptr;
+  quantize_args.scale_row_offsets_host = segmented_scale_offsets;
+  quantize_args.packed_output = &packed;
+  quantize_args.output_scales = &scale;
+  quantize_args.input_row_stride_bytes = 2560 * 2;
+  quantize_args.output_row_stride_bytes = 2560 / 2;
+  quantize_args.scale_row_stride_bytes = 2560 / 16;
+  assert(sparkserve_segmented_nvfp4_quantize_launch(&caps, &quantize_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  quantize_args.input_row_stride_bytes += 2;
+  assert(sparkserve_segmented_nvfp4_quantize_launch(&caps, &quantize_args).code ==
+         SPARKSERVE_STATUS_INVALID_ARGUMENT);
+
+  SparkServeMoeRoutePlan route = {
+      sizeof(SparkServeMoeRoutePlan), SPARKSERVE_KERNEL_ABI_VERSION,
+      2,                               2,
+      4,                               0,
+      2560,                            8,
+  };
+  assert(sparkserve_moe_route_validate(&route).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo route_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_moe_route_query(&caps, &route, &route_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(route_info.backend == SPARKSERVE_BACKEND_FLASHINFER_MOE_ROUTE);
+  assert(route_info.available == 0);
+  uint32_t route_map[] = {4, 0, 1, 5};
+  SparkServeMoeRouteArgs route_args = {};
+  route_args.struct_size = sizeof(route_args);
+  route_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  route_args.plan = route;
+  route_args.token_input = &packed;
+  route_args.route_to_packed_row = route_map;
+  route_args.packed_input = &packed;
+  route_args.route_weights = alpha;
+  route_args.packed_expert_output = &packed;
+  route_args.token_output = &output;
+  route_args.token_input_row_stride_bytes = 2560 * 2;
+  route_args.packed_row_stride_bytes = 2560 * 2;
+  route_args.expert_output_row_stride_bytes = 2560 * 2;
+  assert(sparkserve_moe_route_dispatch(&caps, &route_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  assert(sparkserve_moe_route_finalize(&caps, &route_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  route.top_k = 33;
+  assert(sparkserve_moe_route_validate(&route).code ==
+         SPARKSERVE_STATUS_INVALID_ARGUMENT);
 
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,

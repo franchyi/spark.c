@@ -1,9 +1,10 @@
 use std::ffi::{c_char, c_void};
 
 use crate::kernel::{
-    DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION, SegmentedSiluNvfp4Spec,
-    SiluNvfp4Spec,
+    DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION, SegmentedNvfp4QuantizeSpec,
+    SegmentedSiluNvfp4Spec, SiluNvfp4Spec,
 };
+use crate::routing::MoeRouteSpec;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -275,6 +276,105 @@ pub struct SegmentedSiluNvfp4Args {
     pub cuda_stream: *mut c_void,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentedNvfp4QuantizePlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_experts: u32,
+    pub group_size: u32,
+    pub total_rows: u64,
+    pub input_scale_rows: u64,
+    pub hidden_size: u64,
+    pub input_dtype: u32,
+    pub output_scale_layout: u32,
+    pub requested_backend: u32,
+    pub reserved: u32,
+}
+
+impl From<SegmentedNvfp4QuantizeSpec> for SegmentedNvfp4QuantizePlan {
+    fn from(spec: SegmentedNvfp4QuantizeSpec) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_experts: spec.num_experts,
+            group_size: spec.group_size,
+            total_rows: spec.total_rows,
+            input_scale_rows: spec.input_scale_rows,
+            hidden_size: spec.hidden_size,
+            input_dtype: spec.input_dtype as u32,
+            output_scale_layout: spec.output_scale_layout as u32,
+            requested_backend: spec.requested_backend as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentedNvfp4QuantizeArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: SegmentedNvfp4QuantizePlan,
+    pub input: *const c_void,
+    pub input_global_scales: *const f32,
+    pub active_rows_host: *const i32,
+    pub m_indptr_host: *const i32,
+    pub scale_row_offsets_host: *const u64,
+    pub packed_output: *mut c_void,
+    pub output_scales: *mut c_void,
+    pub input_row_stride_bytes: u64,
+    pub output_row_stride_bytes: u64,
+    pub scale_row_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoeRoutePlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_tokens: u32,
+    pub top_k: u32,
+    pub num_experts: u32,
+    pub reserved: u32,
+    pub hidden_size: u64,
+    pub total_rows: u64,
+}
+
+impl From<MoeRouteSpec> for MoeRoutePlan {
+    fn from(spec: MoeRouteSpec) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_tokens: spec.num_tokens,
+            top_k: spec.top_k,
+            num_experts: spec.num_experts,
+            reserved: 0,
+            hidden_size: spec.hidden_size,
+            total_rows: spec.total_rows,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MoeRouteArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: MoeRoutePlan,
+    pub token_input: *const c_void,
+    pub route_to_packed_row: *const u32,
+    pub packed_input: *mut c_void,
+    pub route_weights: *const f32,
+    pub packed_expert_output: *const c_void,
+    pub token_output: *mut c_void,
+    pub token_input_row_stride_bytes: u64,
+    pub packed_row_stride_bytes: u64,
+    pub expert_output_row_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GdnBackend {
@@ -404,6 +504,32 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const SegmentedSiluNvfp4Args,
     ) -> Status;
+    pub fn sparkserve_segmented_nvfp4_quantize_validate(
+        plan: *const SegmentedNvfp4QuantizePlan,
+    ) -> Status;
+    pub fn sparkserve_segmented_nvfp4_quantize_query(
+        caps: *const DeviceCaps,
+        plan: *const SegmentedNvfp4QuantizePlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_segmented_nvfp4_quantize_launch(
+        caps: *const DeviceCaps,
+        args: *const SegmentedNvfp4QuantizeArgs,
+    ) -> Status;
+    pub fn sparkserve_moe_route_validate(plan: *const MoeRoutePlan) -> Status;
+    pub fn sparkserve_moe_route_query(
+        caps: *const DeviceCaps,
+        plan: *const MoeRoutePlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_moe_route_dispatch(
+        caps: *const DeviceCaps,
+        args: *const MoeRouteArgs,
+    ) -> Status;
+    pub fn sparkserve_moe_route_finalize(
+        caps: *const DeviceCaps,
+        args: *const MoeRouteArgs,
+    ) -> Status;
     pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn sparkserve_gdn_decode_query(
         caps: *const DeviceCaps,
@@ -438,6 +564,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<SiluNvfp4Args>(), 128);
         assert_eq!(std::mem::size_of::<SegmentedSiluNvfp4Plan>(), 56);
         assert_eq!(std::mem::size_of::<SegmentedSiluNvfp4Args>(), 152);
+        assert_eq!(std::mem::size_of::<SegmentedNvfp4QuantizePlan>(), 56);
+        assert_eq!(std::mem::size_of::<SegmentedNvfp4QuantizeArgs>(), 152);
+        assert_eq!(std::mem::size_of::<MoeRoutePlan>(), 40);
+        assert_eq!(std::mem::size_of::<MoeRouteArgs>(), 128);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
@@ -508,5 +638,25 @@ mod tests {
         assert_eq!(plan.num_experts, 3);
         assert_eq!(plan.total_rows, 8);
         assert_eq!(plan.input_scale_rows, 384);
+    }
+
+    #[test]
+    fn route_and_quantize_specs_convert_without_scheduler_metadata_loss() {
+        use crate::kernel::{GroupedExpertLayout, SegmentedNvfp4QuantizeSpec};
+        use crate::routing::RoutePlan;
+
+        let routes = RoutePlan::build(1, 2, 4, &[3, 1]).expect("routes");
+        let route_plan = MoeRoutePlan::from(routes.kernel_spec(2560).expect("route spec"));
+        assert_eq!(route_plan.num_tokens, 1);
+        assert_eq!(route_plan.top_k, 2);
+        assert_eq!(route_plan.total_rows, 8);
+
+        let layout = GroupedExpertLayout::from_expert_rows(&[0, 1, 0, 1]).expect("layout");
+        let quantize =
+            SegmentedNvfp4QuantizeSpec::from_grouped_layout(&layout, 2560).expect("quantizer spec");
+        let quantize_plan = SegmentedNvfp4QuantizePlan::from(quantize);
+        assert_eq!(quantize_plan.num_experts, 4);
+        assert_eq!(quantize_plan.total_rows, 8);
+        assert_eq!(quantize_plan.hidden_size, 2560);
     }
 }

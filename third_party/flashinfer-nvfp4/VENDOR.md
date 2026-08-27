@@ -14,9 +14,9 @@ package, Torch, SGLang, nor a JIT compiler is present in the serving process.
 - Download transport defaults to `https://ghfast.top/`; canonical repository
   identities remain the two upstream GitHub repositories.
 - `source-files.sha256` locks the directly included dense/grouped templates,
-  the upstream grouped generator, its JIT type mapping, the four CuTe
-  quantizer/export sources, and both license files. Git commits lock their
-  transitive headers.
+  the fused-MoE row permutation/finalizer donor, the upstream grouped
+  generator, its JIT type mapping, the four CuTe quantizer/export sources, and
+  both license files. Git commits lock their transitive headers.
 
 Run `scripts/fetch-kernel-sources.sh` to materialize the ignored source tree at
 `third_party/_deps/flashinfer` and verify it before compilation.
@@ -43,9 +43,9 @@ added to the scheduler table; no framework dispatcher is linked.
 `INSTANTIATE_GROUP_GEMM_NVFP4_GROUPWISE_SM120` macro for BF16 output with CTA
 `128 x 128 x 256`, `swap_ab=false`, and per-group FP32 alpha. FlashInfer owns
 the grouped CUTLASS collective and its argument-preparation kernel. SparkServe
-owns routed-row permutation, expert `m_indptr`, scale-row offsets, workspace
-reuse, hot-expert placement, and paging. The serving process still links no
-Torch, TVM-FFI, Python, or SGLang code.
+consumes Rust's expert `m_indptr` and scale-row offsets. Rust owns route-plan
+construction, workspace reuse, hot-expert placement, and paging. This adapter
+alone links no Torch, TVM-FFI, Python, or SGLang code.
 
 `csrc/cuda/nvfp4_silu_cute.cc` uses a different reuse mode because GB10 cannot
 assemble TensorRT-LLM's scalar `cvt.e2m1x2` path for `sm_121`, while the same
@@ -62,6 +62,20 @@ host-scheduled active rows. The exported kernel is fixed to `K=640`, group 16,
 CUTLASS 128x4 scales, PDL off, and BF16 input; the public query reports other
 hidden sizes unavailable. Build metadata records the CuTe-DSL package set,
 architecture, and hash of all source files used in the export.
+
+`csrc/cuda/nvfp4_quantize_cute.cc` applies the same export technique to
+FlashInfer's ordinary BF16-to-NVFP4 input quantizer. The pinned specialization
+is `swizzled_bfloat16_k2560_sf0_pdl0`: a 38 KiB SM121 object with SHA-256
+`8cbc3a588037ba109978c019da0f774c87f3968193376a341a8fc35624376916`.
+It accepts the Rust-owned segmented row/scale layout and is the only
+quantization implementation before grouped GEMM1.
+
+`csrc/cuda/moe_route_flashinfer.cu` is a framework-free adaptation of
+FlashInfer's `expandInputRowsKernel` and `finalizeMoeRoutingKernel` in
+`csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh`. The adapter
+retains their 128-bit row movement and FP32 weighted accumulation, but replaces
+the TensorRT runner with a device `route_to_packed_row` map built by Rust. It
+does not choose experts, allocate buffers, or own padding policy.
 
 ## Current gate
 
@@ -93,12 +107,12 @@ segments, distinct static scales, and different active row counts.
 object through the standalone ABI. All packed E2M1 values and E4M3 scale bytes
 match exactly on GB10.
 
-The end-to-end expert arithmetic gate uses real layer-0 gate, up, and down
-weights for experts 0 and 1. `scripts/capture-qwen-moe-fixture.py` records both
-grouped GEMMs and the intervening CuTe activation with independent per-expert
-down scales. `make test-cuda-qwen-moe-fixture QWEN_MOE_FIXTURE=...` replays the
-three borrowed stages through one standalone binary. Gate/up BF16, packed
-activation values, E4M3 activation scales, and down BF16 output all match the
-FlashInfer oracle byte-for-byte. Rust's `GroupedExpertLayout` supplies one
-shared `m_indptr` and scale-row map, so no activation or weight copy occurs
-between these stages.
+The end-to-end routed expert gate uses two BF16 tokens and real layer-0 gate,
+up, and down weights for experts 0 and 1. `scripts/capture-qwen-moe-fixture.py`
+records token-major routes and weights, the Rust packed-row order, K=2560 input
+quantization, both grouped GEMMs, the fused activation, and weighted finalize.
+`make test-cuda-qwen-moe-fixture QWEN_MOE_FIXTURE=...` replays all six borrowed
+stages through one standalone binary. Dispatch BF16, both sets of packed E2M1
+values/E4M3 scales, both GEMM outputs, and final BF16 output have zero byte
+mismatches on GB10. No activation or model-weight copy occurs between the two
+GEMMs.

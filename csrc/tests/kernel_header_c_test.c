@@ -19,6 +19,14 @@ _Static_assert(sizeof(SparkServeSegmentedSiluNvfp4Plan) == 56u,
                "C segmented SiLU plan layout drifted");
 _Static_assert(sizeof(SparkServeSegmentedSiluNvfp4Args) == 152u,
                "C segmented SiLU arguments layout drifted");
+_Static_assert(sizeof(SparkServeSegmentedNvfp4QuantizePlan) == 56u,
+               "C segmented quantize plan layout drifted");
+_Static_assert(sizeof(SparkServeSegmentedNvfp4QuantizeArgs) == 152u,
+               "C segmented quantize arguments layout drifted");
+_Static_assert(sizeof(SparkServeMoeRoutePlan) == 40u,
+               "C MoE route plan layout drifted");
+_Static_assert(sizeof(SparkServeMoeRouteArgs) == 128u,
+               "C MoE route arguments layout drifted");
 
 int main(void) {
   SparkServeDenseNvfp4Plan plan = {0};

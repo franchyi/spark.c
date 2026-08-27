@@ -44,6 +44,11 @@ typedef enum SparkServeKernelBackend {
   // FlashInfer CuTe-DSL fused SiLU/multiply/NVFP4 quantizer. Its exported
   // artifact is consumed without Python, PyTorch, or SGLang at serving time.
   SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4 = 4,
+  // FlashInfer CuTe-DSL BF16 -> NVFP4 quantizer exported for Qwen K=2560.
+  SPARKSERVE_BACKEND_FLASHINFER_CUTE_NVFP4_QUANTIZE = 5,
+  // Row gather and weighted finalize adapted from FlashInfer's fused-MoE
+  // prologue/epilogue. Rust owns the maps and scheduling policy.
+  SPARKSERVE_BACKEND_FLASHINFER_MOE_ROUTE = 6,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -244,6 +249,71 @@ typedef struct SparkServeSegmentedSiluNvfp4Args {
   void* cuda_stream;
 } SparkServeSegmentedSiluNvfp4Args;
 
+// Segmented BF16 -> NVFP4 input quantization for grouped GEMM1. The row and
+// scale offsets are the same scheduler-owned layout used by the two grouped
+// GEMMs. The linked donor object is specialized for Qwen's K=2560.
+typedef struct SparkServeSegmentedNvfp4QuantizePlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_experts;
+  uint32_t group_size;
+  uint64_t total_rows;
+  uint64_t input_scale_rows;
+  uint64_t hidden_size;
+  uint32_t input_dtype;
+  uint32_t output_scale_layout;
+  uint32_t requested_backend;
+  uint32_t reserved;
+} SparkServeSegmentedNvfp4QuantizePlan;
+
+typedef struct SparkServeSegmentedNvfp4QuantizeArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeSegmentedNvfp4QuantizePlan plan;
+  const void* input;
+  const float* input_global_scales;
+  const int32_t* active_rows_host;
+  const int32_t* m_indptr_host;
+  const uint64_t* scale_row_offsets_host;
+  void* packed_output;
+  void* output_scales;
+  uint64_t input_row_stride_bytes;
+  uint64_t output_row_stride_bytes;
+  uint64_t scale_row_stride_bytes;
+  void* cuda_stream;
+} SparkServeSegmentedNvfp4QuantizeArgs;
+
+// Scheduler-owned MoE row permutation. Natural route order is
+// token-major: route = token * top_k + rank. `route_to_packed_row` is a
+// device UINT32 array generated from the Rust RoutePlan. Padding rows are
+// cleared during dispatch and ignored during finalize.
+typedef struct SparkServeMoeRoutePlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_tokens;
+  uint32_t top_k;
+  uint32_t num_experts;
+  uint32_t reserved;
+  uint64_t hidden_size;
+  uint64_t total_rows;
+} SparkServeMoeRoutePlan;
+
+typedef struct SparkServeMoeRouteArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeMoeRoutePlan plan;
+  const void* token_input;
+  const uint32_t* route_to_packed_row;
+  void* packed_input;
+  const float* route_weights;
+  const void* packed_expert_output;
+  void* token_output;
+  uint64_t token_input_row_stride_bytes;
+  uint64_t packed_row_stride_bytes;
+  uint64_t expert_output_row_stride_bytes;
+  void* cuda_stream;
+} SparkServeMoeRouteArgs;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -347,6 +417,34 @@ SparkServeStatus sparkserve_segmented_silu_nvfp4_query(
 SparkServeStatus sparkserve_segmented_silu_nvfp4_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeSegmentedSiluNvfp4Args* args);
+
+SparkServeStatus sparkserve_segmented_nvfp4_quantize_validate(
+    const SparkServeSegmentedNvfp4QuantizePlan* plan);
+
+SparkServeStatus sparkserve_segmented_nvfp4_quantize_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSegmentedNvfp4QuantizePlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_segmented_nvfp4_quantize_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSegmentedNvfp4QuantizeArgs* args);
+
+SparkServeStatus sparkserve_moe_route_validate(
+    const SparkServeMoeRoutePlan* plan);
+
+SparkServeStatus sparkserve_moe_route_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeMoeRoutePlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_moe_route_dispatch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeMoeRouteArgs* args);
+
+SparkServeStatus sparkserve_moe_route_finalize(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeMoeRouteArgs* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);

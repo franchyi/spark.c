@@ -98,6 +98,14 @@ the shapes proven hot by profiling. Preserve NVFP4 weights and scales exactly;
 avoid load-time BF16 materialization. Routed experts need fused top-k dispatch,
 NVFP4 GEMM, activation, and reduction.
 
+The kernel/runtime boundary is deliberately narrow. FlashInfer/CUTLASS owns
+NVFP4 quantization, both expert GEMMs, row movement, activation, and weighted
+finalization. Rust owns top-k scheduling metadata, a stable padded row map,
+fixed-address graph buckets, workspace reuse, and which expert bytes are
+resident. The native ABI never asks a donor kernel to allocate memory or choose
+an eviction policy. This is also the boundary used for GGUF: borrow arithmetic,
+own scheduling and placement.
+
 The first resident target is Qwen3.8 27B because the existing SGLang service gives
 golden logits and a measured target of about 50 decode tokens/s.
 
@@ -165,6 +173,10 @@ configured safety reserve.
 ### M1 — resident Qwen3.8 27B NVFP4
 
 - Correct one-token forward pass, then 128-token decode.
+- The routed-expert subgraph already has byte-exact real-weight parity through
+  dispatch, K=2560 quantization, both GEMMs, fused activation quantization, and
+  weighted finalize. Router/top-k, shared expert, and full-layer state remain
+  before the first native token.
 - OpenAI-compatible streaming after the offline path is stable.
 - Gate: exact greedy token match and at least 45 tokens/s; target 50+ tokens/s.
 
