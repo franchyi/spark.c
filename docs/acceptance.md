@@ -68,8 +68,13 @@ Locked input: `glm53-flash-iq3-xxs` at revision
 
 ## Current position
 
-Artifact locks, strict Qwen checkpoint scanning, the zero-copy PLE store, native
-GDN correctness kernel, and the first framework-free borrowed NVFP4 GEMM tactic
-exist. This document is deliberately a completion checklist: unchecked graph,
-server, QSA, MoE, tokenizer, GGUF, GLM, and end-to-end parity work is not implied
-to be finished by the presence of an ABI or isolated kernel smoke test.
+Artifact locks, strict Qwen checkpoint scanning, exact-FP8 PLE indexing, the
+native GDN correctness kernel, and the borrowed NVFP4 expert chain now exist.
+The real Qwen fixture is byte-exact through route dispatch, K=2560 quantization,
+both grouped GEMMs, fused activation quantization, and weighted finalize. The
+Rust control plane also has transactional fixed-slot expert residency, and GB10
+has passed CUDA reads from both the registered cache slab and a protected
+file-backed mapping. This document remains a completion checklist: the joined
+QSA/full-token graph, tokenizer/server, production async I/O, GGUF, GLM graph,
+and end-to-end continuation gates are not implied to be finished by isolated
+kernel and fabric tests.

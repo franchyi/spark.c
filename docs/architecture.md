@@ -74,6 +74,15 @@ first-touch, prefetch, residency, and eviction. Direct mmap is enabled only afte
 the target kernel accepts the pointer alignment and matches the performance of a
 resident CUDA allocation.
 
+The first physical backend is now implemented behind `fabric_api.h`. It can
+create a page-aligned anonymous slab for fixed PLE/expert-cache slots or map an
+unaltered file range, register the pages once with CUDA, and return stable host
+and device pointers to the same storage. An SM121 test on GB10 reads both forms
+from a CUDA kernel and matches their CPU byte checksums. The current GB10 driver
+does not advertise `cudaHostRegisterReadOnly`; the file backend therefore uses a
+private writable mapping only during registration and immediately restores
+`PROT_READ` with `mprotect`. Serving kernels treat that pointer as immutable.
+
 ### Transactional expert residency
 
 The Rust control plane now treats one routed layer as a two-phase transaction:
@@ -91,9 +100,10 @@ two NVMe fills from targeting the same fixed slots concurrently. Hits, misses,
 evictions, and bytes loaded advance only on commit. This keeps storage failure
 semantics in Rust and arithmetic in the borrowed kernel set. The implemented
 scheduler is address-stable and strictly bounded by its configured slot count;
-the next systems step is to preallocate its route scratch and back the logical
-slots with one registered, page-aligned coherent-memory slab plus an `io_uring`
-fixed-buffer reader.
+its logical slots can now be backed by the registered coherent-memory slab. The
+next systems step is to preallocate route scratch, register the slab as an
+`io_uring` fixed buffer, and benchmark direct file mappings against the proven
+resident CUDA allocation before promoting them for hot Qwen weights.
 
 ### Flash-Next sparse PLE path
 

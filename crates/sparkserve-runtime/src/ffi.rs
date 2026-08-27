@@ -6,11 +6,74 @@ use crate::kernel::{
 };
 use crate::routing::MoeRouteSpec;
 
+pub const FABRIC_ABI_VERSION: u32 = 1;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Status {
     pub code: i32,
     pub message: *const c_char,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoherentRegionKind {
+    Slab = 1,
+    FileReadOnly = 2,
+}
+
+pub const COHERENT_REGION_PREFAULT: u32 = 1 << 0;
+pub const COHERENT_REGION_HUGE_PAGE_HINT: u32 = 1 << 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CoherentRegionConfig {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub kind: u32,
+    pub flags: u32,
+    pub payload_bytes: u64,
+    pub file_offset: u64,
+    pub required_alignment: u64,
+    pub file_path: *const c_char,
+}
+
+impl CoherentRegionConfig {
+    pub fn slab(payload_bytes: u64, required_alignment: u64, flags: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: FABRIC_ABI_VERSION,
+            kind: CoherentRegionKind::Slab as u32,
+            flags,
+            payload_bytes,
+            file_offset: 0,
+            required_alignment,
+            file_path: std::ptr::null(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CoherentRegionView {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub kind: u32,
+    pub flags: u32,
+    pub host_pointer: *mut c_void,
+    pub device_pointer: *mut c_void,
+    pub mapped_bytes: u64,
+    pub payload_bytes: u64,
+    pub file_offset: u64,
+    pub required_alignment: u64,
+    pub page_bytes: u64,
+    pub device_id: i32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+pub struct CoherentRegion {
+    _private: [u8; 0],
 }
 
 #[repr(C)]
@@ -463,6 +526,16 @@ impl KernelInfo {
 }
 
 unsafe extern "C" {
+    pub fn sparkserve_coherent_region_validate(config: *const CoherentRegionConfig) -> Status;
+    pub fn sparkserve_coherent_region_create(
+        config: *const CoherentRegionConfig,
+        region: *mut *mut CoherentRegion,
+    ) -> Status;
+    pub fn sparkserve_coherent_region_view(
+        region: *const CoherentRegion,
+        view: *mut CoherentRegionView,
+    ) -> Status;
+    pub fn sparkserve_coherent_region_destroy(region: *mut CoherentRegion) -> Status;
     pub fn sparkserve_kernel_abi_version() -> u32;
     pub fn sparkserve_dense_nvfp4_validate(plan: *const DenseNvfp4Plan) -> Status;
     pub fn sparkserve_dense_nvfp4_query(
@@ -553,6 +626,8 @@ mod tests {
 
     #[test]
     fn ffi_layout_matches_version_one_c_header() {
+        assert_eq!(std::mem::size_of::<CoherentRegionConfig>(), 48);
+        assert_eq!(std::mem::size_of::<CoherentRegionView>(), 80);
         assert_eq!(std::mem::size_of::<DeviceCaps>(), 24);
         assert_eq!(std::mem::size_of::<DenseNvfp4Plan>(), 80);
         assert_eq!(std::mem::size_of::<Nvfp4MatrixView>(), 32);

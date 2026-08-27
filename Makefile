@@ -14,6 +14,7 @@ CUDA_GROUPED_NVFP4_FIXTURE_TEST := $(BUILD_DIR)/nvfp4-grouped-fixture-test
 CUDA_SILU_NVFP4_TEST := $(BUILD_DIR)/nvfp4-silu-cute-test
 CUDA_QWEN_MOE_FIXTURE_TEST := $(BUILD_DIR)/qwen-moe-fixture-test
 CUDA_MOE_ROUTE_TEST := $(BUILD_DIR)/moe-route-cuda-test
+CUDA_COHERENT_REGION_TEST := $(BUILD_DIR)/coherent-region-cuda-test
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_121a
 NVCCFLAGS ?= -O2 -std=c++20 -arch=$(CUDA_ARCH)
@@ -33,7 +34,7 @@ CUTE_NVFP4_QUANTIZE_OBJECT ?=
 TVM_FFI_ROOT ?=
 CUTE_DSL_ROOT ?=
 
-.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda test-cuda-fabric test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -41,7 +42,10 @@ test-cpp: $(CONTRACT_TEST) $(HEADER_C_TEST)
 	$(CONTRACT_TEST)
 	$(HEADER_C_TEST)
 
-test-cuda: test-cuda-gdn test-cuda-nvfp4 test-cuda-grouped-nvfp4 test-cuda-moe-route
+test-cuda: test-cuda-fabric test-cuda-gdn test-cuda-nvfp4 test-cuda-grouped-nvfp4 test-cuda-moe-route
+
+test-cuda-fabric: $(CUDA_COHERENT_REGION_TEST)
+	$(CUDA_COHERENT_REGION_TEST)
 
 test-cuda-gdn: $(CUDA_GDN_TEST)
 	$(CUDA_GDN_TEST)
@@ -144,6 +148,11 @@ $(CUDA_MOE_ROUTE_TEST): csrc/kernel_contract.cc csrc/cuda/moe_route_flashinfer.c
 		csrc/cuda/moe_route_flashinfer.cu csrc/tests/moe_route_cuda_test.cu \
 		-o $(CUDA_MOE_ROUTE_TEST)
 
+$(CUDA_COHERENT_REGION_TEST): csrc/fabric/coherent_region.cc csrc/tests/coherent_region_cuda_test.cu csrc/include/sparkserve/fabric_api.h csrc/include/sparkserve/kernel_api.h
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -Icsrc/include csrc/fabric/coherent_region.cc \
+		csrc/tests/coherent_region_cuda_test.cu -o $(CUDA_COHERENT_REGION_TEST)
+
 $(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/internal/nvfp4_grouped_backend.h csrc/internal/nvfp4_silu_backend.h csrc/internal/nvfp4_quantize_backend.h csrc/internal/moe_route_backend.h csrc/tests/qwen_moe_fixture_test.cc csrc/include/sparkserve/kernel_api.h
 	test -n "$(CUTE_NVFP4_OBJECT)"
 	test -n "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
@@ -167,4 +176,4 @@ $(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_f
 		-Xcompiler=-pthread -o $(CUDA_QWEN_MOE_FIXTURE_TEST)
 
 clean:
-	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_MOE_ROUTE_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)
+	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_COHERENT_REGION_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_MOE_ROUTE_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)

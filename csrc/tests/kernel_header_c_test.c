@@ -1,3 +1,4 @@
+#include "sparkserve/fabric_api.h"
 #include "sparkserve/kernel_api.h"
 
 #include <stddef.h>
@@ -27,6 +28,10 @@ _Static_assert(sizeof(SparkServeMoeRoutePlan) == 40u,
                "C MoE route plan layout drifted");
 _Static_assert(sizeof(SparkServeMoeRouteArgs) == 128u,
                "C MoE route arguments layout drifted");
+_Static_assert(sizeof(SparkServeCoherentRegionConfig) == 48u,
+               "C coherent region config layout drifted");
+_Static_assert(sizeof(SparkServeCoherentRegionView) == 80u,
+               "C coherent region view layout drifted");
 
 int main(void) {
   SparkServeDenseNvfp4Plan plan = {0};
