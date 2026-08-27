@@ -1,7 +1,7 @@
 use sparkserve_runtime::ffi::{
-    CoherentRegion, CoherentRegionConfig, CoherentRegionView, FABRIC_ABI_VERSION,
-    COHERENT_REGION_PREFAULT, sparkserve_coherent_region_create,
-    sparkserve_coherent_region_destroy, sparkserve_coherent_region_view,
+    COHERENT_REGION_PREFAULT, CoherentRegion, CoherentRegionConfig, CoherentRegionView,
+    FABRIC_ABI_VERSION, sparkserve_coherent_region_create, sparkserve_coherent_region_destroy,
+    sparkserve_coherent_region_view,
 };
 use sparkserve_runtime::uring::{FixedBufferReader, FixedRead};
 use std::ffi::CStr;
@@ -84,9 +84,8 @@ fn main() -> io::Result<()> {
     let payload_bytes = usize::try_from(view.payload_bytes)
         .map_err(|_| io::Error::other("coherent payload exceeds usize"))?;
     // SAFETY: the region exclusively lends its writable slab to this reader.
-    let slab = unsafe {
-        std::slice::from_raw_parts_mut(view.host_pointer.cast::<u8>(), payload_bytes)
-    };
+    let slab =
+        unsafe { std::slice::from_raw_parts_mut(view.host_pointer.cast::<u8>(), payload_bytes) };
     let mut reader = FixedBufferReader::new(slab, 2, 2)?;
     let (path, file) = scratch_file()?;
     let stats = reader.read(&[
