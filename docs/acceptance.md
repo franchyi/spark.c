@@ -91,7 +91,9 @@ XQA launches, and owns the native mapping until scheduler teardown. The GB10
 native smoke test allocates this full QSA arena successfully. This document
 now also has a Rust-owned native stream/event smoke in which the borrowed SGLang
 packer feeds FlashInfer XQA at the same fixed addresses; packed key, value,
-length, and attention output all have zero mismatches. This document remains a
+length, and attention output all have zero mismatches. Its reusable CUDA fence
+owns the pending scheduler lease and exposes it only after the recorded event
+completes, so host code cannot publish an in-flight arena accidentally. This document remains a
 completion checklist: PLE storage-thread/CUDA-event overlap, top-k/index-prep
 integration into the joined QSA/full-token graph, tokenizer/server, GGUF, GLM
 graph, and end-to-end continuation gates are not implied to be finished by this

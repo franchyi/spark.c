@@ -887,6 +887,169 @@ impl fmt::Display for QsaCoherentArenaError {
 #[cfg(feature = "native-fabric")]
 impl std::error::Error for QsaCoherentArenaError {}
 
+#[cfg(feature = "native-fabric")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QsaCudaPending {
+    WorkspaceZero(QsaWorkspaceZeroLease),
+    Pack(QsaPackLease),
+    Decode(QsaDecodeLease),
+}
+
+#[cfg(feature = "native-fabric")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QsaCudaCompletion {
+    WorkspaceReady,
+    PackReady(QsaReadyLease),
+    DecodeComplete,
+}
+
+/// Binds one reusable CUDA event to exactly one QSA scheduler lease.
+///
+/// The fixed arena permits only one zero/pack/decode writer at a time, so one
+/// fence is sufficient. A lease is published only after `query` reports CUDA
+/// completion or `wait` synchronizes the recorded event.
+#[cfg(feature = "native-fabric")]
+pub struct QsaCudaFence {
+    event: crate::cuda::CudaEventOwner,
+    pending: Option<QsaCudaPending>,
+}
+
+#[cfg(feature = "native-fabric")]
+impl QsaCudaFence {
+    pub fn create() -> Result<Self, QsaCudaFenceError> {
+        Ok(Self {
+            event: crate::cuda::CudaEventOwner::create()?,
+            pending: None,
+        })
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn record_workspace_zero(
+        &mut self,
+        stream: &mut crate::cuda::CudaStreamOwner,
+        lease: QsaWorkspaceZeroLease,
+    ) -> Result<(), QsaCudaFenceError> {
+        self.record(stream, QsaCudaPending::WorkspaceZero(lease))
+    }
+
+    pub fn record_pack(
+        &mut self,
+        stream: &mut crate::cuda::CudaStreamOwner,
+        lease: QsaPackLease,
+    ) -> Result<(), QsaCudaFenceError> {
+        self.record(stream, QsaCudaPending::Pack(lease))
+    }
+
+    pub fn record_decode(
+        &mut self,
+        stream: &mut crate::cuda::CudaStreamOwner,
+        lease: QsaDecodeLease,
+    ) -> Result<(), QsaCudaFenceError> {
+        self.record(stream, QsaCudaPending::Decode(lease))
+    }
+
+    pub fn poll(
+        &mut self,
+        scheduler: &mut QsaArenaScheduler,
+    ) -> Result<Option<QsaCudaCompletion>, QsaCudaFenceError> {
+        if self.pending.is_none() {
+            return Err(QsaCudaFenceError::NoPendingEvent);
+        }
+        if !self.event.query()? {
+            return Ok(None);
+        }
+        self.publish(scheduler).map(Some)
+    }
+
+    pub fn wait(
+        &mut self,
+        scheduler: &mut QsaArenaScheduler,
+    ) -> Result<QsaCudaCompletion, QsaCudaFenceError> {
+        if self.pending.is_none() {
+            return Err(QsaCudaFenceError::NoPendingEvent);
+        }
+        self.event.synchronize()?;
+        self.publish(scheduler)
+    }
+
+    fn record(
+        &mut self,
+        stream: &mut crate::cuda::CudaStreamOwner,
+        pending: QsaCudaPending,
+    ) -> Result<(), QsaCudaFenceError> {
+        if self.pending.is_some() {
+            return Err(QsaCudaFenceError::EventBusy);
+        }
+        self.event.record(stream)?;
+        self.pending = Some(pending);
+        Ok(())
+    }
+
+    fn publish(
+        &mut self,
+        scheduler: &mut QsaArenaScheduler,
+    ) -> Result<QsaCudaCompletion, QsaCudaFenceError> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or(QsaCudaFenceError::NoPendingEvent)?;
+        match pending {
+            QsaCudaPending::WorkspaceZero(lease) => {
+                scheduler.complete_workspace_zero(lease)?;
+                Ok(QsaCudaCompletion::WorkspaceReady)
+            }
+            QsaCudaPending::Pack(lease) => Ok(QsaCudaCompletion::PackReady(
+                scheduler.complete_pack(lease)?,
+            )),
+            QsaCudaPending::Decode(lease) => {
+                scheduler.complete_decode(lease)?;
+                Ok(QsaCudaCompletion::DecodeComplete)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "native-fabric")]
+#[derive(Debug)]
+pub enum QsaCudaFenceError {
+    Runtime(crate::cuda::CudaRuntimeError),
+    Schedule(QsaScheduleError),
+    EventBusy,
+    NoPendingEvent,
+}
+
+#[cfg(feature = "native-fabric")]
+impl From<crate::cuda::CudaRuntimeError> for QsaCudaFenceError {
+    fn from(error: crate::cuda::CudaRuntimeError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+#[cfg(feature = "native-fabric")]
+impl From<QsaScheduleError> for QsaCudaFenceError {
+    fn from(error: QsaScheduleError) -> Self {
+        Self::Schedule(error)
+    }
+}
+
+#[cfg(feature = "native-fabric")]
+impl fmt::Display for QsaCudaFenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime(error) => error.fmt(formatter),
+            Self::Schedule(error) => error.fmt(formatter),
+            Self::EventBusy => formatter.write_str("QSA CUDA fence already owns a lease"),
+            Self::NoPendingEvent => formatter.write_str("QSA CUDA fence has no pending lease"),
+        }
+    }
+}
+
+#[cfg(feature = "native-fabric")]
+impl std::error::Error for QsaCudaFenceError {}
+
 fn align_up(value: usize, alignment: usize) -> Result<usize, QsaPlanError> {
     let add = alignment.checked_sub(1).ok_or(QsaPlanError::SizeOverflow)?;
     value

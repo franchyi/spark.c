@@ -1,10 +1,12 @@
 use sparkserve_runtime::coherent::CoherentRegionOwner;
-use sparkserve_runtime::cuda::{CudaEventOwner, CudaStreamOwner, status_result};
+use sparkserve_runtime::cuda::{CudaStreamOwner, status_result};
 use sparkserve_runtime::ffi::{
     COHERENT_REGION_PREFAULT, DeviceCaps, QsaDecodeArgs, QsaDecodePlan, QsaKvPackArgs,
     QsaKvPackPlan, sparkserve_qsa_decode_launch, sparkserve_qsa_kv_pack_launch,
 };
-use sparkserve_runtime::qsa::{QsaArenaPhase, QsaCoherentArena, QsaSparseDecodePlan};
+use sparkserve_runtime::qsa::{
+    QsaArenaPhase, QsaCoherentArena, QsaCudaCompletion, QsaCudaFence, QsaSparseDecodePlan,
+};
 use std::ffi::c_void;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -180,7 +182,7 @@ fn main() -> io::Result<()> {
     let mut arena = QsaCoherentArena::allocate(plan, vec![1], COHERENT_REGION_PREFAULT)
         .map_err(io::Error::other)?;
     let mut stream = CudaStreamOwner::create().map_err(io::Error::other)?;
-    let mut event = CudaEventOwner::create().map_err(io::Error::other)?;
+    let mut fence = QsaCudaFence::create().map_err(io::Error::other)?;
 
     let zero = arena
         .scheduler_mut()
@@ -195,12 +197,15 @@ fn main() -> io::Result<()> {
         )
     }
     .map_err(io::Error::other)?;
-    event.record(&mut stream).map_err(io::Error::other)?;
-    event.synchronize().map_err(io::Error::other)?;
-    arena
-        .scheduler_mut()
-        .complete_workspace_zero(zero)
+    fence
+        .record_workspace_zero(&mut stream, zero)
         .map_err(io::Error::other)?;
+    assert_eq!(
+        fence
+            .wait(arena.scheduler_mut())
+            .map_err(io::Error::other)?,
+        QsaCudaCompletion::WorkspaceReady
+    );
 
     // The immutable block table is scheduler metadata, initialized once while
     // the arena is idle. The borrowed packer fills K/V and valid lengths.
@@ -249,12 +254,15 @@ fn main() -> io::Result<()> {
         let _ = arena.scheduler_mut().abort_pack(pack);
         return Err(io::Error::other(error));
     }
-    event.record(&mut stream).map_err(io::Error::other)?;
-    event.synchronize().map_err(io::Error::other)?;
-    let ready = arena
-        .scheduler_mut()
-        .complete_pack(pack)
+    fence
+        .record_pack(&mut stream, pack)
         .map_err(io::Error::other)?;
+    let QsaCudaCompletion::PackReady(ready) = fence
+        .wait(arena.scheduler_mut())
+        .map_err(io::Error::other)?
+    else {
+        return Err(io::Error::other("QSA pack fence returned wrong completion"));
+    };
 
     let decode = arena
         .scheduler_mut()
@@ -288,12 +296,15 @@ fn main() -> io::Result<()> {
         let _ = arena.scheduler_mut().abort_decode(decode);
         return Err(io::Error::other(error));
     }
-    event.record(&mut stream).map_err(io::Error::other)?;
-    event.synchronize().map_err(io::Error::other)?;
-    arena
-        .scheduler_mut()
-        .complete_decode(decode)
+    fence
+        .record_decode(&mut stream, decode)
         .map_err(io::Error::other)?;
+    assert_eq!(
+        fence
+            .wait(arena.scheduler_mut())
+            .map_err(io::Error::other)?,
+        QsaCudaCompletion::DecodeComplete
+    );
     assert_eq!(arena.scheduler().phase(), QsaArenaPhase::Idle);
 
     // SAFETY: both CUDA events completed and the scheduler released the arena.
@@ -320,7 +331,6 @@ fn main() -> io::Result<()> {
         ));
     }
 
-    event.close().map_err(io::Error::other)?;
     stream.close().map_err(io::Error::other)?;
     inputs.close().map_err(io::Error::other)?;
     drop(arena);

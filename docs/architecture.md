@@ -186,7 +186,10 @@ coherent allocation, not separate workspaces. Rust advances an epoch-checked
 only after the matching CUDA completion event. A partial XQA failure returns
 the scheduler to `workspace-needs-zero`, because the donor's multi-block atomic
 semaphores may have advanced. The mapping itself is held by a unique Rust owner
-around the native `mmap` plus CUDA registration handle. Rust therefore owns
+around the native `mmap` plus CUDA registration handle. One reusable Rust
+`QsaCudaFence` binds that event to exactly one epoch-checked lease and is the
+only production path that can publish zero, pack, or decode completion; dropping
+an unfinished path leaves the arena quarantined rather than reusable. Rust therefore owns
 logical-to-physical KV maps, residency, mapping lifetime, graph buckets, and
 replay; FlashInfer owns only attention arithmetic. This is no longer only a
 state-machine invariant: the Rust native smoke uses opaque non-blocking CUDA

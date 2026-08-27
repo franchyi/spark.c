@@ -157,7 +157,10 @@ Rust lease machine prevents repack while selected-K/V packing or XQA owns that
 allocation, rejects stale and foreign completions, and forces a semaphore reset
 after any failed XQA launch. The native `mmap`/CUDA registration handle also has
 a unique Rust owner, so the stable device mapping cannot be freed independently
-of its scheduler. The production-shaped Rust smoke now submits a real
+of its scheduler. A reusable `QsaCudaFence` owns both the pending scheduler lease
+and its timing-disabled CUDA event; only a successful event query or wait can
+publish `workspace-ready`, `pack-ready`, or `decode-complete`. The
+production-shaped Rust smoke now submits a real
 asynchronous workspace zero, launches the borrowed SGLang selected-K/V packer,
 records its CUDA completion, transfers the same fixed addresses to FlashInfer
 XQA, and records decode completion. On GB10 the joined path matches the oracle's
