@@ -1,0 +1,61 @@
+schema_version = 1
+
+[[source]]
+id = "flashinfer-mm-fp4"
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "external-oracle"
+status = "contract-defined-not-linked"
+entrypoint = "flashinfer.mm_fp4"
+notes = "Observed in the live Qwen3.8 27B SGLang image on GB10. First dense NVFP4 backend candidate."
+
+[[source]]
+id = "sglang-qwen38-27b-oracle"
+repository = "https://github.com/sgl-project/sglang"
+revision = "c4271c3fe1262fc2adbd162c33b25de5255251c5"
+license = "Apache-2.0"
+mode = "semantic-oracle"
+status = "running-remote"
+entrypoint = "sglang.srt.layers.quantization.modelopt_quant.ModelOptFp4LinearMethod"
+notes = "Defines padding, block-scale interleave, alpha, and activation quantization behavior."
+
+[[source]]
+id = "sglang-qwen4-exp-oracle"
+repository = "https://github.com/sgl-project/sglang"
+revision = "73a255206f916366c8d26d4022f82ddfb0ab558d"
+license = "Apache-2.0"
+mode = "semantic-oracle"
+status = "reference-image-pending"
+entrypoint = "python/sglang/srt/models/qwen4_exp.py"
+notes = "Initial Qwen3.8 Flash-Next implementation from PR 36497."
+
+[[source]]
+id = "ds4-minimal-runtime-pattern"
+repository = "https://github.com/antirez/ds4"
+revision = "c1d4597a80e300b803dc642519718f2c999589da"
+license = "MIT"
+mode = "design-oracle"
+status = "inspected"
+entrypoint = "cuda/mmq/VENDOR.md"
+notes = "Reference for vendoring selected CUDA kernels behind a small raw-pointer C ABI."
+
+[[source]]
+id = "llama-cpp-ggml-cuda-mmq"
+repository = "https://github.com/ggml-org/llama.cpp"
+revision = "5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a"
+license = "MIT"
+mode = "planned-vendor"
+status = "not-copied"
+entrypoint = "ggml/src/ggml-cuda/mmq.cuh"
+notes = "Pin proven by ds4 dense and routed-MoE parity fixtures. Import one GGUF format at a time."
+
+[[source]]
+id = "cutlass-sm121-nvfp4"
+repository = "https://github.com/NVIDIA/cutlass"
+revision = "UNFROZEN"
+license = "BSD-3-Clause"
+mode = "planned-vendor"
+status = "blocked-on-pin-and-benchmark"
+entrypoint = "examples/79_blackwell_geforce_gemm/79a_blackwell_geforce_nvfp4_bf16_gemm.cu"
+notes = "Do not copy until a tested commit and file hashes are frozen."

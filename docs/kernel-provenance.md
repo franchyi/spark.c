@@ -1,0 +1,182 @@
+# Kernel provenance and oracle plan
+
+SparkServe does not treat an inference framework as a single kernel library.
+It separates three roles:
+
+1. **semantic oracle** — defines the model graph, tensor names, state updates,
+   routing, masks, and quantization conventions;
+2. **kernel donor** — supplies a CUDA implementation with a compatible license
+   and a working SM121 path;
+3. **runtime adapter** — our small C ABI over raw pointers, shapes, strides, and
+   CUDA streams.
+
+Reusing a kernel reduces arithmetic risk, but does not prove model accuracy. A
+correct GEMM with a wrong scale inversion, weight permutation, expert order,
+position, cache write, or recurrent-state stride still produces incorrect
+tokens. Every adopted kernel therefore carries its complete tensor contract and
+is tested first in the upstream layout.
+
+## Inspected reference pins
+
+| Reference | Pin observed | Role |
+| --- | --- | --- |
+| Live Qwen3.8 27B SGLang image | SGLang build `c4271c3fe1262fc2adbd162c33b25de5255251c5`; package `0.0.0.dev0+qwen38.27b.g561c8f3`; FlashInfer `0.6.18` at `906181e3f4cf4bcc81835fb480db4011bbd80b62` | Dense NVFP4 and hybrid GDN execution oracle on this GB10 |
+| SGLang Qwen3.8 Flash-Next support | PR `sgl-project/sglang#36497`, initial implementation `73a255206f916366c8d26d4022f82ddfb0ab558d`; current integration helper `02d38b77db92699e5d4f1a78226bf711e9cc762a` | Qwen4-exp graph, PLE, QSA, GDN, mHC, MTP, and memory-state oracle |
+| DwarfStar / `ds4.c` | `c1d4597a80e300b803dc642519718f2c999589da` | Minimal-runtime design and GGUF validation oracle |
+| llama.cpp kernels vendored by `ds4.c` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a` | Q8/Q2/IQ MMQ implementation donor |
+
+These are evidence pins, not automatic dependency pins. A source becomes a
+SparkServe dependency only after its license, file hash, build flags, SM121
+behavior, and parity fixture are recorded in our vendor manifest.
+
+The machine-readable source state is tracked in
+[`third_party/kernel-sources.toml`](../third_party/kernel-sources.toml). The
+milestone-zero dense contract is declared in
+[`csrc/include/sparkserve/kernel_api.h`](../csrc/include/sparkserve/kernel_api.h)
+and mirrored by the Rust runtime. A source marked `UNFROZEN` cannot be copied.
+
+## What SGLang actually uses
+
+The live 27B stack is a dispatcher over multiple kernel families rather than a
+monolithic implementation:
+
+- ModelOpt describes the serialized NVFP4 checkpoint contract.
+- Dense NVFP4 linears dynamically quantize activations to packed FP4 and call
+  FlashInfer `mm_fp4` through SGLang's `fp4_gemm` wrapper.
+- The checkpoint stores two FP4 values per `uint8`, FP8-E4M3 block scales for
+  groups of 16, and FP32 global scales.
+- Before the CUTLASS/FlashInfer call, SGLang pads K and N, transforms the scale
+  tensor into a block-interleaved layout, computes
+  `alpha = input_scale * weight_scale_2`, and uses
+  `input_scale_inv = 1 / input_scale` for activation quantization.
+- The fused dense MLP path can combine SiLU, multiply, and FP4 quantization so
+  the down projection consumes pre-quantized `(fp4, scale)` input.
+- Full attention and sampling use FlashInfer; the current hybrid GDN path uses
+  Triton kernels; decode and speculative verify use CUDA graphs.
+
+For NVFP4 MoE, SGLang's FlashInfer-CUTLASS adapter makes the hidden contract
+visible:
+
+- `w13`: `[experts, 2 * intermediate, hidden / 2]`, packed `uint8`;
+- `w2`: `[experts, hidden, intermediate / 2]`, packed `uint8`;
+- block scales: FP8-E4M3, group size 16;
+- checkpoint global scales are inverted during preparation;
+- gate/up order and scale tensors may be reordered;
+- block scales are swizzled before launch;
+- routing supplies exact `topk_ids` and `topk_weights` to the fused MoE call;
+- output is normally BF16, and the routed scaling factor is applied according
+  to the runner contract.
+
+Flash-Next adds model-specific pieces that must be considered separately:
+
+- QSA index construction, sparse attention metadata, compressed KV addressing,
+  and sparse decode;
+- GDN fused projections and recurrent-state updates;
+- hyperconnection mix/combine;
+- grouped Gemma RMSNorm and fast top-k;
+- PLE n-gram lookup, gather, scale, and accumulation;
+- Qwen4-exp model/MTP logic and state-pool integration.
+
+Those pieces are the main reason SGLang remains the semantic oracle even when
+SparkServe does not ship SGLang's Python scheduler.
+
+## What `ds4.c` actually reuses
+
+`ds4.c` demonstrates the packaging pattern we should copy for GGUF:
+
+- about 11,000 lines of llama.cpp `ggml-cuda` MMQ implementation are vendored
+  at one commit;
+- about 600 lines of stubs and adapters replace the full GGML runtime;
+- the upstream graph dispatcher is not vendored;
+- the adapter calls `mul_mat_q_case<T>` directly with raw pointers, dimensions,
+  strides, and a stream;
+- Q8_0, Q2_K, and IQ2_XXS dense paths have CPU-reference parity fixtures;
+- routed-MoE `_id` variants have separate parity fixtures;
+- source, commit, license, file status, line counts, symbol replacements, and
+  re-sync instructions are recorded in `cuda/mmq/VENDOR.md`.
+
+The vendored MMQ tier does not depend on CUDA graphs, although the larger ds4
+runtime uses its own graphs for decode. This separation is useful: a kernel
+library must not own our scheduler.
+
+The model-specific part of `ds4_cuda.cu` is not a general Qwen donor. It includes
+custom DeepSeek/GLM attention, recurrent, routing, hyperconnection, MoE, and
+MXFP4 paths. Generic primitives such as norms, RoPE, quantization, and top-k are
+benchmark candidates, but they must prove the Qwen tensor contract independently.
+
+`ds4.c` also documents why byte equality is the wrong universal gate: its MMQ
+prefill changes FP32 reduction order relative to dequantize-plus-cuBLAS, causing
+ULP-scale logit drift. It validates continuation and top-logprob fixtures while
+retaining a switch back to the legacy dispatch.
+
+## Adoption matrix
+
+| SparkServe operation | Semantic oracle | Initial implementation candidate | Reuse mode | Required gate |
+| --- | --- | --- | --- | --- |
+| Qwen3.8 27B dense NVFP4 linear | live SGLang ModelOpt path | FlashInfer `mm_fp4` or direct CUTLASS 79a instantiation | wrap first; specialize later | packed bytes/scales exact, real-tensor output parity, greedy-token parity |
+| Flash-Next routed NVFP4 MoE | SGLang Qwen4-exp + ModelOpt | FlashInfer CUTLASS fused MoE / CUTLASS grouped GEMM | wrap with a frozen raw C contract | exact expert ids/order/weights, two GEMMs and activation checked separately, then fused parity |
+| GDN projection and recurrence | SGLang Qwen4-exp/Transformers | port fixed-shape SGLang Triton/CUDA algorithms | reimplement behind golden tests | exact state addressing; layer-state and multi-step sequence parity |
+| QSA indexer and sparse attention | SGLang QSA backend | SGLang JIT CUDA indexer plus proven SM121 sparse-decode kernel | vendor small CUDA pieces; wrap external attention kernel | exact selected indices/masks/cache writes; dense-attention comparison on small cases |
+| Hyperconnection mix/combine | SGLang Qwen4-exp | small SGLang CUDA/Triton kernels | port or vendor after license audit | per-stream output and residual-state parity |
+| PLE lookup | SGLang Qwen4-exp + checkpoint | local mmap-aware gather/scale/accumulate kernel | reimplement for the one-copy store | exact row ids and scale; BF16 result against SGLang for cold/hot rows |
+| RMSNorm/RoPE/top-k/sampling | SGLang, FlashInfer, ds4 | smallest fastest proven candidate | benchmark and adopt independently | exact discrete ids; numerical parity for continuous outputs |
+| MTP/speculative commit | SGLang Qwen4-exp | local scheduler using shared forward kernels | reimplement state machine | target-only greedy identity; verifier logit and committed-state parity |
+| GGUF Q8/Q4/Q2/IQ | llama.cpp and ds4 | selected `ggml-cuda` MMQ files | ds4-style pinned vendor + raw C shim | per-format dense/MoE parity, llama continuation fixtures, performance within target |
+
+## Accuracy ladder
+
+A kernel is promoted only through all applicable levels:
+
+1. **Artifact identity:** checkpoint revision, tensor names, shapes, dtypes,
+   packed-byte hashes, scale convention, and tokenizer revision are frozen.
+2. **Layout identity:** pre-launch transformed weights/scales are compared with
+   the oracle. Permutations, swizzles, padding, and scale inversion are explicit
+   test outputs rather than loader side effects.
+3. **Operator parity:** isolated kernels run on synthetic edge cases and slices
+   from the real checkpoint. Integer indices, routing, masks, and addresses are
+   exact. Floating-point tolerances are defined per operation and dtype.
+4. **Layer/state parity:** one complete GDN, QSA, or MoE layer is compared before
+   and after every persistent-state update over multiple tokens.
+5. **Logit parity:** record max/mean error, top-k overlap, top-1 agreement, and
+   first divergence under teacher forcing. Do not rely only on cosine similarity.
+6. **Continuation parity:** greedy tokens must match for the resident milestone
+   unless a documented reduction-order change is accepted by a stronger
+   continuation/top-logprob quality gate.
+7. **Task quality and speed:** run the same evaluation and benchmark corpus on
+   the same checkpoint, hardware, context frontiers, and thermal state.
+
+Every optimized path keeps a runtime kill switch until it passes levels 1-7.
+
+## Vendor record required for every copied kernel
+
+Each imported source group gets a `VENDOR.md` and machine-readable manifest with:
+
+- upstream repository, immutable commit, original paths, and file SHA-256;
+- license/SPDX identifier and retained notices;
+- copied verbatim versus patched/generated files;
+- compiler, CUDA version, architecture flags, and feature macros;
+- raw C ABI including dtype, layout, alignment, ownership, stream, and workspace;
+- supported shapes and explicit rejection behavior;
+- numerical policy, reference implementation, fixtures, and tolerances;
+- GB10 benchmark evidence and fallback implementation;
+- re-sync steps and a diff-cleanliness check.
+
+This preserves the useful part of SGLang and ds4—known algorithms and tested
+kernels—without importing either framework's scheduler, allocator, or graph.
+
+## Immediate implementation order
+
+1. Freeze a small corpus of inputs, packed weights/scales, intermediate outputs,
+   logits, and greedy continuations from the live 27B SGLang service.
+2. Define the dense NVFP4 raw C ABI to match FlashInfer `mm_fp4`, including the
+   block-interleaved scale layout and alpha convention.
+3. Wrap the existing kernel unchanged and prove parity before replacing its
+   Python/Torch launch layer.
+4. Repeat for Flash-Next MoE once the reference image and checkpoint are ready;
+   keep routing/top-k as a separately tested stage.
+5. Lift the ds4 llama-MMQ subset for the first GGUF format only, preserving its
+   upstream pin and parity-test structure.
+
+Do not begin with fusion. First reproduce the unfused SGLang graph and its
+intermediates; fuse only adjacent operations whose joint contract is already
+covered by the golden harness.

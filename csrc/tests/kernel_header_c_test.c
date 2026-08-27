@@ -1,0 +1,15 @@
+#include "sparkserve/kernel_api.h"
+
+#include <stddef.h>
+
+_Static_assert(SPARKSERVE_KERNEL_ABI_VERSION == 1u, "unexpected ABI version");
+_Static_assert(sizeof(SparkServeDenseNvfp4Plan) == 80u,
+               "C plan layout drifted");
+
+int main(void) {
+  SparkServeDenseNvfp4Plan plan = {0};
+  plan.struct_size = (uint32_t)sizeof(plan);
+  plan.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  plan.output_dtype = SPARKSERVE_DTYPE_BF16;
+  return plan.output_dtype == SPARKSERVE_DTYPE_BF16 ? 0 : 1;
+}

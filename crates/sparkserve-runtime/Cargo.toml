@@ -1,0 +1,12 @@
+[package]
+name = "sparkserve-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Minimal Rust control plane for the SparkServe GB10 inference runtime"
+
+[[bin]]
+name = "sparkserve-runtime"
+path = "src/main.rs"
+
+[dependencies]
