@@ -102,6 +102,16 @@ entrypoint = "python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh"
 notes = "Qwen QSA block-top-k 512 radix selection adapted verbatim at the arithmetic level. TVM-FFI, sgl-kernel wrappers, PDL dispatch, allocation, and framework ownership are removed; Rust owns score ranges and fixed output buffers."
 
 [[source]]
+id = "sglang-qsa-block-expand"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-edge-fixture-parity-passed"
+entrypoint = "python/sglang/srt/layers/attention/qsa/kernel.py"
+notes = "Fixed Qwen compressed-block to logical-token expansion with ratio-four incomplete-tail insertion and contiguous valid-prefix output. Torch/Triton allocation and dispatch are removed; Rust owns coherent buffers and the selection-stage lease."
+
+[[source]]
 id = "sglang-qsa-index-prep"
 repository = "https://github.com/sgl-project/sglang"
 revision = "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"

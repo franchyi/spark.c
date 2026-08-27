@@ -147,8 +147,9 @@ reference implementation. This is a correctness kernel; profiling and fusion
 with QKV extraction come after real-tensor parity with SGLang.
 
 QSA sparse decode now borrows its proven arithmetic rather than reimplementing
-attention. SGLang-derived fused index prep, radix top-k, and selected-K/V pack
-feed FlashInfer's pinned BF16 XQA kernel through raw C ABIs. On GB10, all packed
+attention. SGLang-derived fused index prep, radix top-k, block-to-token
+expansion, and selected-K/V pack feed FlashInfer's pinned BF16 XQA kernel
+through raw C ABIs. On GB10, all packed
 K/V bits and the batch-one attention output match their framework oracles;
 the XQA launch itself takes 7.55 microseconds. Rust owns the fixed 64-token page
 tables, graph-bucket addresses, valid lengths, and 128-MiB workspace split. One
@@ -166,12 +167,15 @@ records its CUDA completion, transfers the same fixed addresses to FlashInfer
 XQA, and records decode completion. On GB10 the joined path matches the oracle's
 packed key, packed value, valid length, and attention output with zero BF16
 mismatches and performs no CPU-to-GPU copy. The same framework-free shared
-library now links the borrowed SGLang fused index-prep and radix top-k kernels.
-A second Rust smoke runs both from CUDA-registered coherent slabs: all Q output,
-persistent key state, RoPE state, and compressed-key elements are bit-exact, and
-all four 65,536-column top-k rows select the oracle's exact 512-index sets. This
-validates every borrowed QSA operator in the shipping library without claiming
-the still-missing score-GEMM and block-to-token selection glue are joined.
+library now links the borrowed SGLang fused index-prep, radix top-k, and
+block-to-token expansion kernels. A second Rust smoke runs all three from
+CUDA-registered coherent slabs: all Q output, persistent key state, RoPE state,
+and compressed-key elements are bit-exact; all four 65,536-column top-k rows
+select the oracle's exact 512-index sets; and all 12,306 expanded logical-token
+indices match, including incomplete-tail and padding cases. The direct expansion
+kernel takes 4.10 microseconds on GB10. This validates all five borrowed QSA
+donors in the shipping library without claiming the still-missing score-MQA
+stage or full semantic QSA layer is complete.
 Rust now enforces that boundary with an allocation-free six-stage token
 scheduler: index-prep, score, block-top-k, selection-expand, K/V-pack, then XQA.
 No caller can jump from top-k directly to pack. One reusable CUDA fence

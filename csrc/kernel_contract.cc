@@ -26,6 +26,9 @@
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_TOPK
 #include "internal/qsa_topk_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_EXPAND
+#include "internal/qsa_expand_backend.h"
+#endif
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_INDEX_PREP
 #include "internal/qsa_index_prep_backend.h"
 #endif
@@ -220,6 +223,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("QSA K/V-pack backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_FLASHINFER_XQA_DECODE:
       return Invalid("FlashInfer XQA backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_QSA_EXPAND:
+      return Invalid("QSA expansion backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1046,6 +1051,88 @@ extern "C" SparkServeStatus sparkserve_qsa_topk_launch(
   return sparkserve_sglang_qsa_topk_cuda_launch(args);
 #else
   return Unavailable("SGLang QSA top-k donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_expand_validate(
+    const SparkServeQsaExpandPlan* plan) {
+  if (plan == nullptr) return Invalid("QSA expansion plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->rows == 0 || plan->rows > 1U << 20) {
+    return Invalid("QSA expansion row count is invalid");
+  }
+  if (plan->block_topk != 512 || plan->compress_ratio != 4 ||
+      plan->token_topk != 2048 || plan->final_topk != 2051) {
+    return Unsupported("Qwen3.8 Flash-Next QSA expansion geometry is required");
+  }
+  if (plan->output_dtype != SPARKSERVE_DTYPE_INT32) {
+    return Unsupported("QSA expansion output must be INT32");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_SGLANG_QSA_EXPAND) {
+    return Invalid("unknown QSA expansion backend");
+  }
+  if (!CanMultiply(plan->rows,
+                   static_cast<uint64_t>(plan->block_topk) * sizeof(int32_t)) ||
+      !CanMultiply(plan->rows,
+                   static_cast<uint64_t>(plan->final_topk) * sizeof(int32_t))) {
+    return Invalid("QSA expansion buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_expand_query(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaExpandPlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first QSA expansion donor is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_qsa_expand_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_SGLANG_QSA_EXPAND;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "sglang-qsa-block-to-token-expand";
+  info->source_revision =
+      "sglang@d91c3682b0b429e4c70df63cd57f819588ce29b0";
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_EXPAND
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_expand_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaExpandArgs* args) {
+  if (args == nullptr) return Invalid("QSA expansion arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query_status =
+      sparkserve_qsa_expand_query(caps, &args->plan, &info);
+  if (query_status.code != SPARKSERVE_STATUS_OK) return query_status;
+  if (args->block_indices == nullptr || args->query_positions == nullptr ||
+      args->sequence_lengths == nullptr || args->logical_indices == nullptr) {
+    return Invalid("QSA expansion pointers cannot be null");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_EXPAND
+  return sparkserve_sglang_qsa_expand_cuda_launch(args);
+#else
+  return Unavailable("SGLang QSA expansion donor is not linked");
 #endif
 }
 

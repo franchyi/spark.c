@@ -357,6 +357,44 @@ int main() {
   assert(sparkserve_qsa_topk_validate(&qsa_topk).code ==
          SPARKSERVE_STATUS_UNSUPPORTED);
 
+  SparkServeQsaExpandPlan qsa_expand = {
+      sizeof(SparkServeQsaExpandPlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      16,
+      512,
+      4,
+      2048,
+      2051,
+      SPARKSERVE_DTYPE_INT32,
+      SPARKSERVE_BACKEND_AUTO,
+      0,
+  };
+  assert(sparkserve_qsa_expand_validate(&qsa_expand).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo qsa_expand_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_qsa_expand_query(&caps, &qsa_expand, &qsa_expand_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(qsa_expand_info.backend == SPARKSERVE_BACKEND_SGLANG_QSA_EXPAND);
+  assert(qsa_expand_info.available == 0);
+  int64_t qsa_query_position = 0;
+  SparkServeQsaExpandArgs qsa_expand_args = {};
+  qsa_expand_args.struct_size = sizeof(qsa_expand_args);
+  qsa_expand_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  qsa_expand_args.plan = qsa_expand;
+  qsa_expand_args.block_indices = &qsa_index;
+  qsa_expand_args.query_positions = &qsa_query_position;
+  qsa_expand_args.sequence_lengths = &qsa_length;
+  qsa_expand_args.logical_indices = &qsa_index;
+  assert(sparkserve_qsa_expand_launch(&caps, &qsa_expand_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  qsa_expand.final_topk = 2048;
+  assert(sparkserve_qsa_expand_validate(&qsa_expand).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeQsaIndexPrepPlan qsa_prep = {
       sizeof(SparkServeQsaIndexPrepPlan),
       SPARKSERVE_KERNEL_ABI_VERSION,

@@ -200,6 +200,32 @@ def test_sglang_qsa_index_prep_donor_is_pinned_and_hashed() -> None:
     ]
 
 
+def test_sglang_qsa_expand_donor_is_pinned_and_hashed() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qsa-block-expand"
+    )
+    assert donor["revision"] == "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["mode"] == "source-adaptation"
+    assert donor["status"].startswith("linked-raw-cuda-sm121-")
+    assert donor["entrypoint"] == (
+        "python/sglang/srt/layers/attention/qsa/kernel.py"
+    )
+
+    vendor = ROOT / "third_party" / "sglang-qsa-expand"
+    assert (vendor / "VENDOR.md").is_file()
+    hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
+    assert hashes == [
+        "5482e38d30bfaf1624ec0625b4896cbb395a1637f75c183c8ca723c9f6055ff8  "
+        "python/sglang/srt/layers/attention/qsa/kernel.py"
+    ]
+
+
 def test_sglang_qsa_kv_pack_donor_is_pinned_and_hashed() -> None:
     payload = tomllib.loads(
         (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")

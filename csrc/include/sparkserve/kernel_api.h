@@ -61,6 +61,9 @@ typedef enum SparkServeKernelBackend {
   SPARKSERVE_BACKEND_SGLANG_QSA_KV_PACK = 10,
   // FlashInfer XQA BF16 paged decode specialized to Qwen QSA on SM121.
   SPARKSERVE_BACKEND_FLASHINFER_XQA_DECODE = 11,
+  // Fixed-width compressed-block to logical-token expansion adapted from
+  // SGLang's QSA Triton kernel.
+  SPARKSERVE_BACKEND_SGLANG_QSA_EXPAND = 12,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -391,6 +394,33 @@ typedef struct SparkServeQsaTopkArgs {
   void* cuda_stream;
 } SparkServeQsaTopkArgs;
 
+typedef struct SparkServeQsaExpandPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t rows;
+  uint32_t block_topk;
+  uint32_t compress_ratio;
+  uint32_t token_topk;
+  uint32_t final_topk;
+  uint32_t output_dtype;
+  uint32_t requested_backend;
+  uint32_t reserved;
+} SparkServeQsaExpandPlan;
+
+typedef struct SparkServeQsaExpandArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeQsaExpandPlan plan;
+  // INT32 [rows,block_topk]. Valid block ids precede -1 padding.
+  const int32_t* block_indices;
+  // INT64 [rows] and INT32 [rows].
+  const int64_t* query_positions;
+  const int32_t* sequence_lengths;
+  // INT32 [rows,final_topk]. Valid logical ids precede -1 padding.
+  int32_t* logical_indices;
+  void* cuda_stream;
+} SparkServeQsaExpandArgs;
+
 typedef struct SparkServeQsaIndexPrepPlan {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -678,6 +708,18 @@ SparkServeStatus sparkserve_qsa_topk_query(
 SparkServeStatus sparkserve_qsa_topk_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeQsaTopkArgs* args);
+
+SparkServeStatus sparkserve_qsa_expand_validate(
+    const SparkServeQsaExpandPlan* plan);
+
+SparkServeStatus sparkserve_qsa_expand_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaExpandPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_qsa_expand_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaExpandArgs* args);
 
 SparkServeStatus sparkserve_qsa_index_prep_validate(
     const SparkServeQsaIndexPrepPlan* plan);

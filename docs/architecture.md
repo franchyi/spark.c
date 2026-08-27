@@ -198,11 +198,14 @@ selected-K/V packer, publish its completion, and launch XQA from the same
 coherent addresses. The packed K/V, valid length, and attention output all
 match the two framework fixtures bit-for-bit. Stream destruction drains work
 before Rust unregisters either mapping. The same small shared object now also
-contains the SGLang-derived fused index-prep and radix top-k donors. A separate
-Rust-native coherent-memory smoke proves their Q/state/RoPE/compressed-key bits
-and all four selected top-k sets against the oracle. The fixtures are presently
-independent: compressed-query score GEMM plus block-to-token/tail expansion must
-be connected before these four validated donors form one semantic QSA layer.
+contains the SGLang-derived fused index-prep, radix top-k, and block-to-token
+expansion donors. A separate Rust-native coherent-memory smoke proves their
+Q/state/RoPE/compressed-key bits, all four selected top-k sets, and all 12,306
+expanded logical-token indices against the oracle. The expansion fixture covers
+ratio-four expansion, incomplete-tail insertion, and `-1` padding exactly; its
+direct GB10 mean is 4.10 microseconds. The fixtures are presently independent:
+the compressed-query score MQA must be borrowed and connected before these five
+validated donors form one semantic QSA layer.
 The Rust control plane already models those gaps explicitly as a six-stage,
 epoch-checked pipeline: index prep, score, block top-k, selection expansion,
 K/V pack, and XQA. Its typed lease cannot advance to pack without completed

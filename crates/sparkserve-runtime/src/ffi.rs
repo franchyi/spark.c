@@ -589,6 +589,51 @@ pub struct QsaTopkArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QsaExpandPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub rows: u32,
+    pub block_topk: u32,
+    pub compress_ratio: u32,
+    pub token_topk: u32,
+    pub final_topk: u32,
+    pub output_dtype: u32,
+    pub requested_backend: u32,
+    pub reserved: u32,
+}
+
+impl QsaExpandPlan {
+    pub fn qwen38_flash(rows: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            rows,
+            block_topk: 512,
+            compress_ratio: 4,
+            token_topk: 2048,
+            final_topk: 2051,
+            output_dtype: DataType::Int32 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangQsaExpand as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QsaExpandArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: QsaExpandPlan,
+    pub block_indices: *const i32,
+    pub query_positions: *const i64,
+    pub sequence_lengths: *const i32,
+    pub logical_indices: *mut i32,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QsaIndexPrepPlan {
     pub struct_size: u32,
     pub abi_version: u32,
@@ -981,6 +1026,16 @@ unsafe extern "C" {
         info: *mut KernelInfo,
     ) -> Status;
     pub fn sparkserve_qsa_topk_launch(caps: *const DeviceCaps, args: *const QsaTopkArgs) -> Status;
+    pub fn sparkserve_qsa_expand_validate(plan: *const QsaExpandPlan) -> Status;
+    pub fn sparkserve_qsa_expand_query(
+        caps: *const DeviceCaps,
+        plan: *const QsaExpandPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_qsa_expand_launch(
+        caps: *const DeviceCaps,
+        args: *const QsaExpandArgs,
+    ) -> Status;
     pub fn sparkserve_qsa_index_prep_validate(plan: *const QsaIndexPrepPlan) -> Status;
     pub fn sparkserve_qsa_index_prep_query(
         caps: *const DeviceCaps,
@@ -1056,6 +1111,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);
         assert_eq!(std::mem::size_of::<QsaTopkPlan>(), 40);
         assert_eq!(std::mem::size_of::<QsaTopkArgs>(), 88);
+        assert_eq!(std::mem::size_of::<QsaExpandPlan>(), 40);
+        assert_eq!(std::mem::size_of::<QsaExpandArgs>(), 88);
         assert_eq!(std::mem::size_of::<QsaIndexPrepPlan>(), 56);
         assert_eq!(std::mem::size_of::<QsaIndexPrepArgs>(), 200);
         assert_eq!(std::mem::size_of::<QsaKvPackPlan>(), 48);
@@ -1128,6 +1185,20 @@ mod tests {
         assert_eq!(plan.input_dtype, DataType::Float32 as u32);
         assert_eq!(plan.output_dtype, DataType::Int32 as u32);
         assert_eq!(plan.requested_backend, KernelBackend::SglangQsaTopk as u32);
+    }
+
+    #[test]
+    fn qwen_qsa_expand_plan_freezes_block_and_tail_geometry() {
+        let plan = QsaExpandPlan::qwen38_flash(16);
+        assert_eq!(plan.block_topk, 512);
+        assert_eq!(plan.compress_ratio, 4);
+        assert_eq!(plan.token_topk, 2048);
+        assert_eq!(plan.final_topk, 2051);
+        assert_eq!(plan.output_dtype, DataType::Int32 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangQsaExpand as u32
+        );
     }
 
     #[test]

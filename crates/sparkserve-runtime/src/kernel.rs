@@ -40,6 +40,7 @@ pub enum KernelBackend {
     SglangQsaIndexPrep = 9,
     SglangQsaKvPack = 10,
     FlashInferXqaDecode = 11,
+    SglangQsaExpand = 12,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

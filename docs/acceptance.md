@@ -94,10 +94,13 @@ packer feeds FlashInfer XQA at the same fixed addresses; packed key, value,
 length, and attention output all have zero mismatches. Its reusable CUDA fence
 owns the pending scheduler lease and exposes it only after the recorded event
 completes, so host code cannot publish an in-flight arena accidentally. The
-same framework-free shared library and Rust launcher now cover fused index prep
-and radix top-k from coherent memory with exact Q/state/RoPE/compressed-key and
-selected-set parity. This document remains a completion checklist: PLE
-storage-thread/CUDA-event overlap, QSA score/selection kernels and full-token
+same framework-free shared library and Rust launcher now cover fused index prep,
+radix top-k, and block-to-token expansion from coherent memory with exact
+Q/state/RoPE/compressed-key, selected-set, and expanded-index parity. The
+expansion fixture covers incomplete-tail insertion and padding with 0/12,306
+mismatches; its direct GB10 kernel mean is 4.10 microseconds. This document
+remains a completion checklist: PLE storage-thread/CUDA-event overlap, the QSA
+score-MQA kernel and full-token
 graph, tokenizer/server, GGUF, GLM
 graph, and end-to-end continuation gates are not implied to be finished by this
 graph fragment.

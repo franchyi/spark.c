@@ -1,8 +1,9 @@
 use sparkserve_runtime::coherent::CoherentRegionOwner;
 use sparkserve_runtime::cuda::{CudaEventOwner, CudaStreamOwner, status_result};
 use sparkserve_runtime::ffi::{
-    COHERENT_REGION_PREFAULT, DeviceCaps, QsaIndexPrepArgs, QsaIndexPrepPlan, QsaTopkArgs,
-    QsaTopkPlan, sparkserve_qsa_index_prep_launch, sparkserve_qsa_topk_launch,
+    COHERENT_REGION_PREFAULT, DeviceCaps, QsaExpandArgs, QsaExpandPlan, QsaIndexPrepArgs,
+    QsaIndexPrepPlan, QsaTopkArgs, QsaTopkPlan, sparkserve_qsa_expand_launch,
+    sparkserve_qsa_index_prep_launch, sparkserve_qsa_topk_launch,
 };
 use std::ffi::c_void;
 use std::io;
@@ -19,6 +20,9 @@ const INDEX_POSITION_ROWS: usize = 512;
 const TOPK_ROWS: usize = 4;
 const TOPK_COLUMNS: usize = 65_536;
 const TOPK_WIDTH: usize = 512;
+const EXPAND_ROWS: usize = 6;
+const EXPAND_BLOCK_TOPK: usize = 512;
+const EXPAND_FINAL_TOPK: usize = 2051;
 
 #[derive(Default)]
 struct LayoutBuilder {
@@ -115,6 +119,33 @@ impl TopkLayout {
             row_starts,
             lengths,
             indices,
+            total_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExpandLayout {
+    block_indices: usize,
+    query_positions: usize,
+    sequence_lengths: usize,
+    logical_indices: usize,
+    total_bytes: usize,
+}
+
+impl ExpandLayout {
+    fn qwen() -> io::Result<Self> {
+        let mut layout = LayoutBuilder::default();
+        let block_indices = layout.field(EXPAND_ROWS * EXPAND_BLOCK_TOPK * 4)?;
+        let query_positions = layout.field(EXPAND_ROWS * 8)?;
+        let sequence_lengths = layout.field(EXPAND_ROWS * 4)?;
+        let logical_indices = layout.field(EXPAND_ROWS * EXPAND_FINAL_TOPK * 4)?;
+        let total_bytes = layout.finish()?;
+        Ok(Self {
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            logical_indices,
             total_bytes,
         })
     }
@@ -370,17 +401,97 @@ fn run_topk(
     region.close().map_err(io::Error::other)
 }
 
+fn run_expand(
+    root: &Path,
+    caps: &DeviceCaps,
+    stream: &mut CudaStreamOwner,
+    event: &mut CudaEventOwner,
+) -> io::Result<()> {
+    let layout = ExpandLayout::qwen()?;
+    let block_indices = read_fixture(
+        root,
+        "block_indices_i32.bin",
+        EXPAND_ROWS * EXPAND_BLOCK_TOPK * 4,
+    )?;
+    let query_positions = read_fixture(root, "query_positions_i64.bin", EXPAND_ROWS * 8)?;
+    let sequence_lengths = read_fixture(root, "sequence_lengths_i32.bin", EXPAND_ROWS * 4)?;
+    let expected = read_fixture(
+        root,
+        "logical_indices_i32.bin",
+        EXPAND_ROWS * EXPAND_FINAL_TOPK * 4,
+    )?;
+
+    let mut region = CoherentRegionOwner::slab(
+        u64::try_from(layout.total_bytes).map_err(|_| io::Error::other("layout overflow"))?,
+        4096,
+        COHERENT_REGION_PREFAULT,
+    )
+    .map_err(io::Error::other)?;
+    // SAFETY: no CUDA work references this freshly allocated mapping.
+    let payload = unsafe { region.host_payload_mut() }.map_err(io::Error::other)?;
+    copy_at(payload, layout.block_indices, &block_indices);
+    copy_at(payload, layout.query_positions, &query_positions);
+    copy_at(payload, layout.sequence_lengths, &sequence_lengths);
+
+    let base = region.device_address();
+    let args = QsaExpandArgs {
+        struct_size: std::mem::size_of::<QsaExpandArgs>() as u32,
+        abi_version: sparkserve_runtime::kernel::KERNEL_ABI_VERSION,
+        plan: QsaExpandPlan::qwen38_flash(EXPAND_ROWS as u32),
+        block_indices: device_pointer(base, layout.block_indices)?
+            .cast::<i32>()
+            .cast_const(),
+        query_positions: device_pointer(base, layout.query_positions)?
+            .cast::<i64>()
+            .cast_const(),
+        sequence_lengths: device_pointer(base, layout.sequence_lengths)?
+            .cast::<i32>()
+            .cast_const(),
+        logical_indices: device_pointer(base, layout.logical_indices)?.cast::<i32>(),
+        cuda_stream: stream.raw(),
+    };
+    // SAFETY: every pointer targets a live coherent mapping and remains stable
+    // until the recorded event is synchronized below.
+    if let Err(error) = status_result(unsafe { sparkserve_qsa_expand_launch(caps, &args) }) {
+        let _ = stream.synchronize();
+        return Err(io::Error::other(error));
+    }
+    event.record(stream).map_err(io::Error::other)?;
+    event.synchronize().map_err(io::Error::other)?;
+
+    // SAFETY: event completion excludes all CUDA access to this mapping.
+    let payload = unsafe { region.host_payload_mut() }.map_err(io::Error::other)?;
+    let actual = &payload[layout.logical_indices..layout.logical_indices + expected.len()];
+    let mismatches = element_mismatches(actual, &expected, 4);
+    println!("Rust QSA block expansion mismatches: {mismatches}");
+    if mismatches != 0 {
+        return Err(io::Error::other(
+            "Rust QSA block expansion differs from oracle",
+        ));
+    }
+    region.close().map_err(io::Error::other)
+}
+
 fn main() -> io::Result<()> {
     let mut arguments = std::env::args_os().skip(1).map(PathBuf::from);
     let index_fixture = arguments.next().ok_or_else(|| {
-        io::Error::other("usage: qsa_frontend_smoke <index-fixture> <topk-fixture>")
+        io::Error::other(
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture>",
+        )
     })?;
     let topk_fixture = arguments.next().ok_or_else(|| {
-        io::Error::other("usage: qsa_frontend_smoke <index-fixture> <topk-fixture>")
+        io::Error::other(
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture>",
+        )
+    })?;
+    let expand_fixture = arguments.next().ok_or_else(|| {
+        io::Error::other(
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture>",
+        )
     })?;
     if arguments.next().is_some() {
         return Err(io::Error::other(
-            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture>",
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture>",
         ));
     }
 
@@ -389,6 +500,7 @@ fn main() -> io::Result<()> {
     let mut event = CudaEventOwner::create().map_err(io::Error::other)?;
     run_index_prep(&index_fixture, &caps, &mut stream, &mut event)?;
     run_topk(&topk_fixture, &caps, &mut stream, &mut event)?;
+    run_expand(&expand_fixture, &caps, &mut stream, &mut event)?;
     event.close().map_err(io::Error::other)?;
     stream.close().map_err(io::Error::other)
 }
