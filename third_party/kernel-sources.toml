@@ -92,6 +92,16 @@ entrypoint = "python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh"
 notes = "Qwen QSA block-top-k 512 radix selection adapted verbatim at the arithmetic level. TVM-FFI, sgl-kernel wrappers, PDL dispatch, allocation, and framework ownership are removed; Rust owns score ranges and fixed output buffers."
 
 [[source]]
+id = "sglang-qsa-index-prep"
+repository = "https://github.com/sgl-project/sglang"
+revision = "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-bit-parity-passed"
+entrypoint = "python/sglang/kernels/jit/csrc/attention/qsa_indexer.cuh"
+notes = "Locked BF16 H=128 Qwen specialization of SGLang's fused Q/K Gemma RMSNorm, NeoX RoPE, raw-key state store, four-token FP32 mean, and compressed-key store. All output/state bits match the original JIT fixture; Rust owns locations and persistent pools."
+
+[[source]]
 id = "ds4-minimal-runtime-pattern"
 repository = "https://github.com/antirez/ds4"
 revision = "c1d4597a80e300b803dc642519718f2c999589da"

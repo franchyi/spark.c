@@ -357,6 +357,60 @@ int main() {
   assert(sparkserve_qsa_topk_validate(&qsa_topk).code ==
          SPARKSERVE_STATUS_UNSUPPORTED);
 
+  SparkServeQsaIndexPrepPlan qsa_prep = {
+      sizeof(SparkServeQsaIndexPrepPlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      16,
+      4,
+      32'768,
+      8'192,
+      4,
+      128,
+      128,
+      4,
+      1,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_BACKEND_AUTO,
+      0,
+  };
+  assert(sparkserve_qsa_index_prep_validate(&qsa_prep).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo qsa_prep_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_qsa_index_prep_query(&caps, &qsa_prep, &qsa_prep_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(qsa_prep_info.backend == SPARKSERVE_BACKEND_SGLANG_QSA_INDEX_PREP);
+  assert(qsa_prep_info.available == 0);
+  int64_t qsa_position = 0;
+  SparkServeQsaIndexPrepArgs qsa_prep_args = {};
+  qsa_prep_args.struct_size = sizeof(qsa_prep_args);
+  qsa_prep_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  qsa_prep_args.plan = qsa_prep;
+  qsa_prep_args.qk = &output;
+  qsa_prep_args.q_output = &output;
+  qsa_prep_args.q_norm_weight = &output;
+  qsa_prep_args.k_norm_weight = &output;
+  qsa_prep_args.cos_sin_cache = &qsa_score;
+  qsa_prep_args.cos_sin_rows = 1;
+  qsa_prep_args.axis_map = &qsa_start;
+  qsa_prep_args.positions = &qsa_position;
+  qsa_prep_args.positions_stride = 16;
+  qsa_prep_args.cache_locs = &qsa_position;
+  qsa_prep_args.key_state = &output;
+  qsa_prep_args.rope_positions = &qsa_position;
+  qsa_prep_args.group_locs = &qsa_start;
+  qsa_prep_args.write_locs = &qsa_start;
+  qsa_prep_args.compressed_keys = &output;
+  qsa_prep_args.eps = 1.0e-6f;
+  assert(sparkserve_qsa_index_prep_launch(&caps, &qsa_prep_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  qsa_prep.num_q_heads = 8;
+  assert(sparkserve_qsa_index_prep_validate(&qsa_prep).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,

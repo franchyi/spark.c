@@ -37,6 +37,7 @@ pub enum KernelBackend {
     FlashInferMoeRoute = 6,
     SglangPleGather = 7,
     SglangQsaTopk = 8,
+    SglangQsaIndexPrep = 9,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

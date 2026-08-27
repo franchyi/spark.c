@@ -54,6 +54,8 @@ typedef enum SparkServeKernelBackend {
   SPARKSERVE_BACKEND_SGLANG_PLE_GATHER = 7,
   // Radix-select QSA block top-k adapted from SGLang's JIT CUDA kernel.
   SPARKSERVE_BACKEND_SGLANG_QSA_TOPK = 8,
+  // Fused QSA Q/K norm, RoPE, state-store, and compressed-K preparation.
+  SPARKSERVE_BACKEND_SGLANG_QSA_INDEX_PREP = 9,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -384,6 +386,55 @@ typedef struct SparkServeQsaTopkArgs {
   void* cuda_stream;
 } SparkServeQsaTopkArgs;
 
+typedef struct SparkServeQsaIndexPrepPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t tokens;
+  uint32_t groups;
+  uint32_t state_slots;
+  uint32_t compressed_slots;
+  uint32_t num_q_heads;
+  uint32_t head_dim;
+  uint32_t rotary_dim;
+  uint32_t compress_ratio;
+  uint32_t num_position_axes;
+  uint32_t dtype;
+  uint32_t requested_backend;
+  uint32_t reserved;
+} SparkServeQsaIndexPrepPlan;
+
+typedef struct SparkServeQsaIndexPrepArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeQsaIndexPrepPlan plan;
+  // BF16 [tokens,(num_q_heads+1),head_dim].
+  const void* qk;
+  // BF16 [tokens,num_q_heads,head_dim].
+  void* q_output;
+  const void* q_norm_weight;
+  const void* k_norm_weight;
+  // FP32 [cos_sin_rows,rotary_dim].
+  const float* cos_sin_cache;
+  uint64_t cos_sin_rows;
+  const int32_t* axis_map;
+  // INT64 [num_position_axes,tokens], with an explicit row stride.
+  const int64_t* positions;
+  uint64_t positions_stride;
+  const int64_t* cache_locs;
+  // Persistent BF16 [state_slots,head_dim].
+  void* key_state;
+  // Persistent INT64 [state_slots,3].
+  int64_t* rope_positions;
+  // INT32 [groups,compress_ratio] and [groups]. Null when groups == 0.
+  const int32_t* group_locs;
+  const int32_t* write_locs;
+  // Persistent BF16 [compressed_slots,head_dim].
+  void* compressed_keys;
+  float eps;
+  uint32_t reserved;
+  void* cuda_stream;
+} SparkServeQsaIndexPrepArgs;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -539,6 +590,18 @@ SparkServeStatus sparkserve_qsa_topk_query(
 SparkServeStatus sparkserve_qsa_topk_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeQsaTopkArgs* args);
+
+SparkServeStatus sparkserve_qsa_index_prep_validate(
+    const SparkServeQsaIndexPrepPlan* plan);
+
+SparkServeStatus sparkserve_qsa_index_prep_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaIndexPrepPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_qsa_index_prep_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeQsaIndexPrepArgs* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);

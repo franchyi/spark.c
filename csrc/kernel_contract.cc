@@ -26,6 +26,9 @@
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_TOPK
 #include "internal/qsa_topk_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_INDEX_PREP
+#include "internal/qsa_index_prep_backend.h"
+#endif
 
 namespace {
 
@@ -205,6 +208,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("PLE gather backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_QSA_TOPK:
       return Invalid("QSA top-k backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_QSA_INDEX_PREP:
+      return Invalid("QSA index-prep backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1031,6 +1036,104 @@ extern "C" SparkServeStatus sparkserve_qsa_topk_launch(
   return sparkserve_sglang_qsa_topk_cuda_launch(args);
 #else
   return Unavailable("SGLang QSA top-k donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_index_prep_validate(
+    const SparkServeQsaIndexPrepPlan* plan) {
+  if (plan == nullptr) return Invalid("QSA index-prep plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->tokens == 0 || plan->tokens > 1U << 20 ||
+      plan->groups > plan->tokens || plan->state_slots == 0 ||
+      plan->compressed_slots == 0) {
+    return Invalid("QSA index-prep state shape is invalid");
+  }
+  if (plan->num_q_heads != 4 || plan->head_dim != 128 ||
+      plan->rotary_dim != 128 || plan->compress_ratio != 4 ||
+      (plan->num_position_axes != 1 && plan->num_position_axes != 3)) {
+    return Unsupported("Qwen3.8 Flash-Next QSA index-prep shape is unsupported");
+  }
+  if (plan->dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("QSA index prep requires BF16 state");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_SGLANG_QSA_INDEX_PREP) {
+    return Invalid("unknown QSA index-prep backend");
+  }
+  if (!CanMultiply(plan->tokens,
+                   static_cast<uint64_t>(plan->num_q_heads + 1) *
+                       plan->head_dim * sizeof(uint16_t)) ||
+      !CanMultiply(plan->state_slots,
+                   static_cast<uint64_t>(plan->head_dim) * sizeof(uint16_t)) ||
+      !CanMultiply(plan->compressed_slots,
+                   static_cast<uint64_t>(plan->head_dim) * sizeof(uint16_t))) {
+    return Invalid("QSA index-prep buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_index_prep_query(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaIndexPrepPlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first QSA index-prep donor is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_qsa_index_prep_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_SGLANG_QSA_INDEX_PREP;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "sglang-qsa-index-prep-bf16-h128";
+  info->source_revision =
+      "sglang@7c66045d71f067c1c5da2b85baad3c47d9a19cb7";
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_INDEX_PREP
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_index_prep_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaIndexPrepArgs* args) {
+  if (args == nullptr) return Invalid("QSA index-prep arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query_status =
+      sparkserve_qsa_index_prep_query(caps, &args->plan, &info);
+  if (query_status.code != SPARKSERVE_STATUS_OK) return query_status;
+  if (args->qk == nullptr || args->q_output == nullptr ||
+      args->q_norm_weight == nullptr || args->cos_sin_cache == nullptr ||
+      args->axis_map == nullptr || args->positions == nullptr ||
+      args->cache_locs == nullptr || args->key_state == nullptr ||
+      args->rope_positions == nullptr || args->cos_sin_rows == 0 ||
+      args->positions_stride < args->plan.tokens ||
+      !(args->eps > 0.0f && args->eps < 1.0f)) {
+    return Invalid("QSA index-prep pointers or scalar arguments are invalid");
+  }
+  if (args->plan.groups != 0 &&
+      (args->k_norm_weight == nullptr || args->group_locs == nullptr ||
+       args->write_locs == nullptr || args->compressed_keys == nullptr)) {
+    return Invalid("QSA compressed-key arguments are required when groups are present");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_QSA_INDEX_PREP
+  return sparkserve_sglang_qsa_index_prep_cuda_launch(args);
+#else
+  return Unavailable("SGLang QSA index-prep donor is not linked");
 #endif
 }
 

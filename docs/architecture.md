@@ -167,10 +167,13 @@ For Flash-Next QSA, the runtime follows SGLang's current GB10 split rather than
 building a new attention algorithm. The first imported primitive is SGLang's
 radix top-k specialized to 512 compressed blocks. Its raw-CUDA adapter matches
 the complete selected index sets for four ragged 65,536-column rows and measures
-26.79 microseconds on SM121. Next, the small fused Q/K norm+MRoPE+compression
-kernel is adapted the same way, while sparse decode wraps the FlashInfer
-TRT-LLM-gen kernel that SGLang itself selects on SM121. Rust retains ownership
-of logical-to-physical KV maps, valid lengths, fixed scratch, and graph replay.
+26.77 microseconds on SM121. The fused Q/K Gemma-RMSNorm, NeoX-RoPE, raw-state,
+and four-token compressed-key donor is also adapted: all Q, raw-K, RoPE-state,
+and compressed-K bits match SGLang for 37 rows and nine groups, at 8.21
+microseconds. Next, selected KV is packed into fixed scratch and sparse decode
+wraps the FlashInfer TRT-LLM-gen kernel that SGLang itself selects on SM121.
+Rust retains ownership of logical-to-physical KV maps, valid lengths, fixed
+scratch, and graph replay.
 
 ### GGUF
 

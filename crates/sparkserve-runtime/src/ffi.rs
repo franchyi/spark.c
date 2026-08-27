@@ -557,6 +557,78 @@ pub struct QsaTopkArgs {
     pub cuda_stream: *mut c_void,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QsaIndexPrepPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub tokens: u32,
+    pub groups: u32,
+    pub state_slots: u32,
+    pub compressed_slots: u32,
+    pub num_q_heads: u32,
+    pub head_dim: u32,
+    pub rotary_dim: u32,
+    pub compress_ratio: u32,
+    pub num_position_axes: u32,
+    pub dtype: u32,
+    pub requested_backend: u32,
+    pub reserved: u32,
+}
+
+impl QsaIndexPrepPlan {
+    pub fn qwen38_flash(
+        tokens: u32,
+        groups: u32,
+        state_slots: u32,
+        compressed_slots: u32,
+        num_position_axes: u32,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            tokens,
+            groups,
+            state_slots,
+            compressed_slots,
+            num_q_heads: 4,
+            head_dim: 128,
+            rotary_dim: 128,
+            compress_ratio: 4,
+            num_position_axes,
+            dtype: DataType::BFloat16 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangQsaIndexPrep as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QsaIndexPrepArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: QsaIndexPrepPlan,
+    pub qk: *const c_void,
+    pub q_output: *mut c_void,
+    pub q_norm_weight: *const c_void,
+    pub k_norm_weight: *const c_void,
+    pub cos_sin_cache: *const f32,
+    pub cos_sin_rows: u64,
+    pub axis_map: *const i32,
+    pub positions: *const i64,
+    pub positions_stride: u64,
+    pub cache_locs: *const i64,
+    pub key_state: *mut c_void,
+    pub rope_positions: *mut i64,
+    pub group_locs: *const i32,
+    pub write_locs: *const i32,
+    pub compressed_keys: *mut c_void,
+    pub eps: f32,
+    pub reserved: u32,
+    pub cuda_stream: *mut c_void,
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GdnBackend {
@@ -739,6 +811,16 @@ unsafe extern "C" {
         info: *mut KernelInfo,
     ) -> Status;
     pub fn sparkserve_qsa_topk_launch(caps: *const DeviceCaps, args: *const QsaTopkArgs) -> Status;
+    pub fn sparkserve_qsa_index_prep_validate(plan: *const QsaIndexPrepPlan) -> Status;
+    pub fn sparkserve_qsa_index_prep_query(
+        caps: *const DeviceCaps,
+        plan: *const QsaIndexPrepPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_qsa_index_prep_launch(
+        caps: *const DeviceCaps,
+        args: *const QsaIndexPrepArgs,
+    ) -> Status;
     pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn sparkserve_gdn_decode_query(
         caps: *const DeviceCaps,
@@ -784,6 +866,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);
         assert_eq!(std::mem::size_of::<QsaTopkPlan>(), 40);
         assert_eq!(std::mem::size_of::<QsaTopkArgs>(), 88);
+        assert_eq!(std::mem::size_of::<QsaIndexPrepPlan>(), 56);
+        assert_eq!(std::mem::size_of::<QsaIndexPrepArgs>(), 200);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
@@ -850,6 +934,20 @@ mod tests {
         assert_eq!(plan.input_dtype, DataType::Float32 as u32);
         assert_eq!(plan.output_dtype, DataType::Int32 as u32);
         assert_eq!(plan.requested_backend, KernelBackend::SglangQsaTopk as u32);
+    }
+
+    #[test]
+    fn qwen_qsa_index_prep_plan_freezes_state_geometry() {
+        let plan = QsaIndexPrepPlan::qwen38_flash(16, 4, 32_768, 8_192, 1);
+        assert_eq!(plan.num_q_heads, 4);
+        assert_eq!(plan.head_dim, 128);
+        assert_eq!(plan.rotary_dim, 128);
+        assert_eq!(plan.compress_ratio, 4);
+        assert_eq!(plan.dtype, DataType::BFloat16 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangQsaIndexPrep as u32
+        );
     }
 
     #[test]

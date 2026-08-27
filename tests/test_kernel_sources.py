@@ -144,3 +144,31 @@ def test_sglang_qsa_topk_donor_is_pinned_and_hashed() -> None:
         "77780478c7b48517fbe9240d62d8a71371203a1acea42d27d44022cc1e9863be  "
         "python/sglang/kernels/ops/elementwise/fast_topk.py",
     ]
+
+
+def test_sglang_qsa_index_prep_donor_is_pinned_and_hashed() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qsa-index-prep"
+    )
+    assert donor["revision"] == "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["mode"] == "source-adaptation"
+    assert donor["status"] == "linked-raw-cuda-sm121-bit-parity-passed"
+    assert donor["entrypoint"] == (
+        "python/sglang/kernels/jit/csrc/attention/qsa_indexer.cuh"
+    )
+
+    vendor = ROOT / "third_party" / "sglang-qsa-index-prep"
+    assert (vendor / "VENDOR.md").is_file()
+    hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
+    assert hashes == [
+        "672290ad5594ba94e0006f73c9d1f341ba768a9adfddbc9296b94a88d4feb77c  "
+        "python/sglang/kernels/jit/csrc/attention/qsa_indexer.cuh",
+        "2e413f99a9c5e475f98529691f1dddf7b59061ff234e107b1894e96e956a54cc  "
+        "python/sglang/kernels/ops/attention/qsa_indexer.py",
+    ]
