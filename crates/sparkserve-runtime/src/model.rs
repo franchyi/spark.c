@@ -60,8 +60,7 @@ pub fn plan_memory(
         sparse_cache_gib
     };
     let resident_gib = model.resident_weight_bytes as f64 / GIB;
-    let required_gib =
-        resident_gib + sparse_cache + kv_cache_gib + runtime_gib + safety_gib;
+    let required_gib = resident_gib + sparse_cache + kv_cache_gib + runtime_gib + safety_gib;
     Ok(MemoryPlan {
         required_gib,
         headroom_gib: system_gib - required_gib,
@@ -75,8 +74,8 @@ mod tests {
 
     #[test]
     fn sparse_flash_next_plan_fits() {
-        let plan = plan_memory(QWEN38_FLASH_NEXT_NVFP4, 121.0, 2.0, 8.0, 12.0, 8.0)
-            .expect("valid plan");
+        let plan =
+            plan_memory(QWEN38_FLASH_NEXT_NVFP4, 121.0, 2.0, 8.0, 12.0, 8.0).expect("valid plan");
         assert!(plan.fits);
         assert!(plan.required_gib > 108.0 && plan.required_gib < 109.0);
     }
@@ -84,15 +83,8 @@ mod tests {
     #[test]
     fn materialized_ple_does_not_fit() {
         let ple_gib = QWEN38_FLASH_NEXT_NVFP4.sparse_store_bytes as f64 / GIB;
-        let plan = plan_memory(
-            QWEN38_FLASH_NEXT_NVFP4,
-            121.0,
-            ple_gib,
-            8.0,
-            12.0,
-            8.0,
-        )
-        .expect("valid plan");
+        let plan = plan_memory(QWEN38_FLASH_NEXT_NVFP4, 121.0, ple_gib, 8.0, 12.0, 8.0)
+            .expect("valid plan");
         assert!(!plan.fits);
     }
 }

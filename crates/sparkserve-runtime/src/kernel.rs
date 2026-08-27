@@ -98,10 +98,8 @@ impl DenseNvfp4Spec {
     pub fn buffer_requirements(self) -> Result<DenseNvfp4Buffers, KernelContractError> {
         let packed_input_bytes = checked_product(&[self.m, self.padded_k / 2])?;
         let packed_weight_bytes = checked_product(&[self.padded_n, self.padded_k / 2])?;
-        let input_scale_bytes = checked_product(&[
-            self.m,
-            self.padded_k / u64::from(self.group_size),
-        ])?;
+        let input_scale_bytes =
+            checked_product(&[self.m, self.padded_k / u64::from(self.group_size)])?;
         let weight_scale_bytes = checked_product(&[
             self.scale_padded_n,
             self.padded_k / u64::from(self.group_size),
@@ -232,7 +230,10 @@ impl fmt::Display for KernelContractError {
             }
             Self::UnsupportedOutputType => write!(formatter, "expected BF16 output"),
             Self::DeviceUnsupported(sm) => {
-                write!(formatter, "SM{sm} does not expose native NVFP4 Tensor Cores")
+                write!(
+                    formatter,
+                    "SM{sm} does not expose native NVFP4 Tensor Cores"
+                )
             }
             Self::NoKernelCandidate => write!(formatter, "no kernel candidate matches the plan"),
         }
@@ -303,8 +304,7 @@ mod tests {
     #[test]
     fn selects_oracle_kernel_source_for_gb10() {
         let spec = DenseNvfp4Spec::native(1, 4096, 4096).expect("valid shape");
-        let candidate =
-            select_dense_nvfp4_candidate(spec, DeviceCaps::GB10).expect("candidate");
+        let candidate = select_dense_nvfp4_candidate(spec, DeviceCaps::GB10).expect("candidate");
         assert_eq!(candidate.id, "flashinfer-mm-fp4");
         assert!(!candidate.linked);
     }

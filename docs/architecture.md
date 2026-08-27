@@ -83,7 +83,7 @@ the consuming layer. The kernel accumulates into the model's BF16 stream without
 ever constructing a BF16 copy of the full table. A CLOCK-Pro-style policy
 separates frequently reused n-grams from scans.
 
-The checkpoint stores 128 logical tables shaped `[2,500,012, 160]`; one token
+The checkpoint stores 128 physical tensors shaped `[2,500,012, 160]`; one token
 selects 16 rows, for 2,560 useful bytes. Existing GB10 measurements establish
 that this can be supplied from NVMe. The implementation question is now whether
 explicit coalesced reads beat pageable-memory faults enough to justify their
@@ -148,8 +148,10 @@ configured safety reserve.
 
 ### M3 — Flash-Next sparse PLE
 
-- Download metadata and one PLE shard first; reproduce both mmap and explicit
-  asynchronous row-reader benchmarks.
+- The exact-FP8 zero-copy safetensors index and bounded parallel row reader are
+  implemented; Python and Rust agree on real-checkpoint row checksums.
+- Replace parallel positional reads with registered `io_uring` buffers and a
+  fixed pinned slab, then connect the existing FP8-to-BF16 gather kernel.
 - Keep the approximately 78.3 GiB main checkpoint resident and cap PLE cache at
   2-4 GiB. Never construct the full BF16 PLE tensor.
 - Gate: peak committed memory below 105 GiB, deterministic cold-cache behavior,

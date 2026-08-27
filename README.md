@@ -50,6 +50,29 @@ uv run sparkserve plan qwen38-flash-next-nvfp4
 uv run pytest
 ```
 
+Build the zero-copy PLE index directly over the downloaded checkpoint, then run
+the reference bounded-cache benchmark:
+
+```bash
+uv run sparkserve ple-index \
+  /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4/.sparkserve/ple.ssple \
+  --revision 7b719225242aacd3dbd3f9407468c2ee9a9d2594
+uv run sparkserve ple-bench \
+  /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4/.sparkserve/ple.ssple \
+  --model-root /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --cache-mib 8192 --workers 16
+```
+
+Add `--batch-tokens 1` to measure the latency-sensitive decode miss path rather
+than a fully coalesced prefill submission.
+
+`ple-index` reads only safetensors headers and the two-byte BF16 scale. The
+resulting index points at the original 47.7 GiB FP8 tensors on NVMe; it neither
+duplicates nor expands the weights. The Python reader is an offline correctness
+and storage benchmark. The shipping path consumes the same binary index from
+Rust and will replace `pread` workers with registered `io_uring` buffers.
+
 The same gate exists in the dependency-free Rust runtime:
 
 ```bash
@@ -82,6 +105,35 @@ alpha, and BF16 output.
 No CUDA backend is claimed as linked yet. A valid launch returns `UNAVAILABLE`
 until the pinned FlashInfer `mm_fp4` adapter is compiled into the runtime. This
 keeps the control plane and tests honest while the oracle tensors are captured.
+
+The Flash-Next storage path now has a cross-language `SSPLEIDX` contract, a
+zero-copy safetensors indexer, bounded Python and Rust caches, cross-page row
+assembly, batch-page admission limits, corruption checks, and a parallel Rust
+reader. On the target Spark, the Rust reference reached 3,525 storage-only
+prefill tokens/s and about 0.52 ms per all-miss decode lookup. See
+[docs/ple-nvme.md](docs/ple-nvme.md) for the format, measurements, and the pinned
+slab/`io_uring` kernel boundary.
+
+## Run the Flash-Next oracle on one Spark
+
+After the model download is complete, build the small SM121 compatibility layer
+over the pinned day-zero image and launch a conservative text-model-only smoke
+server on port 8890:
+
+```bash
+make docker-flash-next-sm121
+scripts/run-flash-next-smoke.sh
+docker logs -f qwen38-flash-next-smoke
+scripts/smoke-flash-next-api.sh
+```
+
+The smoke profile omits the visual tower, drops each checkpoint shard from the OS
+page cache after loading, and starts without speculative decoding. It limits
+decode CUDA graphs to batch one, disables prefill graphs, and caps context at
+32K. This isolates base-model correctness before enabling the checkpoint's BF16
+NEXTN/MTP tensors.
+The currently running Qwen3.8 27B service must be stopped first because both
+servers cannot safely reserve Spark unified memory at the same time.
 
 ## Why Rust plus CUDA, not a large Python stack or one C file?
 
