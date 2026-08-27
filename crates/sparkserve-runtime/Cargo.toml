@@ -11,3 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pinned to the versions used by SGLang storage donor e14d1c3.
+io-uring = "=0.7.14"
+libc = "=0.2.189"

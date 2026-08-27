@@ -2,6 +2,8 @@ use sparkserve_runtime::checkpoint::{CheckpointPlan, load_flash_next_plan};
 use sparkserve_runtime::kernel::{DenseNvfp4Spec, DeviceCaps, select_dense_nvfp4_candidate};
 use sparkserve_runtime::model::{plan_memory, profile};
 use sparkserve_runtime::model_lock::{LockedModel, load_model_lock};
+#[cfg(target_os = "linux")]
+use sparkserve_runtime::storage::FixedPleCache;
 use sparkserve_runtime::storage::{ClockPageCache, FilePageSource, PleIndex};
 use std::path::Path;
 use std::time::Instant;
@@ -16,6 +18,10 @@ fn usage() -> ! {
     eprintln!(
         "  sparkserve-runtime ple-bench <index> <model-root> [tokens] [cache-mib] [chunk-tokens] [workers]"
     );
+    #[cfg(target_os = "linux")]
+    eprintln!(
+        "  sparkserve-runtime ple-fixed-bench <index> <model-root> [tokens] [cache-mib] [chunk-tokens] [queue-depth] [parallel-threshold-pages] [parallel-workers]"
+    );
     std::process::exit(2);
 }
 
@@ -28,6 +34,8 @@ fn main() {
         Some("kernel-plan") => run_kernel_plan(args),
         Some("ple-inspect") => run_ple_inspect(args),
         Some("ple-bench") => run_ple_bench(args),
+        #[cfg(target_os = "linux")]
+        Some("ple-fixed-bench") => run_ple_fixed_bench(args),
         _ => usage(),
     }
 }
@@ -194,6 +202,91 @@ fn run_ple_bench(mut args: impl Iterator<Item = String>) {
     );
     println!("  elapsed          {:12.3} s", elapsed);
     println!("  page reads       {:12}", cache.stats.page_reads);
+    println!("  page hits        {:12}", cache.stats.page_hits);
+    println!("  evictions        {:12}", cache.stats.evictions);
+    println!("  bytes read       {:12}", cache.stats.bytes_read);
+    println!("  output checksum  {checksum:012x}");
+}
+
+#[cfg(target_os = "linux")]
+fn run_ple_fixed_bench(mut args: impl Iterator<Item = String>) {
+    let index_path = args.next().unwrap_or_else(|| usage());
+    let model_root = args.next().unwrap_or_else(|| usage());
+    let tokens = parse_optional_usize(args.next(), 4096);
+    let cache_mib = parse_optional_usize(args.next(), 4);
+    let chunk_tokens = parse_optional_usize(args.next(), 16);
+    let queue_depth = parse_optional_usize(args.next(), 16);
+    let parallel_threshold_pages = parse_optional_usize(args.next(), 64);
+    let parallel_workers = parse_optional_usize(args.next(), 16);
+    if args.next().is_some()
+        || tokens == 0
+        || cache_mib == 0
+        || chunk_tokens == 0
+        || queue_depth == 0
+        || parallel_threshold_pages == 0
+        || parallel_workers == 0
+    {
+        usage();
+    }
+    let payload = std::fs::read(&index_path).unwrap_or_else(|error| {
+        eprintln!("cannot read PLE index {index_path}: {error}");
+        std::process::exit(1);
+    });
+    let index = PleIndex::decode(&payload).unwrap_or_else(|error| {
+        eprintln!("invalid PLE index {index_path}: {error}");
+        std::process::exit(1);
+    });
+    let cache_bytes = cache_mib
+        .checked_mul(1024 * 1024)
+        .unwrap_or_else(|| usage());
+    let mut slab = vec![0_u8; cache_bytes];
+    let mut cache = FixedPleCache::open_hybrid(
+        &index,
+        Path::new(&model_root),
+        &mut slab,
+        queue_depth,
+        parallel_threshold_pages,
+        parallel_workers,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("cannot open fixed-buffer PLE cache: {error}");
+        std::process::exit(1);
+    });
+    let started = Instant::now();
+    let mut generated = 0_usize;
+    let mut random = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut checksum = 0_u64;
+    while generated < tokens {
+        let batch_tokens = chunk_tokens.min(tokens - generated);
+        let mut rows = Vec::with_capacity(batch_tokens * 16);
+        for _ in 0..batch_tokens * 16 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            rows.push(random % index.total_rows);
+        }
+        let batch = cache.fetch_rows(&index, &rows).unwrap_or_else(|error| {
+            eprintln!("fixed-buffer PLE benchmark failed: {error}");
+            std::process::exit(1);
+        });
+        checksum = checksum.wrapping_add(batch.wrapping_checksum());
+        generated += batch_tokens;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    println!("exact FP8 PLE fixed-slab hybrid benchmark");
+    println!(
+        "  throughput       {:12.2} tokens/s",
+        tokens as f64 / elapsed
+    );
+    println!("  elapsed          {:12.3} s", elapsed);
+    println!("  queue depth      {:12}", queue_depth);
+    println!("  pread threshold  {:12} pages", parallel_threshold_pages);
+    println!("  page reads       {:12}", cache.stats.page_reads);
+    println!("  io_uring reads   {:12}", cache.stats.uring_page_reads);
+    println!(
+        "  parallel preads {:12}",
+        cache.stats.parallel_pread_page_reads
+    );
     println!("  page hits        {:12}", cache.stats.page_hits);
     println!("  evictions        {:12}", cache.stats.evictions);
     println!("  bytes read       {:12}", cache.stats.bytes_read);

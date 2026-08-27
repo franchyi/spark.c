@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::path::{Component, Path};
+#[cfg(target_os = "linux")]
+use std::ptr::NonNull;
 use std::sync::mpsc;
 use std::thread;
 
@@ -331,6 +333,549 @@ impl PageSource for FilePageSource {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedPageSlice {
+    pub buffer_offset: usize,
+    pub bytes: usize,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedPleRow {
+    pub first: FixedPageSlice,
+    pub second: Option<FixedPageSlice>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct FixedCacheSlot {
+    key: Option<PageKey>,
+    referenced: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FixedReadPolicy {
+    /// Persistent registered `io_uring`; best for decode-sized miss sets.
+    Uring,
+    /// Large prefill miss sets use parallel positional reads targeting the
+    /// same slab, so policy changes without introducing a page copy.
+    Hybrid {
+        parallel_threshold_pages: usize,
+        parallel_workers: usize,
+    },
+}
+
+/// PLE page cache whose bytes live only in one caller-owned registered slab.
+/// The returned batch borrows the cache, preventing slot reuse until the CUDA
+/// gather has consumed its row fragments.
+#[cfg(target_os = "linux")]
+pub struct FixedPleCache<'slab> {
+    files: Vec<File>,
+    file_sizes: Vec<u64>,
+    page_bytes: usize,
+    slots: Vec<FixedCacheSlot>,
+    index: HashMap<PageKey, usize>,
+    hand: usize,
+    reader: crate::uring::FixedBufferReader<'slab>,
+    device_base: Option<NonNull<std::ffi::c_void>>,
+    read_policy: FixedReadPolicy,
+    pub stats: CacheStats,
+}
+
+#[cfg(target_os = "linux")]
+pub struct FixedPleBatch<'cache, 'slab> {
+    cache: &'cache FixedPleCache<'slab>,
+    rows: Vec<FixedPleRow>,
+    row_bytes: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl FixedPleBatch<'_, '_> {
+    pub fn rows(&self) -> &[FixedPleRow] {
+        &self.rows
+    }
+
+    pub fn host_base(&self) -> *const u8 {
+        self.cache.reader.buffer().as_ptr()
+    }
+
+    /// Stable CUDA-visible base for the same physical slab, when the cache was
+    /// constructed from `fabric_api.h` rather than ordinary host memory.
+    pub fn device_base(&self) -> Option<NonNull<std::ffi::c_void>> {
+        self.cache.device_base
+    }
+
+    /// Correctness helper. Production passes `rows()` and the coherent slab's
+    /// device base directly to the borrowed FP8 gather kernel.
+    pub fn materialize(&self) -> Vec<u8> {
+        let slab = self.cache.reader.buffer();
+        let mut output = Vec::with_capacity(self.rows.len() * self.row_bytes);
+        for row in &self.rows {
+            output.extend_from_slice(
+                &slab[row.first.buffer_offset..row.first.buffer_offset + row.first.bytes],
+            );
+            if let Some(second) = row.second {
+                output.extend_from_slice(
+                    &slab[second.buffer_offset..second.buffer_offset + second.bytes],
+                );
+            }
+        }
+        output
+    }
+
+    pub fn wrapping_checksum(&self) -> u64 {
+        let slab = self.cache.reader.buffer();
+        self.rows.iter().fold(0_u64, |sum, row| {
+            let first = &slab[row.first.buffer_offset..row.first.buffer_offset + row.first.bytes];
+            let sum = first
+                .iter()
+                .fold(sum, |sum, value| sum.wrapping_add(u64::from(*value)));
+            row.second.map_or(sum, |second| {
+                slab[second.buffer_offset..second.buffer_offset + second.bytes]
+                    .iter()
+                    .fold(sum, |sum, value| sum.wrapping_add(u64::from(*value)))
+            })
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<'slab> FixedPleCache<'slab> {
+    pub fn open(
+        index: &PleIndex,
+        model_root: &Path,
+        slab: &'slab mut [u8],
+        queue_depth: usize,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_device_base(
+            index,
+            model_root,
+            slab,
+            queue_depth,
+            None,
+            FixedReadPolicy::Uring,
+        )
+    }
+
+    pub fn open_hybrid(
+        index: &PleIndex,
+        model_root: &Path,
+        slab: &'slab mut [u8],
+        queue_depth: usize,
+        parallel_threshold_pages: usize,
+        parallel_workers: usize,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_device_base(
+            index,
+            model_root,
+            slab,
+            queue_depth,
+            None,
+            FixedReadPolicy::Hybrid {
+                parallel_threshold_pages,
+                parallel_workers,
+            },
+        )
+    }
+
+    /// Build a cache over the anonymous slab returned by `fabric_api.h`.
+    ///
+    /// # Safety
+    ///
+    /// The coherent region that owns `view` must remain alive and exclusively
+    /// lend its payload to this cache for `'slab`. Its host pointer must remain
+    /// writable, and its device pointer must keep addressing the same physical
+    /// bytes until the cache and every borrowed batch are dropped.
+    pub unsafe fn open_coherent(
+        index: &PleIndex,
+        model_root: &Path,
+        view: &'slab crate::ffi::CoherentRegionView,
+        queue_depth: usize,
+    ) -> Result<Self, StoreError> {
+        // SAFETY: this method forwards its caller contract unchanged.
+        unsafe {
+            Self::open_coherent_with_policy(
+                index,
+                model_root,
+                view,
+                queue_depth,
+                FixedReadPolicy::Uring,
+            )
+        }
+    }
+
+    /// Build the production hybrid reader over a `fabric_api.h` slab.
+    ///
+    /// # Safety
+    ///
+    /// The ownership and pointer-stability requirements are identical to
+    /// `open_coherent`.
+    pub unsafe fn open_coherent_hybrid(
+        index: &PleIndex,
+        model_root: &Path,
+        view: &'slab crate::ffi::CoherentRegionView,
+        queue_depth: usize,
+        parallel_threshold_pages: usize,
+        parallel_workers: usize,
+    ) -> Result<Self, StoreError> {
+        // SAFETY: this method forwards its caller contract unchanged.
+        unsafe {
+            Self::open_coherent_with_policy(
+                index,
+                model_root,
+                view,
+                queue_depth,
+                FixedReadPolicy::Hybrid {
+                    parallel_threshold_pages,
+                    parallel_workers,
+                },
+            )
+        }
+    }
+
+    unsafe fn open_coherent_with_policy(
+        index: &PleIndex,
+        model_root: &Path,
+        view: &'slab crate::ffi::CoherentRegionView,
+        queue_depth: usize,
+        read_policy: FixedReadPolicy,
+    ) -> Result<Self, StoreError> {
+        if view.struct_size as usize != std::mem::size_of::<crate::ffi::CoherentRegionView>()
+            || view.abi_version != crate::ffi::FABRIC_ABI_VERSION
+            || view.kind != crate::ffi::CoherentRegionKind::Slab as u32
+            || view.host_pointer.is_null()
+            || view.device_pointer.is_null()
+            || view.payload_bytes == 0
+            || view.payload_bytes > view.mapped_bytes
+        {
+            return Err(StoreError::InvalidCoherentRegion);
+        }
+        let payload_bytes =
+            usize::try_from(view.payload_bytes).map_err(|_| StoreError::IntegerOverflow)?;
+        let host_pointer = NonNull::new(view.host_pointer.cast::<u8>())
+            .ok_or(StoreError::InvalidCoherentRegion)?;
+        let device_base =
+            NonNull::new(view.device_pointer).ok_or(StoreError::InvalidCoherentRegion)?;
+        let required_alignment = usize::try_from(view.required_alignment)
+            .map_err(|_| StoreError::InvalidCoherentRegion)?;
+        if required_alignment == 0
+            || !required_alignment.is_power_of_two()
+            || host_pointer.as_ptr() as usize % required_alignment != 0
+        {
+            return Err(StoreError::InvalidCoherentRegion);
+        }
+        // SAFETY: the caller guarantees exclusive access and stable ownership
+        // of the native coherent region for `'slab`.
+        let slab = unsafe { std::slice::from_raw_parts_mut(host_pointer.as_ptr(), payload_bytes) };
+        Self::open_with_device_base(
+            index,
+            model_root,
+            slab,
+            queue_depth,
+            Some(device_base),
+            read_policy,
+        )
+    }
+
+    fn open_with_device_base(
+        index: &PleIndex,
+        model_root: &Path,
+        slab: &'slab mut [u8],
+        queue_depth: usize,
+        device_base: Option<NonNull<std::ffi::c_void>>,
+        read_policy: FixedReadPolicy,
+    ) -> Result<Self, StoreError> {
+        if index.page_bytes == 0
+            || !index.page_bytes.is_power_of_two()
+            || slab.is_empty()
+            || slab.len() % index.page_bytes != 0
+        {
+            return Err(StoreError::InvalidCache);
+        }
+        if matches!(
+            read_policy,
+            FixedReadPolicy::Hybrid {
+                parallel_threshold_pages: 0,
+                ..
+            } | FixedReadPolicy::Hybrid {
+                parallel_workers: 0,
+                ..
+            }
+        ) {
+            return Err(StoreError::InvalidCache);
+        }
+        let capacity_pages = slab.len() / index.page_bytes;
+        let mut files = Vec::with_capacity(index.shards.len());
+        let mut file_sizes = Vec::with_capacity(index.shards.len());
+        for shard in &index.shards {
+            let path = model_root.join(&shard.relative_path);
+            let file = File::open(&path)?;
+            let file_size = file.metadata()?.len();
+            let tensor_end = shard
+                .data_offset
+                .checked_add(shard.data_bytes)
+                .ok_or(StoreError::IntegerOverflow)?;
+            if tensor_end > file_size {
+                return Err(StoreError::SourceTruncated(path.display().to_string()));
+            }
+            files.push(file);
+            file_sizes.push(file_size);
+        }
+        let reader = crate::uring::FixedBufferReader::new(slab, queue_depth, capacity_pages)?;
+        Ok(Self {
+            files,
+            file_sizes,
+            page_bytes: index.page_bytes,
+            slots: vec![
+                FixedCacheSlot {
+                    key: None,
+                    referenced: false,
+                };
+                capacity_pages
+            ],
+            index: HashMap::with_capacity(capacity_pages),
+            hand: 0,
+            reader,
+            device_base,
+            read_policy,
+            stats: CacheStats::default(),
+        })
+    }
+
+    pub fn capacity_pages(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn fetch_rows<'cache>(
+        &'cache mut self,
+        index: &PleIndex,
+        rows: &[u64],
+    ) -> Result<FixedPleBatch<'cache, 'slab>, StoreError> {
+        if index.page_bytes != self.page_bytes {
+            return Err(StoreError::PageSizeMismatch);
+        }
+        let mut addresses = Vec::with_capacity(rows.len());
+        let mut keys = Vec::with_capacity(rows.len() * 2);
+        let mut unique = HashSet::with_capacity(rows.len() * 2);
+        for row in rows {
+            let address = index.address(*row)?;
+            let first_offset = address.byte_offset & !(self.page_bytes as u64 - 1);
+            let first = PageKey {
+                shard: address.shard,
+                byte_offset: first_offset,
+            };
+            if unique.insert(first) {
+                keys.push(first);
+            }
+            if address.byte_offset + address.byte_len as u64 > first_offset + self.page_bytes as u64
+            {
+                let second = PageKey {
+                    shard: address.shard,
+                    byte_offset: first_offset + self.page_bytes as u64,
+                };
+                if unique.insert(second) {
+                    keys.push(second);
+                }
+            }
+            addresses.push(address);
+        }
+        if keys.len() > self.slots.len() {
+            return Err(StoreError::BatchExceedsCache {
+                pages: keys.len(),
+                capacity: self.slots.len(),
+            });
+        }
+        self.ensure_fixed_pages(&keys, &unique)?;
+
+        let mut fragments = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let page_offset = address.byte_offset & !(self.page_bytes as u64 - 1);
+            let within = (address.byte_offset - page_offset) as usize;
+            let first_key = PageKey {
+                shard: address.shard,
+                byte_offset: page_offset,
+            };
+            let first_slot = *self
+                .index
+                .get(&first_key)
+                .ok_or(StoreError::InvalidPageSource)?;
+            let first_bytes = index.row_bytes.min(self.page_bytes - within);
+            let second = if first_bytes < index.row_bytes {
+                let second_key = PageKey {
+                    shard: address.shard,
+                    byte_offset: page_offset + self.page_bytes as u64,
+                };
+                let second_slot = *self
+                    .index
+                    .get(&second_key)
+                    .ok_or(StoreError::InvalidPageSource)?;
+                Some(FixedPageSlice {
+                    buffer_offset: second_slot * self.page_bytes,
+                    bytes: index.row_bytes - first_bytes,
+                })
+            } else {
+                None
+            };
+            fragments.push(FixedPleRow {
+                first: FixedPageSlice {
+                    buffer_offset: first_slot * self.page_bytes + within,
+                    bytes: first_bytes,
+                },
+                second,
+            });
+        }
+        Ok(FixedPleBatch {
+            cache: self,
+            rows: fragments,
+            row_bytes: index.row_bytes,
+        })
+    }
+
+    fn ensure_fixed_pages(
+        &mut self,
+        keys: &[PageKey],
+        protected: &HashSet<PageKey>,
+    ) -> Result<(), StoreError> {
+        let mut misses = Vec::new();
+        for key in keys {
+            if let Some(slot) = self.index.get(key).copied() {
+                self.slots[slot].referenced = true;
+                self.stats.page_hits = self.stats.page_hits.saturating_add(1);
+            } else {
+                self.stats.page_misses = self.stats.page_misses.saturating_add(1);
+                misses.push(*key);
+            }
+        }
+        if misses.is_empty() {
+            return Ok(());
+        }
+
+        let mut destinations = Vec::with_capacity(misses.len());
+        let mut selected = HashSet::with_capacity(misses.len());
+        for key in &misses {
+            let slot = self.reserve_fixed_slot(protected, &selected)?;
+            selected.insert(slot);
+            if let Some(victim) = self.slots[slot].key.take() {
+                self.index.remove(&victim);
+                self.stats.evictions = self.stats.evictions.saturating_add(1);
+            }
+            self.slots[slot].referenced = false;
+            destinations.push((*key, slot));
+        }
+
+        for (_, slot) in &destinations {
+            let begin = slot * self.page_bytes;
+            self.reader.buffer_mut()[begin..begin + self.page_bytes].fill(0);
+        }
+        let mut reads = Vec::with_capacity(destinations.len());
+        for (key, slot) in &destinations {
+            let file = self
+                .files
+                .get(key.shard)
+                .ok_or(StoreError::ShardOutOfRange(key.shard))?;
+            let file_size = self.file_sizes[key.shard];
+            if key.byte_offset >= file_size {
+                return Err(StoreError::PageOutOfRange(*key));
+            }
+            let bytes = (file_size - key.byte_offset).min(self.page_bytes as u64) as usize;
+            reads.push(crate::uring::FixedRead {
+                file,
+                file_offset: key.byte_offset,
+                buffer_offset: slot * self.page_bytes,
+                bytes,
+            });
+        }
+        let parallel = matches!(
+            self.read_policy,
+            FixedReadPolicy::Hybrid {
+                parallel_threshold_pages,
+                ..
+            } if reads.len() >= parallel_threshold_pages
+        );
+        let read_result = match self.read_policy {
+            FixedReadPolicy::Hybrid {
+                parallel_workers, ..
+            } if parallel => self.reader.read_parallel(&reads, parallel_workers),
+            FixedReadPolicy::Uring | FixedReadPolicy::Hybrid { .. } => self.reader.read(&reads),
+        };
+        let read_stats = match read_result {
+            Ok(stats) => stats,
+            Err(error) => {
+                // Destinations may contain partial DMA writes. They remain
+                // invalid and absent from the index, so no later gather can
+                // observe them.
+                return Err(StoreError::Io(error));
+            }
+        };
+        for (key, slot) in destinations {
+            self.slots[slot] = FixedCacheSlot {
+                key: Some(key),
+                referenced: true,
+            };
+            self.index.insert(key, slot);
+        }
+        self.stats.page_reads = self.stats.page_reads.saturating_add(read_stats.operations);
+        if parallel {
+            self.stats.parallel_pread_page_reads = self
+                .stats
+                .parallel_pread_page_reads
+                .saturating_add(read_stats.operations);
+        } else {
+            self.stats.uring_page_reads = self
+                .stats
+                .uring_page_reads
+                .saturating_add(read_stats.operations);
+        }
+        self.stats.bytes_read = self.stats.bytes_read.saturating_add(read_stats.bytes);
+        Ok(())
+    }
+
+    fn reserve_fixed_slot(
+        &mut self,
+        protected: &HashSet<PageKey>,
+        selected: &HashSet<usize>,
+    ) -> Result<usize, StoreError> {
+        if let Some(slot) = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(slot, state)| state.key.is_none() && !selected.contains(slot))
+            .map(|(slot, _)| slot)
+        {
+            return Ok(slot);
+        }
+        let scan_limit = self
+            .slots
+            .len()
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(StoreError::IntegerOverflow)?;
+        for _ in 0..scan_limit {
+            let slot = self.hand;
+            self.hand = (self.hand + 1) % self.slots.len();
+            if selected.contains(&slot)
+                || self.slots[slot]
+                    .key
+                    .map(|key| protected.contains(&key))
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            if self.slots[slot].referenced {
+                self.slots[slot].referenced = false;
+                continue;
+            }
+            return Ok(slot);
+        }
+        Err(StoreError::BatchExceedsCache {
+            pages: protected.len(),
+            capacity: self.slots.len(),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheStats {
     pub page_hits: u64,
@@ -338,6 +883,8 @@ pub struct CacheStats {
     pub page_reads: u64,
     pub bytes_read: u64,
     pub evictions: u64,
+    pub uring_page_reads: u64,
+    pub parallel_pread_page_reads: u64,
 }
 
 struct CacheSlot {
@@ -512,6 +1059,7 @@ pub enum StoreError {
     Io(std::io::Error),
     InvalidCache,
     InvalidPageSource,
+    InvalidCoherentRegion,
     PageSizeMismatch,
     IntegerOverflow,
     ShardOutOfRange(usize),
@@ -527,6 +1075,9 @@ impl fmt::Display for StoreError {
             Self::Io(error) => write!(formatter, "PLE I/O failed: {error}"),
             Self::InvalidCache => write!(formatter, "PLE cache geometry is invalid"),
             Self::InvalidPageSource => write!(formatter, "PLE page source returned invalid data"),
+            Self::InvalidCoherentRegion => {
+                write!(formatter, "PLE coherent slab view is invalid")
+            }
             Self::PageSizeMismatch => write!(formatter, "PLE index and cache page sizes differ"),
             Self::IntegerOverflow => write!(formatter, "PLE storage size overflow"),
             Self::ShardOutOfRange(shard) => write!(formatter, "PLE shard {shard} is out of range"),
@@ -657,6 +1208,34 @@ impl RowLayout<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    struct TempDirectory(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl TempDirectory {
+        fn new() -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "sparkserve-ple-uring-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create temp directory");
+            Self(path)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     struct MemoryPageSource {
         shards: Vec<Vec<u8>>,
@@ -853,5 +1432,82 @@ mod tests {
                 capacity: 2
             })
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_cache_returns_borrowed_row_fragments_from_one_coherent_slab() {
+        use std::io::Write;
+
+        let directory = TempDirectory::new();
+        let source: Vec<u8> = (0..8192).map(|value| (value % 251) as u8).collect();
+        let mut file = File::create(directory.0.join("weights.safetensors")).expect("file");
+        file.write_all(&source).expect("weights");
+        file.sync_all().expect("sync");
+        drop(file);
+        let index = PleIndex {
+            page_bytes: 4096,
+            row_bytes: 160,
+            dtype: PLE_DTYPE_FP8_E4M3,
+            total_rows: 2,
+            scale_bf16_bits: 0x3f80,
+            shards: vec![PleShard {
+                global_row_start: 0,
+                row_count: 2,
+                data_offset: 4016,
+                data_bytes: 320,
+                relative_path: "weights.safetensors".into(),
+            }],
+        };
+        let mut slab = vec![0_u8; 8192];
+        let expected_device_base = NonNull::new(slab.as_mut_ptr().cast()).expect("device base");
+        let view = crate::ffi::CoherentRegionView {
+            struct_size: std::mem::size_of::<crate::ffi::CoherentRegionView>() as u32,
+            abi_version: crate::ffi::FABRIC_ABI_VERSION,
+            kind: crate::ffi::CoherentRegionKind::Slab as u32,
+            flags: 0,
+            host_pointer: slab.as_mut_ptr().cast(),
+            device_pointer: slab.as_mut_ptr().cast(),
+            mapped_bytes: slab.len() as u64,
+            payload_bytes: slab.len() as u64,
+            file_offset: 0,
+            required_alignment: 1,
+            page_bytes: 4096,
+            device_id: 0,
+            reserved: 0,
+        };
+        // SAFETY: the backing Vec remains allocated and exclusively borrowed
+        // by the cache for the remainder of this scope.
+        let mut cache = match unsafe {
+            FixedPleCache::open_coherent_hybrid(&index, &directory.0, &view, 1, 1, 2)
+        } {
+            Ok(cache) => cache,
+            Err(StoreError::Io(error)) if matches!(error.raw_os_error(), Some(code) if code == libc::ENOSYS || code == libc::EPERM) =>
+            {
+                return;
+            }
+            Err(error) => panic!("cache: {error}"),
+        };
+        {
+            let batch = cache.fetch_rows(&index, &[0, 1, 0]).expect("rows");
+            assert_eq!(batch.rows()[0].first.bytes, 80);
+            assert_eq!(batch.rows()[0].second.expect("cross-page").bytes, 80);
+            assert_eq!(batch.device_base(), Some(expected_device_base));
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&source[4016..4176]);
+            expected.extend_from_slice(&source[4176..4336]);
+            expected.extend_from_slice(&source[4016..4176]);
+            assert_eq!(batch.materialize(), expected);
+        }
+        assert_eq!(cache.stats.page_reads, 2);
+        assert_eq!(cache.stats.parallel_pread_page_reads, 2);
+        assert_eq!(cache.stats.uring_page_reads, 0);
+        assert_eq!(cache.stats.bytes_read, 8192);
+        {
+            let hot = cache.fetch_rows(&index, &[0, 1]).expect("hits");
+            assert_eq!(hot.materialize().len(), 320);
+        }
+        assert_eq!(cache.stats.page_hits, 2);
+        assert_eq!(cache.stats.page_reads, 2);
     }
 }

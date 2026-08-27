@@ -7,3 +7,5 @@ pub mod model_lock;
 pub mod routing;
 pub mod scheduler;
 pub mod storage;
+#[cfg(target_os = "linux")]
+pub mod uring;

@@ -201,8 +201,9 @@ kernels—without importing either framework's scheduler, allocator, or graph.
 1. Connect the router projection, borrowed top-k, and shared expert to the now
    byte-exact routed expert pipeline; then capture full-layer logits and greedy
    continuations from the live SGLang service.
-2. Complete Flash-Next PLE parity using borrowed gather arithmetic and the
-   Rust-owned NVMe residency policy; keep routing/top-k separately tested.
+2. Connect the borrowed Flash-Next gather arithmetic to the completed
+   Rust-owned fixed-slab NVMe residency policy; keep routing/top-k separately
+   tested.
 3. Complete QSA/GDN/mHC model-state parity and join the full native token graph.
 4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
 5. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.

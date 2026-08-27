@@ -28,12 +28,18 @@ binary search. It aligns that address to a 4 KiB page and handles the roughly 4%
 of 160-byte rows that cross a page boundary. Duplicate pages in a submission are
 coalesced.
 
-The current reader uses parallel positional reads behind `PageSource::read_pages`.
-The cache is fixed-capacity CLOCK storage, so a scan cannot allocate beyond its
-configured budget. A submission whose unique page set is larger than the cache
-is rejected before I/O; the scheduler must reduce its prefill chunk. The source
-trait is the replacement boundary for registered `io_uring` buffers and later
-GPUDirect Storage experiments.
+The production reader adapts the persistent bounded queue from SGLang storage
+commit `e14d1c3cb62855e774475a55dac80baff45afbd4`. It removes PyO3 and copied
+page vectors: the caller lends one stable slab, Rust registers it once, and
+misses complete into fixed offsets. The `fabric_api.h` constructor retains the
+matching CUDA device base for the same physical bytes.
+
+I/O policy remains a SparkServe scheduling decision. Decode-sized miss sets use
+registered `ReadFixed`; batches of at least 64 pages use 16 parallel positional
+reads into the same slab. A `FixedPleBatch` borrows the cache, preventing CLOCK
+slot reuse until its CUDA gather is complete. A submission larger than the
+window is rejected before I/O so the prefill scheduler must reduce its chunk.
+Containers need an explicit unlimited memlock setting for registered windows.
 
 The Python implementation reads the same binary index and is the correctness
 oracle. Its two-queue cache protects reused pages from one-pass prompt scans.
@@ -55,6 +61,22 @@ The storage cache was empty for these runs, but the Linux filesystem cache was
 not forcibly flushed. These are storage-path measurements, not end-to-end model
 throughput. Both implementations produced checksum `000006054a2b` for the same
 4,096 real row IDs.
+
+The fixed-slab policy was measured separately on the same checkpoint with the
+current 65,536-row deterministic sequence (4,096 tokens × 16 rows). The Linux
+filesystem cache was warm; these numbers isolate scheduling and destination
+memory behavior, not physical cold-NVMe latency.
+
+| Fixed-slab workload | Result |
+| --- | ---: |
+| 4 MiB window, 16-token prefill chunks, parallel positional reads | 17,690 tok/s |
+| 4 MiB window, one-token submissions, registered `io_uring` | 30,604 tok/s |
+| Ordinary page allocations, 512-token prefill chunks | 17,323 tok/s |
+| 512 MiB registered span, 512-token chunks, `io_uring` | 1,481 tok/s |
+
+All four runs produced `0000606275b8`. The result rules out a large pinned PLE
+cache: SparkServe will use two small fixed windows for overlap and leave the
+original 47.7 GiB FP8 tables on NVMe/filesystem cache.
 
 ## End-to-end SGLang oracle
 
@@ -80,12 +102,11 @@ native SparkServe kernel. The server returned the exact non-thinking completion
 
 ## Next kernel boundary
 
-The next milestone replaces `Vec<u8>` cache pages with a registered, page-aligned
-pinned slab. Miss completion writes directly into fixed slots. A GPU tag lookup
-compacts missing `(head, row)` pairs; the existing FP8 PLE gather consumes hits
-and applies BF16 scale bits `0x3951`. Prefill double-buffers chunk `n+1` I/O under
-chunk `n` compute, while decode submits sixteen reads concurrently immediately
-after the next token is known.
+The fixed slab, direct miss completion, and Rust lifetime barrier are complete.
+Next, the borrowed FP8 gather consumes `(offset, length)` fragments and the
+coherent device base, applying BF16 scale bits `0x3951`. Prefill will
+double-buffer chunk `n+1` I/O under chunk `n` compute, while decode submits its
+miss set immediately after the next token is known.
 
 No additional PLE quantization is part of this path. Exact FP8 bytes and the
 checkpoint scale are preserved so outputs can be compared directly with the

@@ -473,7 +473,7 @@ fn validate_config(config: &SchedulerConfig) -> Result<(), SchedulerError> {
     if config.max_prefill_tokens > config.max_context_tokens
         || config.prefill_buckets.is_empty()
         || config.prefill_buckets.last().copied() != Some(config.max_prefill_tokens)
-        || config.prefill_buckets.iter().any(|bucket| *bucket == 0)
+        || config.prefill_buckets.contains(&0)
         || config
             .prefill_buckets
             .windows(2)

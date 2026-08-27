@@ -101,18 +101,21 @@ evictions, and bytes loaded advance only on commit. This keeps storage failure
 semantics in Rust and arithmetic in the borrowed kernel set. The implemented
 scheduler is address-stable and strictly bounded by its configured slot count;
 its logical slots can now be backed by the registered coherent-memory slab. The
-next systems step is to preallocate route scratch, register the slab as an
-`io_uring` fixed buffer, and benchmark direct file mappings against the proven
-resident CUDA allocation before promoting them for hot Qwen weights.
+PLE path now also registers a bounded slab with `io_uring`; GB10 measurements
+show that the registered span must remain small. Route scratch and expert slots
+will follow the same fixed-window rule rather than pinning their entire cold
+working sets.
 
 ### Flash-Next sparse PLE path
 
 The tokenizer/control plane computes the next PLE row ids early. A small index
-maps each id to `(shard, offset)`. Reads for missing rows are coalesced, copied to
-fixed staging slots, and each FP8 value is multiplied by its per-table scale at
-the consuming layer. The kernel accumulates into the model's BF16 stream without
-ever constructing a BF16 copy of the full table. A CLOCK-Pro-style policy
-separates frequently reused n-grams from scans.
+maps each id to `(shard, offset)`. Rust coalesces missing pages into a 4 MiB
+fixed-address window. Decode-sized misses use the persistent registered
+`io_uring` adapted from SGLang; prefill-sized misses use parallel positional
+reads into the same slab. A returned batch borrows the cache, so CLOCK cannot
+recycle a slot until the CUDA gather releases it. The consuming kernel applies
+the per-table scale and accumulates FP8 values into the BF16 stream without ever
+constructing a BF16 copy of the full table.
 
 The checkpoint stores 128 physical tensors shaped `[2,500,012, 160]`; one token
 selects 16 rows, for 2,560 useful bytes. Existing GB10 measurements establish
@@ -219,12 +222,13 @@ configured safety reserve.
 
 ### M3 — Flash-Next sparse PLE
 
-- The exact-FP8 zero-copy safetensors index and bounded parallel row reader are
-  implemented; Python and Rust agree on real-checkpoint row checksums.
-- Replace parallel positional reads with registered `io_uring` buffers and a
-  fixed pinned slab, then connect the existing FP8-to-BF16 gather kernel.
+- The exact-FP8 safetensors index and fixed-address hybrid reader are
+  implemented; registered `io_uring` handles decode misses and parallel
+  positional reads handle prefill misses without an intermediate page copy.
+- Connect the borrowed FP8-to-BF16 gather arithmetic to the CUDA-visible row
+  fragments, then double-buffer two 4 MiB windows to overlap I/O and compute.
 - Keep the 72.498 GiB base checkpoint resident, add the 4.856 GiB MTP weights only
-  when speculation is enabled, and cap PLE cache at 2-4 GiB. Never construct the
+  when speculation is enabled, and keep PLE staging at two 4 MiB windows. Never construct the
   full BF16 PLE tensor; the 0.836 GiB vision tower is excluded in text mode.
 - Gate: peak committed memory below 105 GiB, deterministic cold-cache behavior,
   and PLE stalls hidden for at least 95% of decode steps.

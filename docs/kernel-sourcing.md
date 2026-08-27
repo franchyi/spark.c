@@ -36,7 +36,7 @@ copied source.
 
 Only the Spark-specific glue and kernels whose specialization is the product:
 
-1. original-safetensors PLE address index and asynchronous row reader;
+1. original-safetensors PLE address index and Spark-specific I/O scheduling;
 2. fused 160-byte FP8 row gather, per-table scaling, and BF16 accumulation;
 3. one-copy mapped-weight allocator and residency controller;
 4. fixed-address GGUF expert-block cache with async NVMe admission and telemetry;
