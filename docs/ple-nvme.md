@@ -116,6 +116,14 @@ intermediate allocation. The next scheduling boundary is to double-buffer
 chunk `n+1` I/O under chunk `n` compute, while decode submits its miss set as
 soon as the next token establishes the required n-grams.
 
+The allocation-free Rust double-buffer state machine is implemented. Chunk
+`n` always maps to fixed window `n % 2`; fill and compute leases reject stale
+completion, out-of-order chunks, incomplete descriptor sets, and reuse before a
+CUDA completion. An I/O failure releases the same window for retry, while a
+kernel failure returns the already-loaded window to `ready`. The remaining work
+is event-loop integration and a cold-NVMe overlap measurement, not another
+memory-layout decision.
+
 No additional PLE quantization is part of this path. Exact FP8 bytes and the
 checkpoint scale are preserved so outputs can be compared directly with the
 full-resident SGLang oracle.

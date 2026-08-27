@@ -129,6 +129,14 @@ Against 16 real checkpoint rows spanning shard, page, and table boundaries, its
 launch mean is 2.06 microseconds. The adapter allocates nothing and makes no
 residency decisions; those remain in the Rust scheduler.
 
+The Rust PLE pipeline assigns chunk `n` permanently to window `n % 2`. Each
+window has fixed host-slab, CUDA-slab, descriptor, and output addresses. Its
+allocation-free lease state machine permits one fill to overlap one compute,
+rejects early slot reuse, preserves strict chunk order, retries failed I/O in
+the same window, and returns failed CUDA work to `ready` without reloading.
+Only completion of the compute lease makes the window reusable. Wiring these
+leases to the storage thread and CUDA events is the remaining overlap step.
+
 The checkpoint stores 128 physical tensors shaped `[2,500,012, 160]`; one token
 selects 16 rows, for 2,560 useful bytes. Existing GB10 measurements establish
 that this can be supplied from NVMe. The implementation question is now whether
@@ -239,8 +247,10 @@ configured safety reserve.
   positional reads handle prefill misses without an intermediate page copy.
 - The pinned SGLang FP8-to-BF16 arithmetic is connected to CUDA-visible
   two-fragment rows and passes bit-exact real-checkpoint parity on SM121.
-- Double-buffer two 4 MiB windows to overlap I/O and compute, keeping descriptor
-  and output addresses fixed for graph replay.
+- The allocation-free two-window Rust lease scheduler now fixes slab,
+  descriptor, and output addresses and prevents reuse before compute completion.
+- Wire its fill/compute transitions to the storage thread and CUDA events, then
+  measure how often two 4 MiB windows hide physical NVMe latency.
 - Keep the 72.498 GiB base checkpoint resident, add the 4.856 GiB MTP weights only
   when speculation is enabled, and keep PLE staging at two 4 MiB windows. Never construct the
   full BF16 PLE tensor; the 0.836 GiB vision tower is excluded in text mode.
