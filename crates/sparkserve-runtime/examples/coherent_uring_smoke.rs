@@ -1,8 +1,9 @@
 use sparkserve_runtime::coherent::CoherentRegionOwner;
 use sparkserve_runtime::cuda::CudaStreamOwner;
 use sparkserve_runtime::ffi::COHERENT_REGION_PREFAULT;
-use sparkserve_runtime::qsa::{
-    QsaArenaPhase, QsaCoherentArena, QsaCudaCompletion, QsaCudaFence, QsaSparseDecodePlan,
+use sparkserve_runtime::qsa::QsaSparseDecodePlan;
+use sparkserve_runtime::qsa_pipeline::{
+    QsaCoherentPipeline, QsaPipelineCudaCompletion, QsaPipelineCudaFence, QsaPipelinePhase,
 };
 use sparkserve_runtime::uring::{FixedBufferReader, FixedRead};
 use std::fs::{self, File, OpenOptions};
@@ -60,7 +61,7 @@ fn main() -> io::Result<()> {
         .scratch_layout()
         .map_err(io::Error::other)?
         .total_bytes;
-    let mut qsa_arena = QsaCoherentArena::allocate(qsa_plan, vec![1], COHERENT_REGION_PREFAULT)
+    let mut qsa_arena = QsaCoherentPipeline::allocate(qsa_plan, vec![1], COHERENT_REGION_PREFAULT)
         .map_err(io::Error::other)?;
     assert_eq!(
         qsa_arena
@@ -71,7 +72,7 @@ fn main() -> io::Result<()> {
     );
     assert_eq!(
         qsa_arena.scheduler().phase(),
-        QsaArenaPhase::WorkspaceNeedsZero
+        QsaPipelinePhase::WorkspaceNeedsZero
     );
     assert_eq!(
         qsa_arena.scheduler().arena().device_base(),
@@ -87,7 +88,7 @@ fn main() -> io::Result<()> {
     payload[workspace_end] = 0xa5;
 
     let mut stream = CudaStreamOwner::create().map_err(io::Error::other)?;
-    let mut fence = QsaCudaFence::create().map_err(io::Error::other)?;
+    let mut fence = QsaPipelineCudaFence::create().map_err(io::Error::other)?;
     let zero = qsa_arena
         .scheduler_mut()
         .begin_workspace_zero()
@@ -107,15 +108,15 @@ fn main() -> io::Result<()> {
         .map_err(io::Error::other)?;
     assert_eq!(
         qsa_arena.scheduler().phase(),
-        QsaArenaPhase::ZeroingWorkspace
+        QsaPipelinePhase::ZeroingWorkspace
     );
     assert_eq!(
         fence
             .wait(qsa_arena.scheduler_mut())
             .map_err(io::Error::other)?,
-        QsaCudaCompletion::WorkspaceReady
+        QsaPipelineCudaCompletion::WorkspaceReady
     );
-    assert_eq!(qsa_arena.scheduler().phase(), QsaArenaPhase::Idle);
+    assert_eq!(qsa_arena.scheduler().phase(), QsaPipelinePhase::Idle);
     // SAFETY: event completion and the Idle phase exclude CUDA access.
     let payload = unsafe { qsa_arena.host_payload_mut() }.map_err(io::Error::other)?;
     assert_eq!(payload[layout.attention_workspace_offset], 0);
@@ -123,7 +124,7 @@ fn main() -> io::Result<()> {
     stream.close().map_err(io::Error::other)?;
     drop(qsa_arena);
     println!(
-        "GB10 coherent slabs accepted io_uring plus event-driven fixed-address QSA initialization"
+        "GB10 coherent slabs accepted io_uring plus event-driven fixed-address QSA pipeline initialization"
     );
     Ok(())
 }

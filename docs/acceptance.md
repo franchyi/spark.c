@@ -97,7 +97,7 @@ completes, so host code cannot publish an in-flight arena accidentally. The
 same framework-free shared library and Rust launcher now cover fused index prep
 and radix top-k from coherent memory with exact Q/state/RoPE/compressed-key and
 selected-set parity. This document remains a completion checklist: PLE
-storage-thread/CUDA-event overlap, QSA score/selection glue and full-token graph,
-tokenizer/server, GGUF, GLM
+storage-thread/CUDA-event overlap, QSA score/selection kernels and full-token
+graph, tokenizer/server, GGUF, GLM
 graph, and end-to-end continuation gates are not implied to be finished by this
 graph fragment.

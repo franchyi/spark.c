@@ -203,6 +203,15 @@ Rust-native coherent-memory smoke proves their Q/state/RoPE/compressed-key bits
 and all four selected top-k sets against the oracle. The fixtures are presently
 independent: compressed-query score GEMM plus block-to-token/tail expansion must
 be connected before these four validated donors form one semantic QSA layer.
+The Rust control plane already models those gaps explicitly as a six-stage,
+epoch-checked pipeline: index prep, score, block top-k, selection expansion,
+K/V pack, and XQA. Its typed lease cannot advance to pack without completed
+score and expansion stages. Every stage can be bound to one reusable CUDA event;
+only event query/wait publishes the handoff. Scratch failures roll back to the
+last ready stage, while partial persistent index/decode failures quarantine the
+token until state restoration. A single `QsaCoherentPipeline` owns this scheduler
+and its CUDA-registered pack/XQA arena, preserving fixed addresses across graph
+buckets without a host/device shadow allocation.
 
 ### GGUF
 

@@ -172,6 +172,14 @@ persistent key state, RoPE state, and compressed-key elements are bit-exact, and
 all four 65,536-column top-k rows select the oracle's exact 512-index sets. This
 validates every borrowed QSA operator in the shipping library without claiming
 the still-missing score-GEMM and block-to-token selection glue are joined.
+Rust now enforces that boundary with an allocation-free six-stage token
+scheduler: index-prep, score, block-top-k, selection-expand, K/V-pack, then XQA.
+No caller can jump from top-k directly to pack. One reusable CUDA fence
+owns each pending stage lease and publishes it only after event completion.
+Scratch-only failures retry from the last completed stage; partial persistent
+index/decode updates quarantine the token until its state checkpoint is restored.
+The scheduler and fixed pack/XQA arena are held by one coherent-memory owner, so
+the CUDA-registered mapping cannot outlive or be freed independently of policy.
 
 The Flash-Next storage path now has a cross-language `SSPLEIDX` contract, a
 zero-copy safetensors indexer, bounded Python and Rust caches, cross-page row

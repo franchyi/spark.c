@@ -205,8 +205,9 @@ kernels—without importing either framework's scheduler, allocator, or graph.
 2. Double-buffer the completed PLE gather and fixed-slab reader, then connect its
    fixed descriptors to the token graph; keep routing/top-k separately tested.
 3. Join the completed QSA prep, radix top-k, selected-K/V pack, and borrowed
-   FlashInfer XQA decode; then complete QSA/GDN/mHC state parity and connect the
-   token graph.
+   FlashInfer XQA decode through the implemented six-stage Rust lease scheduler;
+   borrow or adapt score GEMM and block-to-token expansion first, then complete
+   QSA/GDN/mHC state parity and connect the token graph.
 4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
 5. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
 6. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed
