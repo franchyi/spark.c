@@ -15,6 +15,10 @@ _Static_assert(sizeof(SparkServeSiluNvfp4Plan) == 48u,
                "C fused SiLU plan layout drifted");
 _Static_assert(sizeof(SparkServeSiluNvfp4Args) == 128u,
                "C fused SiLU arguments layout drifted");
+_Static_assert(sizeof(SparkServeSegmentedSiluNvfp4Plan) == 56u,
+               "C segmented SiLU plan layout drifted");
+_Static_assert(sizeof(SparkServeSegmentedSiluNvfp4Args) == 152u,
+               "C segmented SiLU arguments layout drifted");
 
 int main(void) {
   SparkServeDenseNvfp4Plan plan = {0};

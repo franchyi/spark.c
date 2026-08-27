@@ -165,6 +165,44 @@ int main() {
   assert(sparkserve_silu_nvfp4_launch(&caps, &silu_args).code ==
          SPARKSERVE_STATUS_INVALID_ARGUMENT);
 
+  SparkServeSegmentedSiluNvfp4Plan segmented = {
+      sizeof(SparkServeSegmentedSiluNvfp4Plan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      2,
+      16,
+      8,
+      256,
+      640,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4,
+      SPARKSERVE_BACKEND_AUTO,
+      0,
+  };
+  assert(sparkserve_segmented_silu_nvfp4_validate(&segmented).code ==
+         SPARKSERVE_STATUS_OK);
+  int32_t segmented_active[] = {4, 2};
+  int32_t segmented_indptr[] = {0, 4, 8};
+  uint64_t segmented_scale_offsets[] = {0, 128};
+  SparkServeSegmentedSiluNvfp4Args segmented_args = {};
+  segmented_args.struct_size = sizeof(segmented_args);
+  segmented_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  segmented_args.plan = segmented;
+  segmented_args.input = &packed;
+  segmented_args.input_global_scales = alpha;
+  segmented_args.active_rows_host = segmented_active;
+  segmented_args.m_indptr_host = segmented_indptr;
+  segmented_args.scale_row_offsets_host = segmented_scale_offsets;
+  segmented_args.packed_output = &packed;
+  segmented_args.output_scales = &scale;
+  segmented_args.input_row_stride_bytes = 640 * 4;
+  segmented_args.output_row_stride_bytes = 640 / 2;
+  segmented_args.scale_row_stride_bytes = 640 / 16;
+  assert(sparkserve_segmented_silu_nvfp4_launch(&caps, &segmented_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  segmented_indptr[2] = 7;
+  assert(sparkserve_segmented_silu_nvfp4_launch(&caps, &segmented_args).code ==
+         SPARKSERVE_STATUS_INVALID_ARGUMENT);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,

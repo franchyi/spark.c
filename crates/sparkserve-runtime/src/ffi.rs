@@ -1,7 +1,8 @@
 use std::ffi::{c_char, c_void};
 
 use crate::kernel::{
-    DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION, SiluNvfp4Spec,
+    DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION, SegmentedSiluNvfp4Spec,
+    SiluNvfp4Spec,
 };
 
 #[repr(C)]
@@ -221,6 +222,59 @@ pub struct SiluNvfp4Args {
     pub cuda_stream: *mut c_void,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentedSiluNvfp4Plan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_experts: u32,
+    pub group_size: u32,
+    pub total_rows: u64,
+    pub input_scale_rows: u64,
+    pub hidden_size: u64,
+    pub input_dtype: u32,
+    pub output_scale_layout: u32,
+    pub requested_backend: u32,
+    pub reserved: u32,
+}
+
+impl From<SegmentedSiluNvfp4Spec> for SegmentedSiluNvfp4Plan {
+    fn from(spec: SegmentedSiluNvfp4Spec) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_experts: spec.num_experts,
+            group_size: spec.group_size,
+            total_rows: spec.total_rows,
+            input_scale_rows: spec.input_scale_rows,
+            hidden_size: spec.hidden_size,
+            input_dtype: spec.input_dtype as u32,
+            output_scale_layout: spec.output_scale_layout as u32,
+            requested_backend: spec.requested_backend as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentedSiluNvfp4Args {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: SegmentedSiluNvfp4Plan,
+    pub input: *const c_void,
+    pub input_global_scales: *const f32,
+    pub active_rows_host: *const i32,
+    pub m_indptr_host: *const i32,
+    pub scale_row_offsets_host: *const u64,
+    pub packed_output: *mut c_void,
+    pub output_scales: *mut c_void,
+    pub input_row_stride_bytes: u64,
+    pub output_row_stride_bytes: u64,
+    pub scale_row_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GdnBackend {
@@ -340,6 +394,16 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const SiluNvfp4Args,
     ) -> Status;
+    pub fn sparkserve_segmented_silu_nvfp4_validate(plan: *const SegmentedSiluNvfp4Plan) -> Status;
+    pub fn sparkserve_segmented_silu_nvfp4_query(
+        caps: *const DeviceCaps,
+        plan: *const SegmentedSiluNvfp4Plan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_segmented_silu_nvfp4_launch(
+        caps: *const DeviceCaps,
+        args: *const SegmentedSiluNvfp4Args,
+    ) -> Status;
     pub fn sparkserve_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn sparkserve_gdn_decode_query(
         caps: *const DeviceCaps,
@@ -372,6 +436,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<GroupedNvfp4Args>(), 224);
         assert_eq!(std::mem::size_of::<SiluNvfp4Plan>(), 48);
         assert_eq!(std::mem::size_of::<SiluNvfp4Args>(), 128);
+        assert_eq!(std::mem::size_of::<SegmentedSiluNvfp4Plan>(), 56);
+        assert_eq!(std::mem::size_of::<SegmentedSiluNvfp4Args>(), 152);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
@@ -429,5 +495,18 @@ mod tests {
             plan.requested_backend,
             KernelBackend::FlashInferCuteSiluNvfp4 as u32
         );
+    }
+
+    #[test]
+    fn segmented_spec_preserves_grouped_offsets() {
+        use crate::kernel::{GroupedExpertLayout, SegmentedSiluNvfp4Spec};
+
+        let layout = GroupedExpertLayout::from_expert_rows(&[4, 0, 2]).expect("layout");
+        let native =
+            SegmentedSiluNvfp4Spec::from_grouped_layout(&layout, 640).expect("segmented spec");
+        let plan = SegmentedSiluNvfp4Plan::from(native);
+        assert_eq!(plan.num_experts, 3);
+        assert_eq!(plan.total_rows, 8);
+        assert_eq!(plan.input_scale_rows, 384);
     }
 }

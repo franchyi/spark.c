@@ -142,6 +142,54 @@ int main(int argc, char** argv) {
     assert(scale_mismatches == 0);
   }
 
+  CudaOk(cudaMemset(output, 0, kOutputBytes));
+  CudaOk(cudaMemset(output_scales, 0, kScaleBytes));
+  const int32_t m_indptr[] = {0, 4, 8};
+  const uint64_t scale_row_offsets[] = {0, 128};
+  SparkServeSegmentedSiluNvfp4Plan segmented_plan = {
+      sizeof(SparkServeSegmentedSiluNvfp4Plan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      kExperts,
+      16,
+      8,
+      256,
+      kHidden,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4,
+      SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4,
+      0,
+  };
+  SparkServeSegmentedSiluNvfp4Args segmented_args = {};
+  segmented_args.struct_size = sizeof(segmented_args);
+  segmented_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  segmented_args.plan = segmented_plan;
+  segmented_args.input = input;
+  segmented_args.input_global_scales = global_scales;
+  segmented_args.active_rows_host = active_rows;
+  segmented_args.m_indptr_host = m_indptr;
+  segmented_args.scale_row_offsets_host = scale_row_offsets;
+  segmented_args.packed_output = output;
+  segmented_args.output_scales = output_scales;
+  segmented_args.input_row_stride_bytes = kHidden * 4;
+  segmented_args.output_row_stride_bytes = kHidden / 2;
+  segmented_args.scale_row_stride_bytes = kHidden / 16;
+  status = sparkserve_segmented_silu_nvfp4_launch(&caps, &segmented_args);
+  if (status.code != SPARKSERVE_STATUS_OK) std::cerr << status.message << '\n';
+  assert(status.code == SPARKSERVE_STATUS_OK);
+  CudaOk(cudaDeviceSynchronize());
+  CudaOk(cudaMemcpy(host_output.data(), output, host_output.size(),
+                    cudaMemcpyDeviceToHost));
+  CudaOk(cudaMemcpy(host_scales.data(), output_scales, host_scales.size(),
+                    cudaMemcpyDeviceToHost));
+  if (argc == 1) {
+    for (uint8_t value : host_output) assert(value == 0);
+    for (uint8_t value : host_scales) assert(value == 0);
+  } else {
+    assert(host_output == expected_output);
+    assert(host_scales == expected_scales);
+  }
+  std::cout << "FlashInfer CuTe segmented SiLU NVFP4 parity passed\n";
+
   CudaOk(cudaFree(global_scales));
   CudaOk(cudaFree(output_scales));
   CudaOk(cudaFree(output));

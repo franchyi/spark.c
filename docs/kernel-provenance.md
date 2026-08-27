@@ -122,7 +122,7 @@ retaining a switch back to the legacy dispatch.
 | SparkServe operation | Semantic oracle | Initial implementation candidate | Reuse mode | Required gate |
 | --- | --- | --- | --- | --- |
 | Qwen3.8 27B dense NVFP4 linear | live SGLang ModelOpt path | FlashInfer `mm_fp4` or direct CUTLASS 79a instantiation | wrap first; specialize later | packed bytes/scales exact, real-tensor output parity, greedy-token parity |
-| Flash-Next routed NVFP4 MoE | SGLang Qwen4-exp + ModelOpt | linked FlashInfer SM120 grouped NVFP4 GEMM plus AOT CuTe fused SiLU/multiply/NVFP4 | GEMM is a framework-free source instantiation; quantizer is a 76 KiB exported object with a small C runtime | two real experts bit-exact for GEMM1; fused quantized values/scales bit-exact; next exact expert ids/order/weights, GEMM2, and scatter parity |
+| Flash-Next routed NVFP4 MoE | SGLang Qwen4-exp + ModelOpt | linked FlashInfer SM120 grouped NVFP4 GEMM plus AOT CuTe fused SiLU/multiply/NVFP4 | GEMM is a framework-free source instantiation; quantizer is a 76 KiB exported object with a small C runtime; Rust owns one shared padded row layout | full two-expert real-weight gate/up → activation → down chain is byte-exact at every intermediate; next exact route dispatch and weighted reduction parity |
 | GDN projection and recurrence | SGLang Qwen4-exp + FlashInfer GDN | local raw CUDA K=V=128 BF16-state decode; later fuse QKV extraction | correctness kernel implemented; optimize behind the same ABI | CPU-reference parity now; real SGLang tensor/state and multi-step parity next |
 | QSA indexer and sparse attention | SGLang QSA backend | SGLang JIT CUDA indexer plus proven SM121 sparse-decode kernel | vendor small CUDA pieces; wrap external attention kernel | exact selected indices/masks/cache writes; dense-attention comparison on small cases |
 | Hyperconnection mix/combine | SGLang Qwen4-exp | small SGLang CUDA/Triton kernels | port or vendor after license audit | per-stream output and residual-state parity |
@@ -199,8 +199,8 @@ kernels—without importing either framework's scheduler, allocator, or graph.
 
 1. Extend the existing real-tensor dense/grouped NVFP4 fixtures to a complete
    MoE layer, logits, and greedy continuations from the live SGLang service.
-2. Connect the now bit-exact fused SiLU/multiply/FP4 AOT donor to the grouped
-   down projection with scheduler-owned activation compaction and no weight copy.
+2. Connect exact top-k route dispatch and weighted reduction around the now
+   byte-exact grouped gate/up → fused activation → grouped down chain.
 3. Complete Flash-Next MoE and PLE parity; keep routing/top-k as a separately
    tested stage.
 4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.

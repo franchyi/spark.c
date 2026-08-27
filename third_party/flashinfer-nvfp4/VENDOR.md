@@ -92,3 +92,13 @@ segments, distinct static scales, and different active row counts.
 `make test-cuda-silu-nvfp4-fixture NVFP4_SILU_FIXTURE=...` calls the exported
 object through the standalone ABI. All packed E2M1 values and E4M3 scale bytes
 match exactly on GB10.
+
+The end-to-end expert arithmetic gate uses real layer-0 gate, up, and down
+weights for experts 0 and 1. `scripts/capture-qwen-moe-fixture.py` records both
+grouped GEMMs and the intervening CuTe activation with independent per-expert
+down scales. `make test-cuda-qwen-moe-fixture QWEN_MOE_FIXTURE=...` replays the
+three borrowed stages through one standalone binary. Gate/up BF16, packed
+activation values, E4M3 activation scales, and down BF16 output all match the
+FlashInfer oracle byte-for-byte. Rust's `GroupedExpertLayout` supplies one
+shared `m_indptr` and scale-row map, so no activation or weight copy occurs
+between these stages.

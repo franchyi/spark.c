@@ -12,6 +12,7 @@ CUDA_NVFP4_FIXTURE_TEST := $(BUILD_DIR)/nvfp4-dense-fixture-test
 CUDA_GROUPED_NVFP4_TEST := $(BUILD_DIR)/nvfp4-grouped-cuda-test
 CUDA_GROUPED_NVFP4_FIXTURE_TEST := $(BUILD_DIR)/nvfp4-grouped-fixture-test
 CUDA_SILU_NVFP4_TEST := $(BUILD_DIR)/nvfp4-silu-cute-test
+CUDA_QWEN_MOE_FIXTURE_TEST := $(BUILD_DIR)/qwen-moe-fixture-test
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_121a
 NVCCFLAGS ?= -O2 -std=c++20 -arch=$(CUDA_ARCH)
@@ -30,7 +31,7 @@ CUTE_NVFP4_OBJECT ?=
 TVM_FFI_ROOT ?=
 CUTE_DSL_ROOT ?=
 
-.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -63,6 +64,10 @@ test-cuda-silu-nvfp4: $(CUDA_SILU_NVFP4_TEST)
 test-cuda-silu-nvfp4-fixture: $(CUDA_SILU_NVFP4_TEST)
 	test -n "$(NVFP4_SILU_FIXTURE)"
 	LD_LIBRARY_PATH=$(TVM_FFI_ROOT)/lib:$$LD_LIBRARY_PATH $(CUDA_SILU_NVFP4_TEST) "$(NVFP4_SILU_FIXTURE)"
+
+test-cuda-qwen-moe-fixture: $(CUDA_QWEN_MOE_FIXTURE_TEST)
+	test -n "$(QWEN_MOE_FIXTURE)"
+	LD_LIBRARY_PATH=$(TVM_FFI_ROOT)/lib:$$LD_LIBRARY_PATH $(CUDA_QWEN_MOE_FIXTURE_TEST) "$(QWEN_MOE_FIXTURE)"
 
 docker-flash-next-sm121:
 	docker build -t sparkserve/sglang:qwen38flashnext-sm121 -f docker/flashnext-sm121/Dockerfile .
@@ -127,5 +132,22 @@ $(CUDA_SILU_NVFP4_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_silu_cute.cc cs
 		-Xcompiler=-pthread \
 		-o $(CUDA_SILU_NVFP4_TEST)
 
+$(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/internal/nvfp4_grouped_backend.h csrc/internal/nvfp4_silu_backend.h csrc/tests/qwen_moe_fixture_test.cc csrc/include/sparkserve/kernel_api.h
+	test -n "$(CUTE_NVFP4_OBJECT)"
+	test -n "$(TVM_FFI_ROOT)"
+	test -n "$(CUTE_DSL_ROOT)"
+	test -f "$(CUTE_NVFP4_OBJECT)"
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_ARCH_FLAGS) -diag-suppress 177 \
+		-diag-suppress 549 -DSPARKSERVE_WITH_FLASHINFER_GROUPED_NVFP4 \
+		-DSPARKSERVE_WITH_FLASHINFER_CUTE_SILU_NVFP4 \
+		-Icsrc/include -Icsrc $(FLASHINFER_INCLUDES) -I$(TVM_FFI_ROOT)/include \
+		csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu \
+		csrc/cuda/nvfp4_silu_cute.cc csrc/tests/qwen_moe_fixture_test.cc \
+		"$(CUTE_NVFP4_OBJECT)" \
+		$(CUTE_DSL_ROOT)/lib/libcuda_dialect_runtime_static.a \
+		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lcuda -lcudart -ldl \
+		-Xcompiler=-pthread -o $(CUDA_QWEN_MOE_FIXTURE_TEST)
+
 clean:
-	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST)
+	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)

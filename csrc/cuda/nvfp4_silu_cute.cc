@@ -89,6 +89,59 @@ class StreamScope {
   int status_ = 0;
 };
 
+SparkServeStatus LaunchOne(const uint8_t* input, uint8_t* packed_output,
+                           uint8_t* output_scales,
+                           const float* global_scale, int32_t rows,
+                           int device_id, int multiprocessors) {
+  const int64_t padded_rows =
+      (static_cast<int64_t>(rows) + kScaleTileRows - 1) /
+      kScaleTileRows * kScaleTileRows;
+  const int64_t num_blocks = std::min<int64_t>(
+      (padded_rows + kRowsPerBlock - 1) / kRowsPerBlock,
+      static_cast<int64_t>(multiprocessors) * kBlocksPerSm);
+  int64_t input_shape[2] = {rows, kInputColumns};
+  int64_t input_strides[2] = {kInputColumns, 1};
+  int64_t output_shape[2] = {rows, kPackedColumns};
+  int64_t output_strides[2] = {kPackedColumns, 1};
+  int64_t scale_shape[1] = {padded_rows * kScaleColumns};
+  int64_t scale_strides[1] = {1};
+  int64_t global_scale_shape[1] = {1};
+  int64_t global_scale_strides[1] = {1};
+  const DLDevice device = {kDLCUDA, device_id};
+  const DLDataType bf16 = {kDLBfloat, 16, 1};
+  const DLDataType uint8 = {kDLUInt, 8, 1};
+  const DLDataType float32 = {kDLFloat, 32, 1};
+  DLTensor input_tensor =
+      Tensor(const_cast<uint8_t*>(input), device, 2, bf16, input_shape,
+             input_strides);
+  DLTensor output_tensor = Tensor(packed_output, device, 2, uint8,
+                                  output_shape, output_strides);
+  DLTensor scale_tensor = Tensor(output_scales, device, 1, uint8, scale_shape,
+                                 scale_strides);
+  DLTensor global_scale_tensor =
+      Tensor(const_cast<float*>(global_scale), device, 1, float32,
+             global_scale_shape, global_scale_strides);
+  TVMFFIAny call_args[7] = {
+      TensorArgument(&input_tensor),
+      TensorArgument(&output_tensor),
+      TensorArgument(&scale_tensor),
+      IntegerArgument(rows),
+      IntegerArgument(padded_rows),
+      IntegerArgument(num_blocks),
+      TensorArgument(&global_scale_tensor),
+  };
+  TVMFFIAny result = {};
+  result.type_index = kTVMFFINone;
+  const int status =
+      __tvm_ffi_nvfp4_quantize_swizzled_bfloat16_k640_sf0_pdl0_silu(
+          nullptr, call_args, 7, &result);
+  if (status != 0) {
+    return {SPARKSERVE_STATUS_INTERNAL,
+            "FlashInfer CuTe fused SiLU NVFP4 call failed"};
+  }
+  return Ok();
+}
+
 }  // namespace
 
 SparkServeStatus sparkserve_flashinfer_cute_silu_nvfp4_launch(
@@ -119,11 +172,6 @@ SparkServeStatus sparkserve_flashinfer_cute_silu_nvfp4_launch(
   const auto* input = static_cast<const uint8_t*>(args->input);
   auto* packed_output = static_cast<uint8_t*>(args->packed_output);
   auto* output_scales = static_cast<uint8_t*>(args->output_scales);
-  const DLDevice device = {kDLCUDA, device_id};
-  const DLDataType bf16 = {kDLBfloat, 16, 1};
-  const DLDataType uint8 = {kDLUInt, 8, 1};
-  const DLDataType float32 = {kDLFloat, 32, 1};
-
   for (uint32_t expert = 0; expert < args->plan.num_experts; ++expert) {
     const int32_t rows = args->active_rows[expert];
     if (rows < 0 || rows > static_cast<int32_t>(args->plan.rows_per_expert)) {
@@ -131,55 +179,67 @@ SparkServeStatus sparkserve_flashinfer_cute_silu_nvfp4_launch(
     }
     if (rows == 0) continue;
 
-    const int64_t padded_rows =
-        (static_cast<int64_t>(rows) + kScaleTileRows - 1) /
-        kScaleTileRows * kScaleTileRows;
-    const int64_t num_blocks = std::min<int64_t>(
-        (padded_rows + kRowsPerBlock - 1) / kRowsPerBlock,
-        static_cast<int64_t>(multiprocessors) * kBlocksPerSm);
-    int64_t input_shape[2] = {rows, kInputColumns};
-    int64_t input_strides[2] = {kInputColumns, 1};
-    int64_t output_shape[2] = {rows, kPackedColumns};
-    int64_t output_strides[2] = {kPackedColumns, 1};
-    int64_t scale_shape[1] = {padded_rows * kScaleColumns};
-    int64_t scale_strides[1] = {1};
-    int64_t global_scale_shape[1] = {1};
-    int64_t global_scale_strides[1] = {1};
-    DLTensor input_tensor = Tensor(
-        const_cast<uint8_t*>(input + expert * args->input_expert_stride_bytes),
-        device, 2, bf16, input_shape, input_strides);
-    DLTensor output_tensor = Tensor(
-        packed_output + expert * args->output_expert_stride_bytes, device, 2,
-        uint8, output_shape, output_strides);
-    DLTensor scale_tensor = Tensor(
-        output_scales + expert * args->scale_expert_stride_bytes, device, 1,
-        uint8, scale_shape, scale_strides);
-    DLTensor global_scale_tensor = Tensor(
-        const_cast<float*>(args->input_global_scales + expert), device, 1,
-        float32, global_scale_shape, global_scale_strides);
-    TVMFFIAny call_args[7] = {
-        TensorArgument(&input_tensor),
-        TensorArgument(&output_tensor),
-        TensorArgument(&scale_tensor),
-        IntegerArgument(rows),
-        IntegerArgument(padded_rows),
-        IntegerArgument(num_blocks),
-        TensorArgument(&global_scale_tensor),
-    };
-    TVMFFIAny result = {};
-    result.type_index = kTVMFFINone;
-    const int status =
-        __tvm_ffi_nvfp4_quantize_swizzled_bfloat16_k640_sf0_pdl0_silu(
-            nullptr, call_args, 7, &result);
-    if (status != 0) {
-      return {SPARKSERVE_STATUS_INTERNAL,
-              "FlashInfer CuTe fused SiLU NVFP4 call failed"};
-    }
+    SparkServeStatus status = LaunchOne(
+        input + expert * args->input_expert_stride_bytes,
+        packed_output + expert * args->output_expert_stride_bytes,
+        output_scales + expert * args->scale_expert_stride_bytes,
+        args->input_global_scales + expert, rows, device_id, multiprocessors);
+    if (status.code != SPARKSERVE_STATUS_OK) return status;
   }
 
   error = cudaGetLastError();
   if (error != cudaSuccess) {
     return Internal("FlashInfer CuTe fused SiLU NVFP4 launch failed: ",
+                    cudaGetErrorString(error));
+  }
+  return Ok();
+}
+
+SparkServeStatus sparkserve_flashinfer_cute_segmented_silu_nvfp4_launch(
+    const SparkServeSegmentedSiluNvfp4Args* args) {
+  if (args->plan.hidden_size != kHiddenSize) {
+    return Invalid("linked FlashInfer CuTe artifact is specialized for K=640");
+  }
+
+  int device_id = 0;
+  cudaError_t error = cudaGetDevice(&device_id);
+  if (error != cudaSuccess) {
+    return Internal("cannot resolve segmented NVFP4 CUDA device: ",
+                    cudaGetErrorString(error));
+  }
+  int multiprocessors = 0;
+  error = cudaDeviceGetAttribute(&multiprocessors,
+                                 cudaDevAttrMultiProcessorCount, device_id);
+  if (error != cudaSuccess) {
+    return Internal("cannot resolve segmented NVFP4 SM count: ",
+                    cudaGetErrorString(error));
+  }
+  StreamScope stream_scope(device_id, args->cuda_stream);
+  if (stream_scope.status() != 0) {
+    return {SPARKSERVE_STATUS_INTERNAL,
+            "cannot set the TVM-FFI CUDA stream for the CuTe artifact"};
+  }
+
+  const auto* input = static_cast<const uint8_t*>(args->input);
+  auto* packed_output = static_cast<uint8_t*>(args->packed_output);
+  auto* output_scales = static_cast<uint8_t*>(args->output_scales);
+  for (uint32_t expert = 0; expert < args->plan.num_experts; ++expert) {
+    const int32_t rows = args->active_rows_host[expert];
+    if (rows == 0) continue;
+    const uint64_t row_offset =
+        static_cast<uint64_t>(args->m_indptr_host[expert]);
+    const uint64_t scale_row_offset = args->scale_row_offsets_host[expert];
+    SparkServeStatus status = LaunchOne(
+        input + row_offset * args->input_row_stride_bytes,
+        packed_output + row_offset * args->output_row_stride_bytes,
+        output_scales + scale_row_offset * args->scale_row_stride_bytes,
+        args->input_global_scales + expert, rows, device_id, multiprocessors);
+    if (status.code != SPARKSERVE_STATUS_OK) return status;
+  }
+
+  error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return Internal("FlashInfer CuTe segmented SiLU NVFP4 launch failed: ",
                     cudaGetErrorString(error));
   }
   return Ok();

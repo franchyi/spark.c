@@ -485,6 +485,132 @@ extern "C" SparkServeStatus sparkserve_silu_nvfp4_launch(
 #endif
 }
 
+extern "C" SparkServeStatus sparkserve_segmented_silu_nvfp4_validate(
+    const SparkServeSegmentedSiluNvfp4Plan* plan) {
+  if (plan == nullptr) return Invalid("segmented SiLU NVFP4 plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_experts == 0 || plan->num_experts > 512) {
+    return Invalid("segmented SiLU NVFP4 requires between 1 and 512 experts");
+  }
+  if (plan->total_rows == 0 || plan->total_rows % 4 != 0 ||
+      plan->input_scale_rows < plan->total_rows ||
+      plan->input_scale_rows % 128 != 0) {
+    return Invalid("segmented SiLU NVFP4 row layout is invalid");
+  }
+  if (plan->total_rows >
+      static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+    return Invalid("segmented SiLU NVFP4 rows exceed the donor INT32 range");
+  }
+  if (plan->hidden_size == 0 || plan->hidden_size % 128 != 0) {
+    return Invalid("segmented SiLU NVFP4 hidden size must align to 128");
+  }
+  if (plan->group_size != kNvfp4GroupSize) {
+    return Unsupported("segmented SiLU NVFP4 group size must be 16");
+  }
+  if (plan->input_dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("segmented SiLU NVFP4 donor accepts BF16 input");
+  }
+  if (plan->output_scale_layout !=
+      SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4) {
+    return Unsupported("segmented SiLU NVFP4 requires CUTLASS 128x4 scales");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4) {
+    return Invalid("unknown segmented SiLU NVFP4 backend");
+  }
+  const uint64_t scale_columns =
+      (plan->hidden_size / kNvfp4GroupSize + 3) / 4 * 4;
+  if (!CanMultiply(plan->hidden_size, 4) ||
+      !CanMultiply(plan->total_rows, plan->hidden_size * 4) ||
+      !CanMultiply(plan->total_rows, plan->hidden_size / 2) ||
+      !CanMultiply(plan->input_scale_rows, scale_columns)) {
+    return Invalid("segmented SiLU NVFP4 buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_segmented_silu_nvfp4_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSegmentedSiluNvfp4Plan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  SparkServeStatus plan_status = sparkserve_segmented_silu_nvfp4_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_FLASHINFER_CUTE_SILU_NVFP4;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "flashinfer-cute-segmented-silu-mul-nvfp4";
+  info->source_revision =
+      "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+#ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_SILU_NVFP4
+  info->available = plan->hidden_size == 640 ? 1 : 0;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_segmented_silu_nvfp4_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSegmentedSiluNvfp4Args* args) {
+  SparkServeStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (args == nullptr) {
+    return Invalid("segmented SiLU NVFP4 arguments are required");
+  }
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeStatus plan_status =
+      sparkserve_segmented_silu_nvfp4_validate(&args->plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (args->input == nullptr || args->input_global_scales == nullptr ||
+      args->active_rows_host == nullptr || args->m_indptr_host == nullptr ||
+      args->scale_row_offsets_host == nullptr ||
+      args->packed_output == nullptr || args->output_scales == nullptr) {
+    return Invalid("segmented SiLU NVFP4 launch pointers cannot be null");
+  }
+  if (args->input_row_stride_bytes != args->plan.hidden_size * 4 ||
+      args->output_row_stride_bytes != args->plan.hidden_size / 2 ||
+      args->scale_row_stride_bytes != args->plan.hidden_size / 16) {
+    return Invalid("segmented SiLU NVFP4 requires compact row strides");
+  }
+  if (args->m_indptr_host[0] != 0) {
+    return Invalid("segmented SiLU NVFP4 m_indptr must begin at zero");
+  }
+  for (uint32_t expert = 0; expert < args->plan.num_experts; ++expert) {
+    const int32_t begin = args->m_indptr_host[expert];
+    const int32_t end = args->m_indptr_host[expert + 1];
+    const int32_t active = args->active_rows_host[expert];
+    if (begin < 0 || end < begin || (end - begin) % 4 != 0 || active < 0 ||
+        active > end - begin) {
+      return Invalid("segmented SiLU NVFP4 expert row metadata is invalid");
+    }
+    const uint64_t scale_offset = args->scale_row_offsets_host[expert];
+    const uint64_t active_scale_rows =
+        active == 0 ? 128 : (static_cast<uint64_t>(active) + 127) / 128 * 128;
+    if (scale_offset % 128 != 0 ||
+        scale_offset > args->plan.input_scale_rows ||
+        active_scale_rows > args->plan.input_scale_rows - scale_offset) {
+      return Invalid("segmented SiLU NVFP4 scale-row metadata is invalid");
+    }
+  }
+  if (static_cast<uint64_t>(args->m_indptr_host[args->plan.num_experts]) !=
+      args->plan.total_rows) {
+    return Invalid("segmented SiLU NVFP4 m_indptr does not cover total rows");
+  }
+#ifdef SPARKSERVE_WITH_FLASHINFER_CUTE_SILU_NVFP4
+  return sparkserve_flashinfer_cute_segmented_silu_nvfp4_launch(args);
+#else
+  return Unavailable("FlashInfer CuTe fused SiLU NVFP4 artifact is not linked");
+#endif
+}
+
 extern "C" SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan) {
   if (plan == nullptr) return Invalid("GDN decode plan is required");

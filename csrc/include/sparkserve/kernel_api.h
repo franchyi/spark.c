@@ -208,6 +208,42 @@ typedef struct SparkServeSiluNvfp4Args {
   void* cuda_stream;
 } SparkServeSiluNvfp4Args;
 
+// In-place-friendly form for the grouped MoE pipeline. `input` is the compact
+// BF16 output of grouped GEMM1 and `packed_output` is the compact input for
+// grouped GEMM2. Rust supplies host-resident row metadata from the same
+// GroupedExpertLayout used to build m_indptr; no activation or weight copy is
+// needed between the borrowed kernels.
+typedef struct SparkServeSegmentedSiluNvfp4Plan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_experts;
+  uint32_t group_size;
+  uint64_t total_rows;
+  uint64_t input_scale_rows;
+  uint64_t hidden_size;
+  uint32_t input_dtype;
+  uint32_t output_scale_layout;
+  uint32_t requested_backend;
+  uint32_t reserved;
+} SparkServeSegmentedSiluNvfp4Plan;
+
+typedef struct SparkServeSegmentedSiluNvfp4Args {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeSegmentedSiluNvfp4Plan plan;
+  const void* input;
+  const float* input_global_scales;
+  const int32_t* active_rows_host;
+  const int32_t* m_indptr_host;
+  const uint64_t* scale_row_offsets_host;
+  void* packed_output;
+  void* output_scales;
+  uint64_t input_row_stride_bytes;
+  uint64_t output_row_stride_bytes;
+  uint64_t scale_row_stride_bytes;
+  void* cuda_stream;
+} SparkServeSegmentedSiluNvfp4Args;
+
 typedef struct SparkServeKernelInfo {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -299,6 +335,18 @@ SparkServeStatus sparkserve_silu_nvfp4_query(
 SparkServeStatus sparkserve_silu_nvfp4_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeSiluNvfp4Args* args);
+
+SparkServeStatus sparkserve_segmented_silu_nvfp4_validate(
+    const SparkServeSegmentedSiluNvfp4Plan* plan);
+
+SparkServeStatus sparkserve_segmented_silu_nvfp4_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSegmentedSiluNvfp4Plan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_segmented_silu_nvfp4_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSegmentedSiluNvfp4Args* args);
 
 SparkServeStatus sparkserve_gdn_decode_validate(
     const SparkServeGdnDecodePlan* plan);
