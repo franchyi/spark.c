@@ -180,8 +180,15 @@ FlashInfer 0.6.17 `auto` selects XQA on SM121 and that forced TRT-LLM-gen is not
 supported. SparkServe directly compiles the pinned BF16 XQA specialization
 behind its raw ABI; batch-one output is bit-exact and takes 7.55 microseconds.
 The 128-MiB fixed workspace is split into XQA's 8-MiB semaphore region and
-120-MiB scratch region. Rust retains ownership of logical-to-physical KV maps,
-residency, graph buckets, and replay.
+120-MiB scratch region. All graph buckets are metadata views over one max-batch
+coherent allocation, not separate workspaces. Rust advances an epoch-checked
+`packing -> ready -> decoding` lease state machine and releases the addresses
+only after the matching CUDA completion event. A partial XQA failure returns
+the scheduler to `workspace-needs-zero`, because the donor's multi-block atomic
+semaphores may have advanced. The mapping itself is held by a unique Rust owner
+around the native `mmap` plus CUDA registration handle. Rust therefore owns
+logical-to-physical KV maps, residency, mapping lifetime, graph buckets, and
+replay; FlashInfer owns only attention arithmetic.
 
 ### GGUF
 

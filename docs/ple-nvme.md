@@ -112,9 +112,13 @@ scaled BF16 values match the pinned SGLang oracle bit-for-bit on SM121, with a
 The same 4 MiB anonymous slab has passed simultaneous CUDA host registration
 and `io_uring` fixed-buffer registration on GB10. Two real `ReadFixed`
 operations completed directly into it and produced exact bytes without an
-intermediate allocation. The next scheduling boundary is to double-buffer
-chunk `n+1` I/O under chunk `n` compute, while decode submits its miss set as
-soon as the next token establishes the required n-grams.
+intermediate allocation. Rust now uniquely owns the native mapping handle and
+copies native error text before any later FFI call; explicit close or `Drop`
+unregisters it exactly once. CPU access remains an unsafe, exclusive borrow so
+the PLE lease/CUDA-event layer must prove that no kernel owns the same bytes.
+The next scheduling boundary is to double-buffer chunk `n+1` I/O under chunk
+`n` compute, while decode submits its miss set as soon as the next token
+establishes the required n-grams.
 
 The allocation-free Rust double-buffer state machine is implemented. Chunk
 `n` always maps to fixed window `n % 2`; fill and compute leases reject stale

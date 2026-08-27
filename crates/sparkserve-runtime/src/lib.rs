@@ -1,4 +1,6 @@
 pub mod checkpoint;
+#[cfg(feature = "native-fabric")]
+pub mod coherent;
 pub mod fabric;
 pub mod ffi;
 pub mod kernel;

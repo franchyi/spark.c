@@ -71,6 +71,26 @@ pub struct CoherentRegionView {
     pub reserved: u32,
 }
 
+impl CoherentRegionView {
+    pub fn empty() -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: FABRIC_ABI_VERSION,
+            kind: 0,
+            flags: 0,
+            host_pointer: std::ptr::null_mut(),
+            device_pointer: std::ptr::null_mut(),
+            mapped_bytes: 0,
+            payload_bytes: 0,
+            file_offset: 0,
+            required_alignment: 0,
+            page_bytes: 0,
+            device_id: 0,
+            reserved: 0,
+        }
+    }
+}
+
 #[repr(C)]
 pub struct CoherentRegion {
     _private: [u8; 0],

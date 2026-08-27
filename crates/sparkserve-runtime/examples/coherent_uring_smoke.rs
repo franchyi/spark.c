@@ -1,39 +1,9 @@
-use sparkserve_runtime::ffi::{
-    COHERENT_REGION_PREFAULT, CoherentRegion, CoherentRegionConfig, CoherentRegionView,
-    FABRIC_ABI_VERSION, sparkserve_coherent_region_create, sparkserve_coherent_region_destroy,
-    sparkserve_coherent_region_view,
-};
+use sparkserve_runtime::coherent::CoherentRegionOwner;
+use sparkserve_runtime::ffi::COHERENT_REGION_PREFAULT;
+use sparkserve_runtime::qsa::{QsaArenaPhase, QsaCoherentArena, QsaSparseDecodePlan};
 use sparkserve_runtime::uring::{FixedBufferReader, FixedRead};
-use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::ptr;
-
-struct Region(*mut CoherentRegion);
-
-impl Drop for Region {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns the native region handle.
-        let status = unsafe { sparkserve_coherent_region_destroy(self.0) };
-        assert_eq!(status.code, 0, "coherent region destroy failed");
-    }
-}
-
-fn status_result(status: sparkserve_runtime::ffi::Status) -> io::Result<()> {
-    if status.code == 0 {
-        return Ok(());
-    }
-    let message = if status.message.is_null() {
-        "native fabric error".to_owned()
-    } else {
-        // SAFETY: native status messages remain valid until the next native
-        // call on this thread and are NUL-terminated.
-        unsafe { CStr::from_ptr(status.message) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    Err(io::Error::other(message))
-}
 
 fn scratch_file() -> io::Result<(std::path::PathBuf, File)> {
     let path = std::env::temp_dir().join(format!(
@@ -53,39 +23,11 @@ fn scratch_file() -> io::Result<(std::path::PathBuf, File)> {
 }
 
 fn main() -> io::Result<()> {
-    let config = CoherentRegionConfig::slab(4 * 1024 * 1024, 4096, COHERENT_REGION_PREFAULT);
-    let mut raw_region = ptr::null_mut();
-    // SAFETY: the config and output pointer follow fabric ABI version one.
-    status_result(unsafe { sparkserve_coherent_region_create(&config, &mut raw_region) })?;
-    if raw_region.is_null() {
-        return Err(io::Error::other("native fabric returned a null region"));
-    }
-    let region = Region(raw_region);
-    let mut view = CoherentRegionView {
-        struct_size: std::mem::size_of::<CoherentRegionView>() as u32,
-        abi_version: FABRIC_ABI_VERSION,
-        kind: 0,
-        flags: 0,
-        host_pointer: ptr::null_mut(),
-        device_pointer: ptr::null_mut(),
-        mapped_bytes: 0,
-        payload_bytes: 0,
-        file_offset: 0,
-        required_alignment: 0,
-        page_bytes: 0,
-        device_id: 0,
-        reserved: 0,
-    };
-    // SAFETY: `region` remains alive until after the view and reader are gone.
-    status_result(unsafe { sparkserve_coherent_region_view(region.0, &mut view) })?;
-    if view.host_pointer.is_null() || view.device_pointer.is_null() {
-        return Err(io::Error::other("coherent region returned null pointers"));
-    }
-    let payload_bytes = usize::try_from(view.payload_bytes)
-        .map_err(|_| io::Error::other("coherent payload exceeds usize"))?;
-    // SAFETY: the region exclusively lends its writable slab to this reader.
-    let slab =
-        unsafe { std::slice::from_raw_parts_mut(view.host_pointer.cast::<u8>(), payload_bytes) };
+    let mut region = CoherentRegionOwner::slab(4 * 1024 * 1024, 4096, COHERENT_REGION_PREFAULT)
+        .map_err(io::Error::other)?;
+    // SAFETY: no CUDA work is submitted while the fixed reader owns the CPU
+    // alias. The native smoke test validates device visibility afterwards.
+    let slab = unsafe { region.host_payload_mut() }.map_err(io::Error::other)?;
     let mut reader = FixedBufferReader::new(slab, 2, 2)?;
     let (path, file) = scratch_file()?;
     let stats = reader.read(&[
@@ -108,7 +50,25 @@ fn main() -> io::Result<()> {
     drop(reader);
     drop(file);
     fs::remove_file(path)?;
-    drop(region);
-    println!("GB10 coherent slab accepted simultaneous CUDA and io_uring registration");
+    region.close().map_err(io::Error::other)?;
+
+    let qsa_plan = QsaSparseDecodePlan::qwen38_flash(1).map_err(io::Error::other)?;
+    let qsa_bytes = qsa_plan
+        .scratch_layout()
+        .map_err(io::Error::other)?
+        .total_bytes;
+    let qsa_arena = QsaCoherentArena::allocate(qsa_plan, vec![1], COHERENT_REGION_PREFAULT)
+        .map_err(io::Error::other)?;
+    assert_eq!(qsa_arena.region().payload_bytes().unwrap(), qsa_bytes);
+    assert_eq!(
+        qsa_arena.scheduler().phase(),
+        QsaArenaPhase::WorkspaceNeedsZero
+    );
+    assert_eq!(
+        qsa_arena.scheduler().arena().device_base(),
+        qsa_arena.region().device_address()
+    );
+    drop(qsa_arena);
+    println!("GB10 coherent slabs accepted io_uring registration and a fixed-address QSA arena");
     Ok(())
 }

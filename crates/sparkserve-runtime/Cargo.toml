@@ -15,7 +15,8 @@ path = "examples/coherent_uring_smoke.rs"
 required-features = ["native-fabric-smoke"]
 
 [features]
-native-fabric-smoke = []
+native-fabric = []
+native-fabric-smoke = ["native-fabric"]
 
 [dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

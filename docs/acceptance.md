@@ -84,8 +84,12 @@ also matches Q output and all raw/compressed key and RoPE state bits. The
 selected-K/V adapter now matches SGLang's valid counts and all packed BF16 bits;
 Rust fixes its 64-token page table, scratch addresses, graph buckets, and
 128-MiB downstream workspace. The pinned FlashInfer XQA source now consumes
-that layout through the raw ABI with bit-exact BF16 output at batch one. This
-document remains a completion checklist: storage-thread/CUDA-event overlap
-integration, joined QSA/full-token graph parity, tokenizer/server, GGUF, GLM
-graph, and end-to-end continuation gates are not implied to be finished by
-isolated kernel and fabric tests.
+that layout through the raw ABI with bit-exact BF16 output at batch one. Its
+Rust arena lifecycle now shares one coherent max-batch allocation across graph
+buckets, blocks early reuse with pack/ready/decode leases, resets after failed
+XQA launches, and owns the native mapping until scheduler teardown. The GB10
+native smoke test allocates this full QSA arena successfully. This document
+remains a completion checklist: storage-thread/CUDA-event overlap integration,
+joined QSA/full-token graph parity, tokenizer/server, GGUF, GLM graph, and
+end-to-end continuation gates are not implied to be finished by isolated kernel
+and fabric tests.

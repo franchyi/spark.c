@@ -149,7 +149,13 @@ attention. SGLang-derived fused index prep, radix top-k, and selected-K/V pack
 feed FlashInfer's pinned BF16 XQA kernel through raw C ABIs. On GB10, all packed
 K/V bits and the batch-one attention output match their framework oracles;
 the XQA launch itself takes 7.55 microseconds. Rust owns the fixed 64-token page
-tables, graph-bucket addresses, valid lengths, and 128-MiB workspace split.
+tables, graph-bucket addresses, valid lengths, and 128-MiB workspace split. One
+max-batch coherent allocation now backs every graph bucket. An allocation-free
+Rust lease machine prevents repack while selected-K/V packing or XQA owns that
+allocation, rejects stale and foreign completions, and forces a semaphore reset
+after any failed XQA launch. The native `mmap`/CUDA registration handle also has
+a unique Rust owner, so the stable device mapping cannot be freed independently
+of its scheduler.
 
 The Flash-Next storage path now has a cross-language `SSPLEIDX` contract, a
 zero-copy safetensors indexer, bounded Python and Rust caches, cross-page row
