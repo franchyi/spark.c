@@ -128,12 +128,20 @@ scripts/smoke-flash-next-api.sh
 ```
 
 The smoke profile omits the visual tower, drops each checkpoint shard from the OS
-page cache after loading, and starts without speculative decoding. It limits
-decode CUDA graphs to batch one, disables prefill graphs, and caps context at
-32K. This isolates base-model correctness before enabling the checkpoint's BF16
-NEXTN/MTP tensors.
+page cache after loading, and starts without speculative decoding. It disables
+CUDA graphs because the first NVMe adapter performs a live PLE lookup on every
+forward pass, and caps context at 32K. The NVMe profile defaults the
+static-memory fraction to 0.82: the non-PLE weights consume about 80 GiB, while
+the remaining headroom protects this shared unified-memory machine. Override it
+with `SPARKSERVE_MEM_FRACTION_STATIC`. This isolates base-model correctness
+before enabling the checkpoint's BF16 NEXTN/MTP tensors.
 The currently running Qwen3.8 27B service must be stopped first because both
 servers cannot safely reserve Spark unified memory at the same time.
+
+This container is a disposable correctness oracle. SGLang, PyTorch, Triton, and
+TileLang are not production dependencies of the standalone engine. Golden
+tokens and intermediate tensors from this path gate the native Rust + CUDA
+implementation.
 
 ## Why Rust plus CUDA, not a large Python stack or one C file?
 

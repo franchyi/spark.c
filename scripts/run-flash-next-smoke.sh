@@ -12,6 +12,12 @@ if [[ ! -f "${model_dir}/config.json" ]]; then
   exit 2
 fi
 
+if [[ ! -f "${model_dir}/.sparkserve/ple.ssple" ]]; then
+  echo "missing SparkServe PLE index: ${model_dir}/.sparkserve/ple.ssple" >&2
+  echo "run: uv run sparkserve ple-index ${model_dir} ${model_dir}/.sparkserve/ple.ssple" >&2
+  exit 2
+fi
+
 if find "${model_dir}/.cache" -type f -name '*.incomplete' -print -quit 2>/dev/null | grep -q .; then
   echo "model download is incomplete: ${model_dir}" >&2
   exit 2
@@ -31,6 +37,10 @@ docker run -d \
   --ulimit memlock=-1 \
   --cap-add IPC_LOCK \
   -e PYTHONUNBUFFERED=1 \
+  -e SPARKSERVE_PLE_INDEX=/model/.sparkserve/ple.ssple \
+  -e SPARKSERVE_MODEL_ROOT=/model \
+  -e SPARKSERVE_PLE_CACHE_MIB="${SPARKSERVE_PLE_CACHE_MIB:-512}" \
+  -e SPARKSERVE_PLE_WORKERS="${SPARKSERVE_PLE_WORKERS:-16}" \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
   -e SGLANG_CACHE_DIR=/cache/sglang \
@@ -51,13 +61,12 @@ docker run -d \
     --decode-attention-backend trtllm_mha \
     --page-size 64 \
     --chunked-prefill-size 4096 \
-    --disable-prefill-cuda-graph \
-    --cuda-graph-max-bs-decode 1 \
-    --cuda-graph-bs-decode 1 \
+    --cuda-graph-backend-decode disabled \
+    --cuda-graph-backend-prefill disabled \
     --mamba-ssm-dtype bfloat16 \
     --mamba-radix-cache-strategy extra_buffer \
     --mamba-track-interval 64 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static "${SPARKSERVE_MEM_FRACTION_STATIC:-0.82}" \
     --context-length 32768 \
     --max-running-requests 1 \
     --reasoning-parser qwen3 \

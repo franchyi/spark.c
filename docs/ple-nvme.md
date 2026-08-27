@@ -56,6 +56,28 @@ not forcibly flushed. These are storage-path measurements, not end-to-end model
 throughput. Both implementations produced checksum `000006054a2b` for the same
 4,096 real row IDs.
 
+## End-to-end SGLang oracle
+
+The opt-in compatibility adapter was also exercised through the complete
+Qwen3.8 Flash-Next NVFP4 model on one Spark. The PLE table remained in its
+original safetensors on NVMe; the adapter used a 512 MiB page cache and converted
+only selected FP8 rows to BF16. CUDA graphs were disabled because a Python-side
+lookup cannot be captured correctly.
+
+| Oracle workload | Result |
+| --- | ---: |
+| Fresh 3,082-token prompt plus one output token | 2.36 s, about 1,306 prompt tok/s |
+| Forced 256-token decode | 15.0 tok/s end-to-end, 15.7 tok/s steady |
+| Non-PLE model weights | 81.35 GiB |
+| Hybrid state and KV capacity | 19 Mamba slots, 53,248 KV tokens |
+
+The prompt rate is a direct wall-clock approximation that includes HTTP,
+tokenization, prefill, and one decode step. It is workload-specific, and the OS
+page cache was not dropped. The decode result is the more conservative baseline
+for migration: it is measured with eager execution and the Python oracle, not a
+native SparkServe kernel. The server returned the exact non-thinking completion
+`Spark ready` through the OpenAI-compatible endpoint.
+
 ## Next kernel boundary
 
 The next milestone replaces `Vec<u8>` cache pages with a registered, page-aligned

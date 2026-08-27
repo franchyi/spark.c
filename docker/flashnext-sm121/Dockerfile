@@ -1,6 +1,10 @@
 ARG BASE_IMAGE=docker.1ms.run/lmsysorg/sglang:qwen38flashnext
 FROM ${BASE_IMAGE}
 
+COPY src/sparkserve /opt/sparkserve/sparkserve
+COPY docker/flashnext-sm121/sitecustomize.py /opt/sparkserve/sitecustomize.py
+ENV PYTHONPATH=/opt/sparkserve
+
 LABEL org.opencontainers.image.title="SparkServe SGLang Flash-Next SM121 oracle"
 LABEL org.opencontainers.image.description="Day-zero Qwen3.8 Flash-Next image with the GB10 QSA sparse-decode capability guard enabled"
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang/pull/36497"
