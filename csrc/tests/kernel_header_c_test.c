@@ -52,6 +52,10 @@ _Static_assert(sizeof(SparkServeQsaDecodePlan) == 56u,
                "C QSA decode plan layout drifted");
 _Static_assert(sizeof(SparkServeQsaDecodeArgs) == 144u,
                "C QSA decode arguments layout drifted");
+_Static_assert(sizeof(SparkServeGdnBlockPlan) == 48u,
+               "C GDN block plan layout drifted");
+_Static_assert(sizeof(SparkServeGdnBlockArgs) == 216u,
+               "C GDN block arguments layout drifted");
 _Static_assert(sizeof(SparkServeCoherentRegionConfig) == 48u,
                "C coherent region config layout drifted");
 _Static_assert(sizeof(SparkServeCoherentRegionView) == 80u,

@@ -79,6 +79,10 @@ typedef enum SparkServeKernelBackend {
   // Qwen mHC: SGLang grouped Gemma RMSNorm/combine arithmetic with cuBLAS
   // low-rank projections and a deterministic fused mix epilogue.
   SPARKSERVE_BACKEND_SGLANG_CUBLAS_MHC = 17,
+  // Qwen GDN half-layer framing: cuBLAS projections, the pinned
+  // SGLang/causal-conv1d update, and SGLang FLA gated RMSNorm. The recurrent
+  // FlashInfer GDN remains a separate stage so Rust owns state scheduling.
+  SPARKSERVE_BACKEND_SGLANG_CUBLAS_GDN_BLOCK = 18,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -86,8 +90,8 @@ typedef enum SparkServeGdnBackend {
   // SparkServe-owned correctness-first CUDA decode kernel. It implements the
   // same BF16-state recurrence used by the pinned FlashInfer/SGLang oracle.
   SPARKSERVE_GDN_BACKEND_LOCAL_CUDA = 1,
-  // Reserved for a future raw FlashInfer adapter. The current FlashInfer GDN
-  // entry point is Python/CuTe DSL and is not linked into the shipping runtime.
+  // Pinned FlashInfer CuTe BF16-state artifact exported offline for SM121 and
+  // called through TVM-FFI without Python, Torch, SGLang, or serving-time JIT.
   SPARKSERVE_GDN_BACKEND_FLASHINFER = 2,
 } SparkServeGdnBackend;
 
@@ -798,6 +802,53 @@ typedef struct SparkServeGdnDecodeArgs {
   void* cuda_stream;
 } SparkServeGdnDecodeArgs;
 
+// Stateless projection/epilogue framing around the stateful GDN recurrence.
+// Rust deliberately launches prepare -> GDN recurrence -> finish as separate
+// stages so it can checkpoint both recurrent pools and schedule each request.
+typedef struct SparkServeGdnBlockPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_tokens;
+  uint32_t hidden_size;
+  uint32_t num_qk_heads;
+  uint32_t num_value_heads;
+  uint32_t head_dim;
+  uint32_t conv_kernel;
+  uint32_t dtype;
+  uint32_t requested_backend;
+  float rms_norm_eps;
+  uint32_t reserved;
+} SparkServeGdnBlockPlan;
+
+typedef struct SparkServeGdnBlockArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeGdnBlockPlan plan;
+  // BF16 input and resident checkpoint weights.
+  const void* hidden_states;
+  const void* in_proj_qkv_weight;
+  const void* in_proj_z_weight;
+  const void* in_proj_b_weight;
+  const void* in_proj_a_weight;
+  const void* conv_weight;
+  const void* gated_norm_weight;
+  const void* out_proj_weight;
+  // BF16 [slots,10240,3] rolling convolution state and INT32 [tokens] slots.
+  void* conv_state_pool;
+  const int32_t* state_indices;
+  // Caller-owned fixed BF16 scratch. No serving-time allocation occurs.
+  void* projected_qkv;
+  void* projected_z;
+  void* projected_b;
+  void* projected_a;
+  void* convolved_qkv;
+  const void* gdn_core_output;
+  void* gated_norm_output;
+  void* attention_output;
+  void* cublas_handle;
+  void* cuda_stream;
+} SparkServeGdnBlockArgs;
+
 uint32_t sparkserve_kernel_abi_version(void);
 
 SparkServeStatus sparkserve_dense_nvfp4_validate(
@@ -1025,6 +1076,22 @@ SparkServeStatus sparkserve_gdn_decode_query(
 SparkServeStatus sparkserve_gdn_decode_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeGdnDecodeArgs* args);
+
+SparkServeStatus sparkserve_gdn_block_validate(
+    const SparkServeGdnBlockPlan* plan);
+
+SparkServeStatus sparkserve_gdn_block_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGdnBlockPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_gdn_block_prepare_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGdnBlockArgs* args);
+
+SparkServeStatus sparkserve_gdn_block_finish_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeGdnBlockArgs* args);
 
 #ifdef __cplusplus
 }  // extern "C"

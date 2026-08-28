@@ -128,7 +128,7 @@ retaining a switch back to the legacy dispatch.
 | Flash-Next router/top-k | SGLang Qwen4-exp and `moe_topk_softmax.cuh` at `d91c368` | cuBLAS BF16 router GEMM plus SGLang's workspace-free 512-expert warp top-k | one raw CUDA boundary; Rust owns the long-lived handle, coherent buffers, completion, and scheduling | passed: isolated eight-token gate is exact at 16.86 us; the joined real top-10 chain also has zero logit/id/weight mismatches |
 | Flash-Next shared expert | SGLang BF16 activation at `d91c368` | cuBLAS merged gate/up and down plus adapted SGLang vector SiLU | framework-free raw CUDA; loader builds one final merged resident weight region | passed: isolated gated branch is exact at 30.69 us for eight tokens; production ungated branch is exact in the joined chain |
 | Flash-Next routed/shared join | SGLang `_fused_gate_sigmoid_mul_add_kernel` at `d91c368` | raw CUDA preserves the 4096-wide FP32 reduction, sigmoid, shared multiply, routed add, and BF16 store | one allocation-free ABI; Rust overlaps branches and gates publication by CUDA events | passed: 2,560/2,560 final BF16 values exact; complete sequential hot-cache MoE is 306.668 us |
-| GDN projection and recurrence | SGLang Qwen4-exp + FlashInfer GDN | local raw CUDA K=V=128 BF16-state decode; later fuse QKV extraction | correctness kernel implemented; optimize behind the same ABI | CPU-reference parity now; real SGLang tensor/state and multi-step parity next |
+| GDN projection and recurrence | SGLang Qwen4-exp causal-conv/FLA norm at `d91c368` + FlashInfer CuTe GDN at `906181e` | cuBLAS projections, raw donor-exact causal convolution/norm, and offline-exported SM121 BF16-state recurrence | five allocation-free ABIs; Rust owns paired-state snapshots, stage leases, rollback, stream, and publication | passed: every real layer-0 projection, intermediate, 60 KiB convolution state, 1.5 MiB temporal state, output, and mHC boundary is byte-exact; recurrence 6.197 us, complete attention half-layer 693.755 us |
 | QSA indexer and sparse attention | SGLang QSA backend at `7c66045`/`d91c368`, TileLang `cd37ed5`, FlashInfer `906181e` | SGLang fused Q/K prep, TileLang-generated score MQA, radix top-k, block-to-token expansion, selected-K/V pack, and FlashInfer XQA BF16 paged decode | all six donors share one framework-free library; Rust owns coherent ranges, streams/events, fixed page tables/workspace, and graph scheduling | isolated fixtures pass exact parity; the joined coherent chain has exact selection/packing semantics and 0.015625 max BF16 attention error under legal top-k permutation; full Qwen-layer continuation next |
 | Hyperconnection mix/combine | SGLang grouped Gemma RMSNorm, `hc_combine.cuh`, and persistent mix at `d91c368` | raw RMSNorm/combine, cuBLAS low-rank projections, deterministic BF16 mix epilogue | pinned raw ABI; persistent atomic mix is performance-only oracle | passed: real layer-0 deterministic mix/combine byte-exact; persistent mix max BF16 error 0.015625; 41.217/8.213 us; composed mHC -> exact top-10 MoE -> combine half-layer exact at 418.123 us |
 | PLE lookup | SGLang Qwen4-exp at `7c66045` + checkpoint | raw CUDA adapter matching the SGLang FP8-E4M3 load, BF16 conversion, and BF16 scaling; Rust supplies NVMe row residency | linked framework-free adapter plus original one-copy storage policy | passed: 16 real boundary rows, 2,560/2,560 scaled BF16 values bit-exact; 2.06 us mean on SM121 |
@@ -202,14 +202,15 @@ kernels—without importing either framework's scheduler, allocator, or graph.
 
 ## Immediate implementation order
 
-1. Connect the byte-exact mHC-wrapped MLP half-layer and completed six-stage QSA
-   chain to real Qwen layer state; then capture full-layer outputs, logits, and
-   greedy continuations from the live SGLang service.
+1. Compose the byte-exact mHC-wrapped GDN attention and MLP half-layers into a
+   complete real Qwen layer; connect the completed six-stage QSA path for its
+   alternating layers, then capture logits and greedy continuations.
 2. Double-buffer the completed PLE gather and fixed-slab reader, then connect its
    fixed descriptors to the token graph; keep routing/top-k separately tested.
-3. Connect the completed six-stage borrowed QSA chain to Qwen layer state,
-   then complete QSA/GDN/mHC layer parity and the token graph. Preserve radix
-   top-k's set contract instead of adding a canonical sort to the hot path.
+3. Connect the completed six-stage borrowed QSA chain to Qwen layer state and
+   the same Rust token transaction used by the completed GDN half-layer.
+   Preserve radix top-k's set contract instead of adding a canonical sort to
+   the hot path.
 4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
 5. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
 6. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed

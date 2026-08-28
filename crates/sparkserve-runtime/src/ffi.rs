@@ -1145,6 +1145,70 @@ pub struct GdnDecodeArgs {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GdnBlockPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_tokens: u32,
+    pub hidden_size: u32,
+    pub num_qk_heads: u32,
+    pub num_value_heads: u32,
+    pub head_dim: u32,
+    pub conv_kernel: u32,
+    pub dtype: u32,
+    pub requested_backend: u32,
+    pub rms_norm_eps: f32,
+    pub reserved: u32,
+}
+
+impl GdnBlockPlan {
+    pub fn qwen38_flash_decode(num_tokens: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_tokens,
+            hidden_size: 2560,
+            num_qk_heads: 16,
+            num_value_heads: 48,
+            head_dim: 128,
+            conv_kernel: 4,
+            dtype: DataType::BFloat16 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangCublasGdnBlock as u32,
+            rms_norm_eps: 1.0e-6,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GdnBlockArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: GdnBlockPlan,
+    pub hidden_states: *const c_void,
+    pub in_proj_qkv_weight: *const c_void,
+    pub in_proj_z_weight: *const c_void,
+    pub in_proj_b_weight: *const c_void,
+    pub in_proj_a_weight: *const c_void,
+    pub conv_weight: *const c_void,
+    pub gated_norm_weight: *const c_void,
+    pub out_proj_weight: *const c_void,
+    pub conv_state_pool: *mut c_void,
+    pub state_indices: *const i32,
+    pub projected_qkv: *mut c_void,
+    pub projected_z: *mut c_void,
+    pub projected_b: *mut c_void,
+    pub projected_a: *mut c_void,
+    pub convolved_qkv: *mut c_void,
+    pub gdn_core_output: *const c_void,
+    pub gated_norm_output: *mut c_void,
+    pub attention_output: *mut c_void,
+    pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct KernelInfo {
     pub struct_size: u32,
@@ -1382,6 +1446,20 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const GdnDecodeArgs,
     ) -> Status;
+    pub fn sparkserve_gdn_block_validate(plan: *const GdnBlockPlan) -> Status;
+    pub fn sparkserve_gdn_block_query(
+        caps: *const DeviceCaps,
+        plan: *const GdnBlockPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_gdn_block_prepare_launch(
+        caps: *const DeviceCaps,
+        args: *const GdnBlockArgs,
+    ) -> Status;
+    pub fn sparkserve_gdn_block_finish_launch(
+        caps: *const DeviceCaps,
+        args: *const GdnBlockArgs,
+    ) -> Status;
 }
 
 fn size_u32<T>() -> u32 {
@@ -1437,6 +1515,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<QsaDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<GdnDecodePlan>(), 40);
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
+        assert_eq!(std::mem::size_of::<GdnBlockPlan>(), 48);
+        assert_eq!(std::mem::size_of::<GdnBlockArgs>(), 216);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
     }
 
@@ -1460,6 +1540,21 @@ mod tests {
         assert_eq!(plan.value_dim, 128);
         assert_eq!(plan.state_dtype, DataType::BFloat16 as u32);
         assert_eq!(plan.requested_backend, GdnBackend::Auto as u32);
+    }
+
+    #[test]
+    fn qwen_flash_gdn_block_plan_freezes_projection_geometry() {
+        let plan = GdnBlockPlan::qwen38_flash_decode(1);
+        assert_eq!(plan.hidden_size, 2560);
+        assert_eq!(plan.num_qk_heads, 16);
+        assert_eq!(plan.num_value_heads, 48);
+        assert_eq!(plan.head_dim, 128);
+        assert_eq!(plan.conv_kernel, 4);
+        assert_eq!(plan.dtype, DataType::BFloat16 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangCublasGdnBlock as u32
+        );
     }
 
     #[test]

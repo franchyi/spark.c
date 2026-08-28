@@ -97,6 +97,45 @@ def test_flashinfer_xqa_donor_is_framework_free_pinned_and_hashed() -> None:
     ) in hashes
 
 
+def test_qwen_gdn_donors_are_pinned_hashed_and_full_half_layer_exact() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    flashinfer = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "flashinfer-gdn-decode-oracle"
+    )
+    assert flashinfer["revision"] == "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+    assert flashinfer["mode"] == "aot-kernel-donor"
+    assert flashinfer["status"] == "linked-aot-sm121-real-state-bit-parity-passed"
+    assert flashinfer["entrypoint"] == (
+        "flashinfer/gdn_kernels/gdn_decode_bf16_state.py"
+    )
+    sglang = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qwen-gdn-block"
+    )
+    assert sglang["revision"] == "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+    assert sglang["mode"] == "source-adaptation"
+    assert sglang["status"] == (
+        "linked-raw-cuda-sm121-real-attention-half-layer-bit-parity-passed"
+    )
+    vendor = ROOT / "third_party" / "qwen-gdn"
+    assert (vendor / "VENDOR.md").is_file()
+    assert (vendor / "source-files.sha256").read_text(
+        encoding="utf-8"
+    ).splitlines() == [
+        "8fa1fdc138374bf0685457a6f97e1ffea78f79d5e73cef07e0275c1639efac48  "
+        "python/sglang/kernels/ops/mamba/causal_conv1d_triton.py",
+        "3ce4895e768aead4f12031b37fc0ee511d783b9ec476016c85b715c2dcf84988  "
+        "python/sglang/kernels/ops/attention/fla/layernorm_gated.py",
+        "61de9ffa703962cb1ddb73823100550138708bbcbb535a3efcac608940e67e61  "
+        "flashinfer/gdn_kernels/gdn_decode_bf16_state.py",
+    ]
+
+
 def test_sglang_storage_donor_is_pinned_and_hashed() -> None:
     payload = tomllib.loads(
         (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")

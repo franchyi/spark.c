@@ -7,6 +7,8 @@ BUILD_DIR := build
 CONTRACT_TEST := $(BUILD_DIR)/kernel-contract-test
 HEADER_C_TEST := $(BUILD_DIR)/kernel-header-c-test
 CUDA_GDN_TEST := $(BUILD_DIR)/gdn-decode-cuda-test
+CUDA_GDN_FIXTURE_TEST := $(BUILD_DIR)/gdn-fixture-test
+CUDA_QWEN_GDN_BLOCK_FIXTURE_TEST := $(BUILD_DIR)/qwen-gdn-block-fixture-test
 CUDA_NVFP4_TEST := $(BUILD_DIR)/nvfp4-dense-cuda-test
 CUDA_NVFP4_FIXTURE_TEST := $(BUILD_DIR)/nvfp4-dense-fixture-test
 CUDA_GROUPED_NVFP4_TEST := $(BUILD_DIR)/nvfp4-grouped-cuda-test
@@ -58,10 +60,11 @@ QWEN_XQA_FLAGS := --expt-relaxed-constexpr \
 	-DMLA_WRAPPER=0 -DUSE_SM90_MHA=0
 CUTE_NVFP4_OBJECT ?=
 CUTE_NVFP4_QUANTIZE_OBJECT ?=
+GDN_AOT_OBJECT ?=
 TVM_FFI_ROOT ?=
 CUTE_DSL_ROOT ?=
 
-.PHONY: test test-cpp test-cuda fabric-shared qsa-shared moe-gate-shared shared-expert-shared moe-join-shared mhc-shared test-cuda-fabric test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-moe-gate-fixture test-cuda-shared-expert-fixture test-cuda-moe-join-fixture test-cuda-mhc-fixture test-cuda-ple-gather-fixture test-cuda-qsa-topk-fixture test-cuda-qsa-expand-fixture test-cuda-qsa-score-fixture test-cuda-qsa-index-prep-fixture test-cuda-qsa-kv-pack-fixture test-cuda-qsa-decode-xqa-fixture test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda fabric-shared qsa-shared moe-gate-shared shared-expert-shared moe-join-shared mhc-shared test-cuda-fabric test-cuda-gdn test-cuda-gdn-fixture test-cuda-qwen-gdn-block-fixture test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-moe-gate-fixture test-cuda-shared-expert-fixture test-cuda-moe-join-fixture test-cuda-mhc-fixture test-cuda-ple-gather-fixture test-cuda-qsa-topk-fixture test-cuda-qsa-expand-fixture test-cuda-qsa-score-fixture test-cuda-qsa-index-prep-fixture test-cuda-qsa-kv-pack-fixture test-cuda-qsa-decode-xqa-fixture test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -88,6 +91,16 @@ mhc-shared: $(CUDA_MHC_SHARED)
 
 test-cuda-gdn: $(CUDA_GDN_TEST)
 	$(CUDA_GDN_TEST)
+
+test-cuda-gdn-fixture: $(CUDA_GDN_FIXTURE_TEST)
+	test -n "$(QWEN_GDN_FIXTURE)"
+	LD_LIBRARY_PATH=$(TVM_FFI_ROOT)/lib:$$LD_LIBRARY_PATH \
+		$(CUDA_GDN_FIXTURE_TEST) "$(QWEN_GDN_FIXTURE)"
+
+test-cuda-qwen-gdn-block-fixture: $(CUDA_QWEN_GDN_BLOCK_FIXTURE_TEST)
+	test -n "$(QWEN_GDN_FIXTURE)"
+	LD_LIBRARY_PATH=$(TVM_FFI_ROOT)/lib:$$LD_LIBRARY_PATH \
+		$(CUDA_QWEN_GDN_BLOCK_FIXTURE_TEST) "$(QWEN_GDN_FIXTURE)"
 
 test-cuda-nvfp4: $(CUDA_NVFP4_TEST)
 	$(CUDA_NVFP4_TEST)
@@ -177,6 +190,39 @@ $(CUDA_GDN_TEST): csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu csrc/internal/
 	$(NVCC) $(NVCCFLAGS) -DSPARKSERVE_WITH_CUDA -Icsrc/include -Icsrc \
 		csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu \
 		csrc/tests/gdn_decode_cuda_test.cu -o $(CUDA_GDN_TEST)
+
+$(CUDA_GDN_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu csrc/cuda/gdn_decode_flashinfer_cute.cc csrc/internal/gdn_decode_backend.h csrc/internal/gdn_decode_flashinfer_backend.h csrc/tests/gdn_fixture_test.cu csrc/include/sparkserve/kernel_api.h
+	test -n "$(GDN_AOT_OBJECT)"
+	test -n "$(TVM_FFI_ROOT)"
+	test -n "$(CUTE_DSL_ROOT)"
+	test -f "$(GDN_AOT_OBJECT)"
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -DSPARKSERVE_WITH_CUDA \
+		-DSPARKSERVE_WITH_FLASHINFER_GDN_AOT -Icsrc/include -Icsrc \
+		-I$(TVM_FFI_ROOT)/include csrc/kernel_contract.cc \
+		csrc/cuda/gdn_decode.cu csrc/cuda/gdn_decode_flashinfer_cute.cc \
+		csrc/tests/gdn_fixture_test.cu "$(GDN_AOT_OBJECT)" \
+		$(CUTE_DSL_ROOT)/lib/libcuda_dialect_runtime_static.a \
+		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lcuda -lcudart -ldl \
+		-Xcompiler=-pthread -o $(CUDA_GDN_FIXTURE_TEST)
+
+$(CUDA_QWEN_GDN_BLOCK_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu csrc/cuda/gdn_decode_flashinfer_cute.cc csrc/cuda/gdn_block_sglang.cu csrc/cuda/mhc_sglang.cu csrc/internal/gdn_decode_backend.h csrc/internal/gdn_decode_flashinfer_backend.h csrc/internal/gdn_block_backend.h csrc/internal/mhc_backend.h csrc/tests/qwen_gdn_block_fixture_test.cc csrc/include/sparkserve/kernel_api.h
+	test -n "$(GDN_AOT_OBJECT)"
+	test -n "$(TVM_FFI_ROOT)"
+	test -n "$(CUTE_DSL_ROOT)"
+	test -f "$(GDN_AOT_OBJECT)"
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -DSPARKSERVE_WITH_CUDA \
+		-DSPARKSERVE_WITH_FLASHINFER_GDN_AOT \
+		-DSPARKSERVE_WITH_SGLANG_CUBLAS_GDN_BLOCK \
+		-DSPARKSERVE_WITH_SGLANG_CUBLAS_MHC -Icsrc/include -Icsrc \
+		-I$(TVM_FFI_ROOT)/include csrc/kernel_contract.cc \
+		csrc/cuda/gdn_decode.cu csrc/cuda/gdn_decode_flashinfer_cute.cc \
+		csrc/cuda/gdn_block_sglang.cu csrc/cuda/mhc_sglang.cu \
+		csrc/tests/qwen_gdn_block_fixture_test.cc "$(GDN_AOT_OBJECT)" \
+		$(CUTE_DSL_ROOT)/lib/libcuda_dialect_runtime_static.a \
+		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lcublas -lcuda -lcudart -ldl \
+		-Xcompiler=-pthread -o $(CUDA_QWEN_GDN_BLOCK_FIXTURE_TEST)
 
 $(CUDA_NVFP4_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_dense_flashinfer.cu csrc/internal/nvfp4_dense_backend.h csrc/tests/nvfp4_dense_cuda_test.cu csrc/include/sparkserve/kernel_api.h
 	mkdir -p $(BUILD_DIR)
@@ -410,4 +456,4 @@ $(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_f
 		-Xcompiler=-pthread -o $(CUDA_QWEN_MOE_FIXTURE_TEST)
 
 clean:
-	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_COHERENT_REGION_TEST) $(CUDA_PLE_GATHER_FIXTURE_TEST) $(CUDA_QSA_TOPK_FIXTURE_TEST) $(CUDA_QSA_EXPAND_FIXTURE_TEST) $(CUDA_QSA_SCORE_FIXTURE_TEST) $(CUDA_QSA_SCORE_OBJECT) $(CUDA_QSA_INDEX_PREP_FIXTURE_TEST) $(CUDA_QSA_KV_PACK_FIXTURE_TEST) $(CUDA_QSA_DECODE_XQA_FIXTURE_TEST) $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) $(CUDA_QSA_SHARED) $(CUDA_FABRIC_SHARED) $(CUDA_GDN_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_MOE_ROUTE_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)
+	rm -f $(CONTRACT_TEST) $(HEADER_C_TEST) $(CUDA_COHERENT_REGION_TEST) $(CUDA_PLE_GATHER_FIXTURE_TEST) $(CUDA_QSA_TOPK_FIXTURE_TEST) $(CUDA_QSA_EXPAND_FIXTURE_TEST) $(CUDA_QSA_SCORE_FIXTURE_TEST) $(CUDA_QSA_SCORE_OBJECT) $(CUDA_QSA_INDEX_PREP_FIXTURE_TEST) $(CUDA_QSA_KV_PACK_FIXTURE_TEST) $(CUDA_QSA_DECODE_XQA_FIXTURE_TEST) $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) $(CUDA_QSA_SHARED) $(CUDA_FABRIC_SHARED) $(CUDA_GDN_TEST) $(CUDA_GDN_FIXTURE_TEST) $(CUDA_NVFP4_TEST) $(CUDA_NVFP4_FIXTURE_TEST) $(CUDA_GROUPED_NVFP4_TEST) $(CUDA_GROUPED_NVFP4_FIXTURE_TEST) $(CUDA_SILU_NVFP4_TEST) $(CUDA_MOE_ROUTE_TEST) $(CUDA_QWEN_MOE_FIXTURE_TEST)

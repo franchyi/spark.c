@@ -5,6 +5,7 @@
 
 #ifdef SPARKSERVE_WITH_CUDA
 #include "internal/gdn_decode_backend.h"
+#include "internal/gdn_decode_flashinfer_backend.h"
 #endif
 #ifdef SPARKSERVE_WITH_FLASHINFER_NVFP4
 #include "internal/nvfp4_dense_backend.h"
@@ -32,6 +33,9 @@
 #endif
 #ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_MHC
 #include "internal/mhc_backend.h"
+#endif
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_GDN_BLOCK
+#include "internal/gdn_block_backend.h"
 #endif
 #ifdef SPARKSERVE_WITH_SGLANG_PLE_GATHER
 #include "internal/ple_gather_backend.h"
@@ -251,6 +255,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("MoE join backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_CUBLAS_MHC:
       return Invalid("mHC backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_CUBLAS_GDN_BLOCK:
+      return Invalid("GDN block backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1984,7 +1990,11 @@ extern "C" SparkServeStatus sparkserve_gdn_decode_query(
 
   const uint32_t backend =
       plan->requested_backend == SPARKSERVE_GDN_BACKEND_AUTO
+#ifdef SPARKSERVE_WITH_FLASHINFER_GDN_AOT
+          ? static_cast<uint32_t>(SPARKSERVE_GDN_BACKEND_FLASHINFER)
+#else
           ? static_cast<uint32_t>(SPARKSERVE_GDN_BACKEND_LOCAL_CUDA)
+#endif
           : plan->requested_backend;
   info->backend = backend;
   info->workspace_bytes = 0;
@@ -2000,6 +2010,9 @@ extern "C" SparkServeStatus sparkserve_gdn_decode_query(
   info->name = "flashinfer-gdn-decode-pretranspose";
   info->source_revision =
       "flashinfer@906181e3f4cf4bcc81835fb480db4011bbd80b62";
+#ifdef SPARKSERVE_WITH_FLASHINFER_GDN_AOT
+  info->available = 1;
+#endif
   return Ok();
 }
 
@@ -2025,15 +2038,146 @@ extern "C" SparkServeStatus sparkserve_gdn_decode_launch(
   }
   const uint32_t backend =
       args->plan.requested_backend == SPARKSERVE_GDN_BACKEND_AUTO
+#ifdef SPARKSERVE_WITH_FLASHINFER_GDN_AOT
+          ? static_cast<uint32_t>(SPARKSERVE_GDN_BACKEND_FLASHINFER)
+#else
           ? static_cast<uint32_t>(SPARKSERVE_GDN_BACKEND_LOCAL_CUDA)
+#endif
           : args->plan.requested_backend;
-  if (backend != SPARKSERVE_GDN_BACKEND_LOCAL_CUDA) {
-    return Unavailable("the raw FlashInfer GDN adapter is not linked");
+  if (backend == SPARKSERVE_GDN_BACKEND_FLASHINFER) {
+#ifdef SPARKSERVE_WITH_FLASHINFER_GDN_AOT
+    return sparkserve_gdn_decode_flashinfer_aot_launch(args);
+#else
+    return Unavailable("the FlashInfer GDN AOT artifact is not linked");
+#endif
   }
+  if (backend != SPARKSERVE_GDN_BACKEND_LOCAL_CUDA)
+    return Invalid("unknown resolved GDN decode backend");
 #ifdef SPARKSERVE_WITH_CUDA
   return sparkserve_gdn_decode_cuda_launch(args);
 #else
   return Unavailable(
       "GDN contract is valid but this library was built without CUDA");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_gdn_block_validate(
+    const SparkServeGdnBlockPlan* plan) {
+  if (plan == nullptr) return Invalid("GDN block plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_tokens == 0 || plan->num_tokens > 1U << 20) {
+    return Invalid("GDN block token count is invalid");
+  }
+  if (plan->hidden_size != 2560 || plan->num_qk_heads != 16 ||
+      plan->num_value_heads != 48 || plan->head_dim != 128 ||
+      plan->conv_kernel != 4) {
+    return Unsupported(
+        "Qwen3.8 Flash-Next GDN block requires H=2560, QH=16, VH=48, "
+        "D=128, W=4");
+  }
+  if (plan->dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("Qwen GDN block requires BF16 tensors");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend !=
+          SPARKSERVE_BACKEND_SGLANG_CUBLAS_GDN_BLOCK) {
+    return Invalid("unknown GDN block backend");
+  }
+  if (!(plan->rms_norm_eps > 0.0F) ||
+      !std::isfinite(plan->rms_norm_eps)) {
+    return Invalid("GDN gated RMSNorm epsilon must be finite and positive");
+  }
+  if (!CanMultiply(plan->num_tokens, 10240) ||
+      !CanMultiply(plan->num_tokens, 6144)) {
+    return Invalid("GDN block buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_gdn_block_query(
+    const SparkServeDeviceCaps* caps, const SparkServeGdnBlockPlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported(
+        "the first GDN block framing backend is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_gdn_block_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_SGLANG_CUBLAS_GDN_BLOCK;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "cublas+sglang-qwen-gdn-block";
+  info->source_revision =
+      "sglang@d91c3682b0b429e4c70df63cd57f819588ce29b0";
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_GDN_BLOCK
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_gdn_block_prepare_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeGdnBlockArgs* args) {
+  if (args == nullptr) return Invalid("GDN block arguments are required");
+  SparkServeStatus header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query = sparkserve_gdn_block_query(caps, &args->plan, &info);
+  if (query.code != SPARKSERVE_STATUS_OK) return query;
+  if (args->hidden_states == nullptr || args->in_proj_qkv_weight == nullptr ||
+      args->in_proj_z_weight == nullptr || args->in_proj_b_weight == nullptr ||
+      args->in_proj_a_weight == nullptr || args->conv_weight == nullptr ||
+      args->conv_state_pool == nullptr || args->state_indices == nullptr ||
+      args->projected_qkv == nullptr || args->projected_z == nullptr ||
+      args->projected_b == nullptr || args->projected_a == nullptr ||
+      args->convolved_qkv == nullptr || args->cublas_handle == nullptr) {
+    return Invalid("GDN prepare pointers and cuBLAS handle cannot be null");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_GDN_BLOCK
+  return sparkserve_sglang_cublas_gdn_prepare_cuda_launch(args);
+#else
+  return Unavailable("SGLang/cuBLAS GDN block donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_gdn_block_finish_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeGdnBlockArgs* args) {
+  if (args == nullptr) return Invalid("GDN block arguments are required");
+  SparkServeStatus header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query = sparkserve_gdn_block_query(caps, &args->plan, &info);
+  if (query.code != SPARKSERVE_STATUS_OK) return query;
+  if (args->projected_z == nullptr || args->gdn_core_output == nullptr ||
+      args->gated_norm_weight == nullptr || args->out_proj_weight == nullptr ||
+      args->gated_norm_output == nullptr || args->attention_output == nullptr ||
+      args->cublas_handle == nullptr) {
+    return Invalid("GDN finish pointers and cuBLAS handle cannot be null");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_GDN_BLOCK
+  return sparkserve_sglang_cublas_gdn_finish_cuda_launch(args);
+#else
+  return Unavailable("SGLang/cuBLAS GDN block donor is not linked");
 #endif
 }

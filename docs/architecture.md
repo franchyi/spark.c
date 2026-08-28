@@ -193,6 +193,18 @@ that mHC boundary. All mix, route, NVFP4 expert, shared-expert, join, and combin
 intermediates are byte-exact in one native process; the one-token hot-cache MLP
 half-layer takes 418.123 microseconds on GB10.
 
+The alternating GDN attention half-layer now uses the same boundary. cuBLAS
+owns QKV/Z/A/B and output projections; a raw specialization preserves
+SGLang Triton's width-four causal-convolution BF16 product rounding and FLA
+gated RMSNorm; FlashInfer's exact BF16-state CuTe kernel is exported offline as
+an SM121 object. Every real layer-0 intermediate, the 60-KiB convolution state,
+the 1.5-MiB temporal state, and the final mHC output are byte-exact. The
+recurrence alone is 6.197 microseconds and the full attention half-layer is
+693.755 microseconds per token. Rust owns the five-stage order and requires two
+disjoint, 256-byte-aligned coherent snapshot ranges before either state pool is
+mutated. A failed stateful stage poisons the token lease until both ranges are
+restored; borrowed kernels cannot publish or select retry policy.
+
 The first resident target is Qwen3.8 27B because the existing SGLang service gives
 golden logits and a measured target of about 50 decode tokens/s.
 
@@ -328,8 +340,10 @@ configured safety reserve.
   routed/shared intermediate and final byte at 306.668 us sequential hot-cache.
   mHC deterministic mix/combine now also passes real layer-0 parity at 41.217
   and 8.213 us. The composed mHC-wrapped MLP half-layer is exact at 418.123 us.
-  Attention projections/state and the complete residual layer remain before the
-  first native token.
+  The complete layer-0 mHC-wrapped GDN attention half-layer is also exact at
+  693.755 us, including both persistent state writes. Composition with the
+  exact MLP half-layer, remaining alternating QSA layers, final norm/logits, and
+  tokenizer remain before the first native token.
 - OpenAI-compatible streaming after the offline path is stable.
 - Gate: exact greedy token match and at least 45 tokens/s; target 50+ tokens/s.
 

@@ -46,6 +46,7 @@ pub enum KernelBackend {
     SglangCublasSharedExpert = 15,
     SglangFusedMoeJoin = 16,
     SglangCublasMhc = 17,
+    SglangCublasGdnBlock = 18,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

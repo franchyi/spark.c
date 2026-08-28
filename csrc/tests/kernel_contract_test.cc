@@ -666,5 +666,35 @@ int main() {
          SPARKSERVE_STATUS_OK);
   assert(gdn_info.backend == SPARKSERVE_GDN_BACKEND_LOCAL_CUDA);
   assert(gdn_info.available == 0);
+
+  SparkServeGdnBlockPlan gdn_block = {
+      sizeof(SparkServeGdnBlockPlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      1,
+      2560,
+      16,
+      48,
+      128,
+      4,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_BACKEND_AUTO,
+      1.0e-6F,
+      0,
+  };
+  assert(sparkserve_gdn_block_validate(&gdn_block).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo gdn_block_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_gdn_block_query(&caps, &gdn_block, &gdn_block_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(gdn_block_info.backend ==
+         SPARKSERVE_BACKEND_SGLANG_CUBLAS_GDN_BLOCK);
+  assert(gdn_block_info.available == 0);
+  gdn_block.conv_kernel = 3;
+  assert(sparkserve_gdn_block_validate(&gdn_block).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
   return 0;
 }
