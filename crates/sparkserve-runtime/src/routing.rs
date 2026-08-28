@@ -209,6 +209,10 @@ pub enum RouteError {
         expert: u32,
         num_experts: u32,
     },
+    NegativeExpert {
+        route: usize,
+        expert: i32,
+    },
     DuplicateExpert {
         token: usize,
         expert: u32,
@@ -239,6 +243,9 @@ impl Display for RouteError {
                 formatter,
                 "route {route} selects expert {expert}, but only {num_experts} exist"
             ),
+            Self::NegativeExpert { route, expert } => {
+                write!(formatter, "route {route} has negative expert id {expert}")
+            }
             Self::DuplicateExpert { token, expert } => {
                 write!(formatter, "token {token} selects expert {expert} twice")
             }

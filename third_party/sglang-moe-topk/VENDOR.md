@@ -22,3 +22,10 @@ completion event, and fixed coherent regions for input, weight, logits, ids,
 and weights. `scripts/capture-qwen-router-fixture.py` records a real layer-0
 router boundary through the original SGLang operator. The private fixture
 compares BF16 logits, exact expert ids, and FP32 normalized route weights.
+
+On GB10/SM121, the real layer-0 eight-token fixture has zero BF16 router-logit
+error, zero top-10 id mismatches, and zero FP32 route-weight error. The combined
+cuBLAS projection and normalized selection averages 16.86 microseconds over 100
+iterations. The Rust coherent-memory smoke repeats zero-error parity, then reads
+the INT32 ids from the CPU alias, builds the expert-contiguous route, and writes
+its route map into another fixed region of the same CUDA-visible allocation.

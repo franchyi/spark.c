@@ -131,12 +131,17 @@ real checkpoint fixture (`layer 0 / expert 0 / gate_proj`,
 640 BF16 outputs.
 
 The routed-MoE arithmetic boundary now links FlashInfer's grouped SM120/121
-NVFP4 GEMM through a second raw C ABI. Rust builds per-expert row ranges with
-separate four-row GEMM padding and 128-row scale padding, so fixed 512-expert
-graphs retain stable addresses even when most experts are empty. A two-expert
-fixture using real layer-0 gate projections matches all 5,120 BF16 outputs
-bit-for-bit. Routing/top-k, the borrowed fused SiLU/quantizer, the down
-projection, and weighted scatter-add remain before a complete MoE layer token.
+NVFP4 GEMMs, fused quantizers, route dispatch, and weighted finalize through raw
+C ABIs. Rust builds per-expert row ranges with separate four-row GEMM padding
+and 128-row scale padding, so fixed 512-expert graphs retain stable addresses
+even when most experts are empty. The real-weight routed subgraph is byte-exact.
+The preceding boundary now uses cuBLAS for the BF16 `[2560,512]` router and
+SGLang's workspace-free 512-expert normalized top-10 warp kernel. Its real
+layer-0 eight-token fixture has zero logit/id/weight error at 16.86 microseconds.
+Rust owns the persistent cuBLAS handle, stream/event, and one coherent allocation
+for logits, outputs, and the route map; it reads completed ids through the CPU
+alias and transactionally reserves fixed expert slots without a copy. The shared
+expert and joined gate-to-routed output remain before a complete MoE layer token.
 
 The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
 a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real

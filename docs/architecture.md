@@ -286,8 +286,11 @@ configured safety reserve.
 - Correct one-token forward pass, then 128-token decode.
 - The routed-expert subgraph already has byte-exact real-weight parity through
   dispatch, K=2560 quantization, both GEMMs, fused activation quantization, and
-  weighted finalize. Router/top-k, shared expert, and full-layer state remain
-  before the first native token.
+  weighted finalize. The preceding real layer-0 cuBLAS router plus borrowed
+  SGLang normalized top-10 now has zero logit/id/weight error, and its Rust
+  event handoff writes the expert-contiguous map into the same coherent arena.
+  The shared expert, joined MoE output, and full-layer state remain before the
+  first native token.
 - OpenAI-compatible streaming after the offline path is stable.
 - Gate: exact greedy token match and at least 45 tokens/s; target 50+ tokens/s.
 

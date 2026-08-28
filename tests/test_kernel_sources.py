@@ -178,6 +178,30 @@ def test_sglang_qsa_topk_donor_is_pinned_and_hashed() -> None:
     ]
 
 
+def test_sglang_moe_topk_donor_is_pinned_hashed_and_passed_real_router_parity() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qwen-moe-topk"
+    )
+    assert donor["revision"] == "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["mode"] == "source-adaptation"
+    assert donor["status"] == "linked-raw-cuda-sm121-real-router-bit-parity-passed"
+    assert donor["entrypoint"] == (
+        "python/sglang/kernels/jit/csrc/moe/moe_topk_softmax.cuh"
+    )
+    vendor = ROOT / "third_party" / "sglang-moe-topk"
+    assert (vendor / "VENDOR.md").is_file()
+    assert (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines() == [
+        "f9c8ee1f1e9af1037612418cda472b907c6455262c93a5d1e20764cf065fb55a  "
+        "python/sglang/kernels/jit/csrc/moe/moe_topk_softmax.cuh"
+    ]
+
+
 def test_sglang_qsa_index_prep_donor_is_pinned_and_hashed() -> None:
     payload = tomllib.loads(
         (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")

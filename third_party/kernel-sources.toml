@@ -107,9 +107,9 @@ repository = "https://github.com/sgl-project/sglang"
 revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
 license = "Apache-2.0"
 mode = "source-adaptation"
-status = "linked-raw-cuda-sm121-real-router-validation-pending"
+status = "linked-raw-cuda-sm121-real-router-bit-parity-passed"
 entrypoint = "python/sglang/kernels/jit/csrc/moe/moe_topk_softmax.cuh"
-notes = "Workspace-free BF16 512-expert softmax/top-k-10 arithmetic follows the pinned SGLang warp kernel; cuBLAS supplies the preceding BF16 router projection. Rust owns the persistent cuBLAS handle, coherent logits/outputs, stream, event, route-map construction, and expert scheduling."
+notes = "Workspace-free BF16 512-expert softmax/top-k-10 arithmetic follows the pinned SGLang warp kernel; cuBLAS supplies the preceding BF16 router projection. The real layer-0 eight-token fixture has zero BF16 logit, top-10 id, and FP32 weight mismatches at 16.86 us. Rust owns the persistent cuBLAS handle, coherent logits/outputs/route map, stream, event, and transactional expert scheduling."
 
 [[source]]
 id = "sglang-qsa-block-expand"

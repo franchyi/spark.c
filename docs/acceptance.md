@@ -72,6 +72,12 @@ Artifact locks, strict Qwen checkpoint scanning, exact-FP8 PLE indexing, the
 native GDN correctness kernel, and the borrowed NVFP4 expert chain now exist.
 The real Qwen fixture is byte-exact through route dispatch, K=2560 quantization,
 both grouped GEMMs, fused activation quantization, and weighted finalize. The
+preceding real layer-0 BF16 router plus SGLang normalized top-10 has zero logit,
+expert-id, and route-weight error for eight tokens at 16.86 microseconds. Its
+Rust smoke owns the cuBLAS handle and CUDA completion event, consumes ids through
+the coherent CPU alias, and writes the expert-contiguous route map back into the
+same CUDA-visible allocation without a transfer. The shared expert and joined
+gate-to-routed output remain incomplete. The
 Rust control plane also has transactional fixed-slot expert residency, and GB10
 has passed CUDA reads from both the registered cache slab and a protected
 file-backed mapping. PLE now adds bit-exact scaled-BF16 gather parity on 16 real

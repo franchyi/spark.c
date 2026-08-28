@@ -314,6 +314,25 @@ impl RoutedMoeScheduler {
         result
     }
 
+    /// Consume the INT32 expert ids written by SGLang's top-k ABI after its
+    /// CUDA completion event. On GB10 these ids can be read through the CPU
+    /// alias of the same coherent allocation; no device-to-host copy or second
+    /// route tensor is required.
+    pub fn prepare_gate_step(
+        &self,
+        layer: u16,
+        num_tokens: u32,
+        expert_ids: &[i32],
+    ) -> Result<PendingMoeStep, MoeScheduleError> {
+        let mut converted = Vec::with_capacity(expert_ids.len());
+        for (route, expert) in expert_ids.iter().copied().enumerate() {
+            converted.push(u32::try_from(expert).map_err(|_| {
+                MoeScheduleError::Route(RouteError::NegativeExpert { route, expert })
+            })?);
+        }
+        self.prepare_step(layer, num_tokens, &converted)
+    }
+
     pub fn commit_step(
         &mut self,
         mut pending: PendingMoeStep,
@@ -743,6 +762,32 @@ mod tests {
         assert!(hot.loads().is_empty());
         scheduler.commit_step(hot).expect("hot commit");
         assert_eq!(scheduler.cache_stats().hits, 4);
+    }
+
+    #[test]
+    fn sglang_gate_ids_feed_the_same_transactional_route_without_a_shadow_tensor() {
+        let scheduler = RoutedMoeScheduler::new(MoeSchedulerConfig {
+            layers: 48,
+            num_experts: 512,
+            top_k: 4,
+            hidden_size: 2560,
+            expert_slots: 8,
+            expert_slot_bytes: 4096,
+        })
+        .expect("scheduler");
+        let pending = scheduler
+            .prepare_gate_step(3, 2, &[9, 1, 7, 4, 7, 9, 11, 2])
+            .expect("SGLang gate handoff");
+        assert_eq!(pending.route().active_experts(), 6);
+        assert_eq!(pending.route().useful_rows(), 8);
+        drop(pending);
+        assert!(matches!(
+            scheduler.prepare_gate_step(3, 1, &[-1, 2, 3, 4]),
+            Err(MoeScheduleError::Route(RouteError::NegativeExpert {
+                route: 0,
+                expert: -1
+            }))
+        ));
     }
 
     #[test]

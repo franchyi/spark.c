@@ -4,6 +4,7 @@ use sparkserve_runtime::ffi::{
     COHERENT_REGION_PREFAULT, DeviceCaps, MoeGateArgs, MoeGatePlan, sparkserve_moe_gate_launch,
 };
 use sparkserve_runtime::kernel::KERNEL_ABI_VERSION;
+use sparkserve_runtime::scheduler::{MoeSchedulerConfig, RoutedMoeScheduler};
 use std::ffi::c_void;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,7 @@ struct Layout {
     logits: usize,
     topk_weights: usize,
     topk_ids: usize,
+    route_map: usize,
     bytes: usize,
 }
 
@@ -58,6 +60,7 @@ impl Layout {
         let logits = builder.field(TOKENS * EXPERTS * 2)?;
         let topk_weights = builder.field(TOKENS * TOP_K * 4)?;
         let topk_ids = builder.field(TOKENS * TOP_K * 4)?;
+        let route_map = builder.field(TOKENS * TOP_K * 4)?;
         let bytes = builder.finish()?;
         Ok(Self {
             hidden,
@@ -65,6 +68,7 @@ impl Layout {
             logits,
             topk_weights,
             topk_ids,
+            route_map,
             bytes,
         })
     }
@@ -176,9 +180,46 @@ fn main() -> io::Result<()> {
         .zip(expected_ids.chunks_exact(4))
         .filter(|(actual, expected)| actual != expected)
         .count();
+    let gate_ids = actual_ids
+        .chunks_exact(4)
+        .map(|id| i32::from_ne_bytes(id.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let moe_scheduler = RoutedMoeScheduler::new(MoeSchedulerConfig {
+        layers: 48,
+        num_experts: 512,
+        top_k: 10,
+        hidden_size: 2560,
+        expert_slots: 512,
+        // The smoke reserves logical fixed slots only; production fills the
+        // checkpoint-derived encoded expert byte span into each address.
+        expert_slot_bytes: 1,
+    })
+    .map_err(io::Error::other)?;
+    let pending = moe_scheduler
+        .prepare_gate_step(
+            0,
+            u32::try_from(TOKENS).map_err(io::Error::other)?,
+            &gate_ids,
+        )
+        .map_err(io::Error::other)?;
+    let route = pending.route();
+    for (destination, row) in payload
+        [layout.route_map..layout.route_map + route.route_to_packed_row.len() * 4]
+        .chunks_exact_mut(4)
+        .zip(route.route_to_packed_row.iter())
+    {
+        destination.copy_from_slice(&row.to_ne_bytes());
+    }
     println!("Rust coherent Qwen router max BF16 error: {max_logit_error}");
     println!("Rust coherent SGLang top-k id mismatches: {id_mismatches}");
     println!("Rust coherent SGLang top-k max weight error: {max_weight_error}");
+    println!(
+        "Rust route handoff: {} active experts, {} useful rows, {} padded rows, {} fixed-slot loads",
+        route.active_experts(),
+        route.useful_rows(),
+        route.padded_rows(),
+        pending.loads().len()
+    );
     if max_logit_error > 0.125 || max_weight_error > 1.0e-5 || id_mismatches != 0 {
         return Err(io::Error::other("Qwen MoE gate parity failed"));
     }
