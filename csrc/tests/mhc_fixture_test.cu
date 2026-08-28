@@ -181,6 +181,36 @@ int main(int argc, char** argv) {
   CudaOk(cudaDeviceSynchronize());
   assert(ExpectBytes(combined_device, expected_combined, "mHC combine") == 0);
 
+  cudaEvent_t begin;
+  cudaEvent_t end;
+  CudaOk(cudaEventCreate(&begin));
+  CudaOk(cudaEventCreate(&end));
+  constexpr int kIterations = 100;
+  CudaOk(cudaEventRecord(begin));
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    assert(sparkserve_mhc_mix_launch(&caps, &args).code ==
+           SPARKSERVE_STATUS_OK);
+  }
+  CudaOk(cudaEventRecord(end));
+  CudaOk(cudaEventSynchronize(end));
+  float mix_ms = 0.0F;
+  CudaOk(cudaEventElapsedTime(&mix_ms, begin, end));
+  CudaOk(cudaEventRecord(begin));
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    assert(sparkserve_mhc_combine_launch(&caps, &args).code ==
+           SPARKSERVE_STATUS_OK);
+  }
+  CudaOk(cudaEventRecord(end));
+  CudaOk(cudaEventSynchronize(end));
+  float combine_ms = 0.0F;
+  CudaOk(cudaEventElapsedTime(&combine_ms, begin, end));
+  std::cout << "mHC deterministic mix mean: "
+            << mix_ms * 1000.0F / kIterations << " us\n";
+  std::cout << "mHC combine mean: "
+            << combine_ms * 1000.0F / kIterations << " us\n";
+  CudaOk(cudaEventDestroy(end));
+  CudaOk(cudaEventDestroy(begin));
+
   CublasOk(cublasDestroy(blas));
   CudaOk(cudaFree(combined_device));
   CudaOk(cudaFree(mixed_device));

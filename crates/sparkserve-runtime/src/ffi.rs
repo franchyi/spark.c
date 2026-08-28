@@ -1508,7 +1508,10 @@ mod tests {
         assert_eq!(plan.hidden_size, 2560);
         assert_eq!(plan.lowrank_size, 320);
         assert_eq!(plan.rms_norm_eps, 1.0e-6);
-        assert_eq!(plan.requested_backend, KernelBackend::SglangCublasMhc as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangCublasMhc as u32
+        );
     }
 
     #[test]
