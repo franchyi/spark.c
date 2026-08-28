@@ -182,6 +182,14 @@ expert, and SGLang's deployed FP32 gate/sigmoid/multiply/add epilogue. Sequentia
 hot-cache arithmetic is 306.668 microseconds on GB10; storage and Rust scheduling
 are measured separately and the next optimization is dual-stream overlap.
 
+Qwen mHC uses the same sourcing rule. SGLang's grouped Gemma RMSNorm and combine
+reduction are adapted to raw CUDA, while cuBLAS owns the HC=4, H=2560, R=320
+low-rank projections. The deterministic reference is the correctness contract
+because SGLang's persistent Triton alternative uses device-scope atomics and
+explicitly disables itself for deterministic inference. The native mix/combine
+is byte-exact to that reference and stays within 0.015625 BF16 of the deployed
+persistent path.
+
 The first resident target is Qwen3.8 27B because the existing SGLang service gives
 golden logits and a measured target of about 50 decode tokens/s.
 
@@ -315,7 +323,8 @@ configured safety reserve.
   merged gate/up, SiLU, and down path. The deployed fused gate/join is exact as
   well: one real token selects ten physical-slot experts and matches every
   routed/shared intermediate and final byte at 306.668 us sequential hot-cache.
-  mHC, surrounding norms/projections, and full-layer state remain before the
+  mHC deterministic mix/combine now also passes real layer-0 parity at 41.217
+  and 8.213 us. Surrounding projections and full-layer state remain before the
   first native token.
 - OpenAI-compatible streaming after the offline path is stable.
 - Gate: exact greedy token match and at least 45 tokens/s; target 50+ tokens/s.

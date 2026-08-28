@@ -132,6 +132,16 @@ entrypoint = "python/sglang/kernels/ops/elementwise/elementwise.py"
 notes = "Raw CUDA preserves SGLang's deployed 4096-wide FP32 gate reduction, sigmoid, shared multiply, routed add, and BF16 store. The full real one-token router -> ten fixed-slot NVFP4 experts plus ungated BF16 shared expert -> join chain is byte-exact at every boundary and averages 306.668 us sequential hot-cache on GB10."
 
 [[source]]
+id = "sglang-qwen-mhc"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-real-mhc-reference-bit-parity-passed"
+entrypoint = "python/sglang/kernels/jit/csrc/elementwise/hc_combine.cuh"
+notes = "SGLang grouped Gemma RMSNorm and combine reductions are adapted behind the raw ABI; cuBLAS supplies the HC=4,H=2560,R=320 low-rank projections. Deterministic mix and combine are byte-exact to the real layer-0 reference, while the deployed atomic persistent mix differs by at most 0.015625 BF16. One-token mix is 41.217 us and combine 8.213 us on GB10."
+
+[[source]]
 id = "sglang-qsa-block-expand"
 repository = "https://github.com/sgl-project/sglang"
 revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"

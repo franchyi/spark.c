@@ -152,6 +152,13 @@ hot-cache chain averages 306.668 microseconds on GB10. Rust owns the overlap
 state machine: shared compute may run during expert reads, slot publication is
 transactional, and join cannot begin until both branch events complete.
 
+The adjacent mHC boundary is native as well. SparkServe borrows SGLang's grouped
+Gemma RMSNorm and fused combine reductions, uses cuBLAS for the two low-rank
+projections, and preserves the deterministic BF16 mix rounding points. Real
+layer-0 deterministic mix/combine is byte-exact; output remains within 0.015625
+BF16 of SGLang's faster atomic persistent mix. One-token mix and combine take
+41.217 and 8.213 microseconds respectively on GB10.
+
 The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
 a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real
 `H=16`, `HV=48`, `K=V=128` topology and BF16 K-last state pool. It has no Torch,

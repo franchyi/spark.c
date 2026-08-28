@@ -254,6 +254,31 @@ def test_sglang_fused_moe_join_is_pinned_hashed_and_bit_exact() -> None:
     ]
 
 
+def test_sglang_mhc_donors_are_pinned_hashed_and_reference_exact() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source for source in payload["source"] if source["id"] == "sglang-qwen-mhc"
+    )
+    assert donor["revision"] == "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["mode"] == "source-adaptation"
+    assert donor["status"] == (
+        "linked-raw-cuda-sm121-real-mhc-reference-bit-parity-passed"
+    )
+    vendor = ROOT / "third_party" / "sglang-mhc"
+    assert (vendor / "VENDOR.md").is_file()
+    assert (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines() == [
+        "acd83fd2cbd5ca4f3c6ca5362560954812ca87237b48cae80e44cb0958b849ec  "
+        "python/sglang/kernels/jit/csrc/elementwise/grouped_gemma_rmsnorm.cuh",
+        "e251e31ad2a0bf5193abbcb0b95becc3721e26c2af69d321a517e741d35e7ee3  "
+        "python/sglang/kernels/jit/csrc/elementwise/hc_combine.cuh",
+        "4cca5abd2a9c343373d4abf851c0759aa6bd81d24f70830e46113ccaca1f8a4d  "
+        "python/sglang/srt/layers/hc_mix_triton.py",
+    ]
+
+
 def test_sglang_qsa_index_prep_donor_is_pinned_and_hashed() -> None:
     payload = tomllib.loads(
         (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")

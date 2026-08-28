@@ -86,7 +86,11 @@ slot dispatch, both NVFP4 GEMMs, ungated shared expert, and final join. Its
 sequential hot-cache arithmetic time is 306.668 microseconds. The Rust control
 plane overlaps the shared branch with transactional expert fills, publishes
 fixed slots atomically, and blocks final join until both CUDA events complete.
-GB10
+The surrounding layer-0 mHC now also uses pinned SGLang grouped RMSNorm and
+combine arithmetic plus cuBLAS low-rank projections. Deterministic mix and
+combine are byte-exact to SGLang's reference; the deployed atomic persistent
+mix differs by at most 0.015625 BF16. One-token mix is 41.217 microseconds and
+combine 8.213 microseconds on GB10. GB10
 has passed CUDA reads from both the registered cache slab and a protected
 file-backed mapping. PLE now adds bit-exact scaled-BF16 gather parity on 16 real
 boundary rows plus simultaneous CUDA and `io_uring` registration of the same
@@ -116,5 +120,6 @@ within 0.015625 maximum BF16 absolute error. This document remains a completion
 checklist: PLE storage-thread/CUDA-event overlap, the complete Qwen layer and
 full-token graph, tokenizer/server, GGUF, GLM
 graph, and end-to-end continuation gates are not implied to be finished by this
-graph fragment. The next Qwen arithmetic boundary is mHC plus the surrounding
-norm/projection path needed to turn this exact MoE into one complete layer.
+graph fragment. The next Qwen arithmetic boundary is the remaining surrounding
+norm/projection glue needed to turn these exact MoE and mHC pieces into one
+complete layer.

@@ -617,6 +617,34 @@ int main() {
   assert(sparkserve_moe_join_validate(&moe_join).code ==
          SPARKSERVE_STATUS_UNSUPPORTED);
 
+  SparkServeMhcPlan mhc = {
+      sizeof(SparkServeMhcPlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      1,
+      4,
+      2560,
+      320,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_BACKEND_AUTO,
+      1.0e-6F,
+      0,
+      0,
+      0,
+  };
+  assert(sparkserve_mhc_validate(&mhc).code == SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo mhc_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_mhc_query(&caps, &mhc, &mhc_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(mhc_info.backend == SPARKSERVE_BACKEND_SGLANG_CUBLAS_MHC);
+  assert(mhc_info.available == 0);
+  mhc.lowrank_size = 64;
+  assert(sparkserve_mhc_validate(&mhc).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,

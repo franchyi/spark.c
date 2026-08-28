@@ -20,7 +20,7 @@ contracts, and promotion gates are recorded in
 | QSA decode | SGLang Qwen4 backend, TileLang-generated score MMA, and FlashInfer XQA | Pinned index prep, AOT score, radix top-k, block expansion, selected-K/V pack, and BF16 H=256 page-64 XQA are linked behind the raw ABI; Rust owns coherent buffers, scratch, leases, and page tables | full-layer/token integration, prefill split, and FP8-KV edge cases |
 | GDN recurrent update | SGLang Qwen4 + pinned FlashInfer recurrence | Raw CUDA BF16 K-last decode is implemented for Qwen K=V=128; next fuse projection and add prefill | real-tensor parity, state-slot addressing, and reduction-order drift |
 | GLM KDA/DSA state and sparse indexer | pinned GLM5Next llama.cpp oracle | Port only after exact index, state, and FP32-reference fixtures are frozen | draft upstream CUDA path, pooled top-k semantics, accidental RoPE |
-| Hyperconnection mix/combine | SGLang fused kernels as oracle | Small shape-specialized CUDA kernels | silent stream-index errors |
+| Hyperconnection mix/combine | pinned SGLang grouped norm/combine plus cuBLAS | Raw deterministic HC=4,H=2560,R=320 path is reference-exact; persistent atomic Triton remains a speed oracle | prefill tactics and persistent-kernel speed gap |
 | RMSNorm, RoPE, sampling | FlashInfer or compact local CUDA | Reuse only when it wins a GB10 microbenchmark | launch overhead at batch one |
 | GGUF Q8/IQ3/Q3 | llama.cpp `ggml-cuda` MMQ kernels | Use Q8_0 as the reference, then vendor only IQ3_XXS and Q3_K pieces behind our ABI | coupling to ggml metadata and selected-expert slice layout |
 
