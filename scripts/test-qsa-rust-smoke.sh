@@ -7,6 +7,8 @@ pack_fixture="${2:-tests/fixtures/private/qsa-kv-pack}"
 index_fixture="${3:-tests/fixtures/private/qsa-index-prep}"
 topk_fixture="${4:-tests/fixtures/private/qsa-topk}"
 expand_fixture="${5:-tests/fixtures/private/qsa-expand}"
+score_fixture="${6:-tests/fixtures/private/qsa-score}"
+chain_fixture="${7:-tests/fixtures/private/qsa-decode-chain}"
 cuda_image="${SPARKSERVE_CUDA_IMAGE:-sparkserve/sglang:qwen38flashnext-sm121}"
 rust_image="${SPARKSERVE_RUST_IMAGE:-docker.1ms.run/rust:1.89.0}"
 
@@ -21,6 +23,7 @@ docker run --rm --network host \
   -e RUSTFLAGS="-L native=/work/build -l dylib=sparkserve-fabric -l dylib=sparkserve-qsa -C link-arg=-Wl,--allow-shlib-undefined" \
   "${rust_image}" \
   cargo build --release --example qsa_frontend_smoke --example qsa_xqa_smoke \
+    --example qsa_chain_smoke \
     --features native-qsa-smoke
 
 docker run --rm --gpus all --security-opt seccomp=unconfined \
@@ -29,7 +32,8 @@ docker run --rm --gpus all --security-opt seccomp=unconfined \
   -e LD_LIBRARY_PATH=/work/build:/usr/local/cuda/lib64 \
   "${cuda_image}" \
   /work/target/release/examples/qsa_frontend_smoke \
-    "/work/${index_fixture}" "/work/${topk_fixture}" "/work/${expand_fixture}"
+    "/work/${index_fixture}" "/work/${topk_fixture}" "/work/${expand_fixture}" \
+    "/work/${score_fixture}"
 
 docker run --rm --gpus all --security-opt seccomp=unconfined \
   --ulimit memlock=-1:-1 \
@@ -38,3 +42,10 @@ docker run --rm --gpus all --security-opt seccomp=unconfined \
   "${cuda_image}" \
   /work/target/release/examples/qsa_xqa_smoke \
     "/work/${xqa_fixture}" "/work/${pack_fixture}"
+
+docker run --rm --gpus all --security-opt seccomp=unconfined \
+  --ulimit memlock=-1:-1 \
+  -v "${repo_root}:/work" -w /work \
+  -e LD_LIBRARY_PATH=/work/build:/usr/local/cuda/lib64 \
+  "${cuda_image}" \
+  /work/target/release/examples/qsa_chain_smoke "/work/${chain_fixture}"

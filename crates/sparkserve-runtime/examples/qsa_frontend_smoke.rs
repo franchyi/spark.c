@@ -2,8 +2,9 @@ use sparkserve_runtime::coherent::CoherentRegionOwner;
 use sparkserve_runtime::cuda::{CudaEventOwner, CudaStreamOwner, status_result};
 use sparkserve_runtime::ffi::{
     COHERENT_REGION_PREFAULT, DeviceCaps, QsaExpandArgs, QsaExpandPlan, QsaIndexPrepArgs,
-    QsaIndexPrepPlan, QsaTopkArgs, QsaTopkPlan, sparkserve_qsa_expand_launch,
-    sparkserve_qsa_index_prep_launch, sparkserve_qsa_topk_launch,
+    QsaIndexPrepPlan, QsaScoreArgs, QsaScorePlan, QsaTopkArgs, QsaTopkPlan,
+    sparkserve_qsa_expand_launch, sparkserve_qsa_index_prep_launch, sparkserve_qsa_score_launch,
+    sparkserve_qsa_topk_launch,
 };
 use std::ffi::c_void;
 use std::io;
@@ -16,6 +17,7 @@ const INDEX_STATE_SLOTS: usize = 128;
 const INDEX_COMPRESSED_SLOTS: usize = 64;
 const INDEX_HEAD_DIM: usize = 128;
 const INDEX_QUERY_HEADS: usize = 4;
+const INDEX_QUERY_HEADS_PADDED: usize = 8;
 const INDEX_POSITION_ROWS: usize = 512;
 const TOPK_ROWS: usize = 4;
 const TOPK_COLUMNS: usize = 65_536;
@@ -23,6 +25,13 @@ const TOPK_WIDTH: usize = 512;
 const EXPAND_ROWS: usize = 6;
 const EXPAND_BLOCK_TOPK: usize = 512;
 const EXPAND_FINAL_TOPK: usize = 2051;
+const SCORE_BATCH: usize = 3;
+const SCORE_HEADS: usize = 8;
+const SCORE_HEAD_DIM: usize = 128;
+const SCORE_PAGES: usize = 41;
+const SCORE_PAGE_SIZE: usize = 16;
+const SCORE_MAX_PAGES: usize = 17;
+const SCORE_MAX_MODEL_LEN: usize = SCORE_MAX_PAGES * SCORE_PAGE_SIZE;
 
 #[derive(Default)]
 struct LayoutBuilder {
@@ -73,7 +82,8 @@ impl IndexLayout {
         let cache_locs = layout.field(INDEX_TOKENS * 8)?;
         let group_locs = layout.field(INDEX_GROUPS * 4 * 4)?;
         let write_locs = layout.field(INDEX_GROUPS * 4)?;
-        let q_output = layout.field(INDEX_TOKENS * INDEX_QUERY_HEADS * INDEX_HEAD_DIM * 2)?;
+        let q_output =
+            layout.field(INDEX_TOKENS * INDEX_QUERY_HEADS_PADDED * INDEX_HEAD_DIM * 2)?;
         let key_state = layout.field(INDEX_STATE_SLOTS * INDEX_HEAD_DIM * 2)?;
         let rope_positions = layout.field(INDEX_STATE_SLOTS * 3 * 8)?;
         let compressed_keys = layout.field(INDEX_COMPRESSED_SLOTS * INDEX_HEAD_DIM * 2)?;
@@ -146,6 +156,36 @@ impl ExpandLayout {
             query_positions,
             sequence_lengths,
             logical_indices,
+            total_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScoreLayout {
+    query: usize,
+    key_cache: usize,
+    page_table: usize,
+    context_lengths: usize,
+    logits: usize,
+    total_bytes: usize,
+}
+
+impl ScoreLayout {
+    fn qwen() -> io::Result<Self> {
+        let mut layout = LayoutBuilder::default();
+        let query = layout.field(SCORE_BATCH * SCORE_HEADS * SCORE_HEAD_DIM * 2)?;
+        let key_cache = layout.field(SCORE_PAGES * SCORE_PAGE_SIZE * SCORE_HEAD_DIM * 2)?;
+        let page_table = layout.field(SCORE_BATCH * SCORE_MAX_PAGES * 4)?;
+        let context_lengths = layout.field(SCORE_BATCH * 4)?;
+        let logits = layout.field(SCORE_BATCH * SCORE_MAX_MODEL_LEN * 4)?;
+        let total_bytes = layout.finish()?;
+        Ok(Self {
+            query,
+            key_cache,
+            page_table,
+            context_lengths,
+            logits,
             total_bytes,
         })
     }
@@ -225,7 +265,7 @@ fn run_index_prep(
     let expected_q = read_fixture(
         root,
         "q_output_bf16.bin",
-        INDEX_TOKENS * INDEX_QUERY_HEADS * INDEX_HEAD_DIM * 2,
+        INDEX_TOKENS * INDEX_QUERY_HEADS_PADDED * INDEX_HEAD_DIM * 2,
     )?;
     let expected_state = read_fixture(
         root,
@@ -401,6 +441,102 @@ fn run_topk(
     region.close().map_err(io::Error::other)
 }
 
+fn run_score(
+    root: &Path,
+    caps: &DeviceCaps,
+    stream: &mut CudaStreamOwner,
+    event: &mut CudaEventOwner,
+) -> io::Result<()> {
+    let layout = ScoreLayout::qwen()?;
+    let query = read_fixture(
+        root,
+        "q_bf16.bin",
+        SCORE_BATCH * SCORE_HEADS * SCORE_HEAD_DIM * 2,
+    )?;
+    let key_cache = read_fixture(
+        root,
+        "k_cache_bf16.bin",
+        SCORE_PAGES * SCORE_PAGE_SIZE * SCORE_HEAD_DIM * 2,
+    )?;
+    let page_table = read_fixture(
+        root,
+        "page_table_i32.bin",
+        SCORE_BATCH * SCORE_MAX_PAGES * 4,
+    )?;
+    let context_lengths = read_fixture(root, "context_lens_i32.bin", SCORE_BATCH * 4)?;
+    let expected = read_fixture(
+        root,
+        "logits_f32.bin",
+        SCORE_BATCH * SCORE_MAX_MODEL_LEN * 4,
+    )?;
+    let lengths = i32_values(&context_lengths);
+
+    let mut region = CoherentRegionOwner::slab(
+        u64::try_from(layout.total_bytes).map_err(|_| io::Error::other("layout overflow"))?,
+        4096,
+        COHERENT_REGION_PREFAULT,
+    )
+    .map_err(io::Error::other)?;
+    // SAFETY: no CUDA work references this freshly allocated mapping.
+    let payload = unsafe { region.host_payload_mut() }.map_err(io::Error::other)?;
+    copy_at(payload, layout.query, &query);
+    copy_at(payload, layout.key_cache, &key_cache);
+    copy_at(payload, layout.page_table, &page_table);
+    copy_at(payload, layout.context_lengths, &context_lengths);
+    for value in payload[layout.logits..layout.logits + expected.len()].chunks_exact_mut(4) {
+        value.copy_from_slice(&f32::NAN.to_ne_bytes());
+    }
+
+    let base = region.device_address();
+    let args = QsaScoreArgs {
+        struct_size: std::mem::size_of::<QsaScoreArgs>() as u32,
+        abi_version: sparkserve_runtime::kernel::KERNEL_ABI_VERSION,
+        plan: QsaScorePlan::qwen38_flash(
+            SCORE_BATCH as u32,
+            SCORE_PAGES as u32,
+            SCORE_MAX_PAGES as u32,
+        ),
+        query: device_pointer(base, layout.query)?.cast_const(),
+        key_cache: device_pointer(base, layout.key_cache)?.cast_const(),
+        page_table: device_pointer(base, layout.page_table)?
+            .cast::<i32>()
+            .cast_const(),
+        context_lengths: device_pointer(base, layout.context_lengths)?
+            .cast::<i32>()
+            .cast_const(),
+        logits: device_pointer(base, layout.logits)?.cast::<f32>(),
+        score_scale: (SCORE_HEAD_DIM as f32).sqrt(),
+        reserved: 0,
+        cuda_stream: stream.raw(),
+    };
+    // SAFETY: every pointer targets a live coherent mapping and remains stable
+    // until the recorded event is synchronized below.
+    if let Err(error) = status_result(unsafe { sparkserve_qsa_score_launch(caps, &args) }) {
+        let _ = stream.synchronize();
+        return Err(io::Error::other(error));
+    }
+    event.record(stream).map_err(io::Error::other)?;
+    event.synchronize().map_err(io::Error::other)?;
+
+    // SAFETY: event completion excludes all CUDA access to this mapping.
+    let payload = unsafe { region.host_payload_mut() }.map_err(io::Error::other)?;
+    let actual = &payload[layout.logits..layout.logits + expected.len()];
+    let mut mismatches = 0;
+    let mut compared = 0;
+    for (row, &length) in lengths.iter().enumerate() {
+        let length = usize::try_from(length).map_err(|_| io::Error::other("negative length"))?;
+        let begin = row * SCORE_MAX_MODEL_LEN * 4;
+        let end = begin + length * 4;
+        mismatches += element_mismatches(&actual[begin..end], &expected[begin..end], 4);
+        compared += length;
+    }
+    println!("Rust QSA score mismatches: {mismatches}/{compared}");
+    if mismatches != 0 {
+        return Err(io::Error::other("Rust QSA score differs from oracle"));
+    }
+    region.close().map_err(io::Error::other)
+}
+
 fn run_expand(
     root: &Path,
     caps: &DeviceCaps,
@@ -476,22 +612,27 @@ fn main() -> io::Result<()> {
     let mut arguments = std::env::args_os().skip(1).map(PathBuf::from);
     let index_fixture = arguments.next().ok_or_else(|| {
         io::Error::other(
-            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture>",
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture> <score-fixture>",
         )
     })?;
     let topk_fixture = arguments.next().ok_or_else(|| {
         io::Error::other(
-            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture>",
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture> <score-fixture>",
         )
     })?;
     let expand_fixture = arguments.next().ok_or_else(|| {
         io::Error::other(
-            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture>",
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture> <score-fixture>",
+        )
+    })?;
+    let score_fixture = arguments.next().ok_or_else(|| {
+        io::Error::other(
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture> <score-fixture>",
         )
     })?;
     if arguments.next().is_some() {
         return Err(io::Error::other(
-            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture>",
+            "usage: qsa_frontend_smoke <index-fixture> <topk-fixture> <expand-fixture> <score-fixture>",
         ));
     }
 
@@ -499,6 +640,7 @@ fn main() -> io::Result<()> {
     let mut stream = CudaStreamOwner::create().map_err(io::Error::other)?;
     let mut event = CudaEventOwner::create().map_err(io::Error::other)?;
     run_index_prep(&index_fixture, &caps, &mut stream, &mut event)?;
+    run_score(&score_fixture, &caps, &mut stream, &mut event)?;
     run_topk(&topk_fixture, &caps, &mut stream, &mut event)?;
     run_expand(&expand_fixture, &caps, &mut stream, &mut event)?;
     event.close().map_err(io::Error::other)?;

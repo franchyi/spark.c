@@ -634,6 +634,58 @@ pub struct QsaExpandArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QsaScorePlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub batch_size: u32,
+    pub pages: u32,
+    pub max_pages: u32,
+    pub max_model_len: u32,
+    pub query_heads: u32,
+    pub head_dim: u32,
+    pub page_size: u32,
+    pub query_dtype: u32,
+    pub logits_dtype: u32,
+    pub requested_backend: u32,
+}
+
+impl QsaScorePlan {
+    pub fn qwen38_flash(batch_size: u32, pages: u32, max_pages: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            batch_size,
+            pages,
+            max_pages,
+            max_model_len: max_pages.saturating_mul(16),
+            query_heads: 8,
+            head_dim: 128,
+            page_size: 16,
+            query_dtype: DataType::BFloat16 as u32,
+            logits_dtype: DataType::Float32 as u32,
+            requested_backend: crate::kernel::KernelBackend::TilelangQsaScore as u32,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QsaScoreArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: QsaScorePlan,
+    pub query: *const c_void,
+    pub key_cache: *const c_void,
+    pub page_table: *const i32,
+    pub context_lengths: *const i32,
+    pub logits: *mut f32,
+    pub score_scale: f32,
+    pub reserved: u32,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QsaIndexPrepPlan {
     pub struct_size: u32,
     pub abi_version: u32,
@@ -648,7 +700,7 @@ pub struct QsaIndexPrepPlan {
     pub num_position_axes: u32,
     pub dtype: u32,
     pub requested_backend: u32,
-    pub reserved: u32,
+    pub q_heads_padded: u32,
 }
 
 impl QsaIndexPrepPlan {
@@ -673,7 +725,7 @@ impl QsaIndexPrepPlan {
             num_position_axes,
             dtype: DataType::BFloat16 as u32,
             requested_backend: crate::kernel::KernelBackend::SglangQsaIndexPrep as u32,
-            reserved: 0,
+            q_heads_padded: 8,
         }
     }
 }
@@ -1036,6 +1088,16 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const QsaExpandArgs,
     ) -> Status;
+    pub fn sparkserve_qsa_score_validate(plan: *const QsaScorePlan) -> Status;
+    pub fn sparkserve_qsa_score_query(
+        caps: *const DeviceCaps,
+        plan: *const QsaScorePlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_qsa_score_launch(
+        caps: *const DeviceCaps,
+        args: *const QsaScoreArgs,
+    ) -> Status;
     pub fn sparkserve_qsa_index_prep_validate(plan: *const QsaIndexPrepPlan) -> Status;
     pub fn sparkserve_qsa_index_prep_query(
         caps: *const DeviceCaps,
@@ -1113,6 +1175,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<QsaTopkArgs>(), 88);
         assert_eq!(std::mem::size_of::<QsaExpandPlan>(), 40);
         assert_eq!(std::mem::size_of::<QsaExpandArgs>(), 88);
+        assert_eq!(std::mem::size_of::<QsaScorePlan>(), 48);
+        assert_eq!(std::mem::size_of::<QsaScoreArgs>(), 112);
         assert_eq!(std::mem::size_of::<QsaIndexPrepPlan>(), 56);
         assert_eq!(std::mem::size_of::<QsaIndexPrepArgs>(), 200);
         assert_eq!(std::mem::size_of::<QsaKvPackPlan>(), 48);
@@ -1202,9 +1266,25 @@ mod tests {
     }
 
     #[test]
+    fn qwen_qsa_score_plan_freezes_tilelang_decode_geometry() {
+        let plan = QsaScorePlan::qwen38_flash(3, 41, 17);
+        assert_eq!(plan.max_model_len, 272);
+        assert_eq!(plan.query_heads, 8);
+        assert_eq!(plan.head_dim, 128);
+        assert_eq!(plan.page_size, 16);
+        assert_eq!(plan.query_dtype, DataType::BFloat16 as u32);
+        assert_eq!(plan.logits_dtype, DataType::Float32 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::TilelangQsaScore as u32
+        );
+    }
+
+    #[test]
     fn qwen_qsa_index_prep_plan_freezes_state_geometry() {
         let plan = QsaIndexPrepPlan::qwen38_flash(16, 4, 32_768, 8_192, 1);
         assert_eq!(plan.num_q_heads, 4);
+        assert_eq!(plan.q_heads_padded, 8);
         assert_eq!(plan.head_dim, 128);
         assert_eq!(plan.rotary_dim, 128);
         assert_eq!(plan.compress_ratio, 4);

@@ -32,6 +32,10 @@ _Static_assert(sizeof(SparkServeQsaExpandPlan) == 40u,
                "C QSA expansion plan layout drifted");
 _Static_assert(sizeof(SparkServeQsaExpandArgs) == 88u,
                "C QSA expansion arguments layout drifted");
+_Static_assert(sizeof(SparkServeQsaScorePlan) == 48u,
+               "C QSA score plan layout drifted");
+_Static_assert(sizeof(SparkServeQsaScoreArgs) == 112u,
+               "C QSA score arguments layout drifted");
 _Static_assert(sizeof(SparkServeQsaKvPackPlan) == 48u,
                "C QSA K/V-pack plan layout drifted");
 _Static_assert(sizeof(SparkServeQsaKvPackArgs) == 136u,

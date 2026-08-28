@@ -1,5 +1,6 @@
 #include "sparkserve/kernel_api.h"
 
+#include <cmath>
 #include <limits>
 
 #ifdef SPARKSERVE_WITH_CUDA
@@ -28,6 +29,9 @@
 #endif
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_EXPAND
 #include "internal/qsa_expand_backend.h"
+#endif
+#ifdef SPARKSERVE_WITH_TILELANG_QSA_SCORE
+#include "internal/qsa_score_backend.h"
 #endif
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_INDEX_PREP
 #include "internal/qsa_index_prep_backend.h"
@@ -225,6 +229,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("FlashInfer XQA backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_QSA_EXPAND:
       return Invalid("QSA expansion backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_TILELANG_QSA_SCORE:
+      return Invalid("QSA score backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1136,6 +1142,106 @@ extern "C" SparkServeStatus sparkserve_qsa_expand_launch(
 #endif
 }
 
+extern "C" SparkServeStatus sparkserve_qsa_score_validate(
+    const SparkServeQsaScorePlan* plan) {
+  if (plan == nullptr) return Invalid("QSA score plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->batch_size == 0 || plan->batch_size > 1U << 20) {
+    return Invalid("QSA score batch size is invalid");
+  }
+  if (plan->pages == 0 || plan->max_pages == 0 ||
+      plan->max_pages > 1U << 20) {
+    return Invalid("QSA score page geometry is invalid");
+  }
+  if (plan->max_model_len != plan->max_pages * 16U) {
+    return Unsupported("QSA score length must equal max_pages * 16");
+  }
+  if (plan->query_heads != 8 || plan->head_dim != 128 ||
+      plan->page_size != 16) {
+    return Unsupported("Qwen3.8 Flash-Next QSA score geometry is required");
+  }
+  if (plan->query_dtype != SPARKSERVE_DTYPE_BF16 ||
+      plan->logits_dtype != SPARKSERVE_DTYPE_F32) {
+    return Unsupported("QSA score requires BF16 query/cache and FP32 logits");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_TILELANG_QSA_SCORE) {
+    return Invalid("unknown QSA score backend");
+  }
+  if (!CanMultiply(plan->batch_size,
+                   static_cast<uint64_t>(plan->query_heads) * plan->head_dim *
+                       sizeof(uint16_t)) ||
+      !CanMultiply(plan->pages,
+                   static_cast<uint64_t>(plan->page_size) * plan->head_dim *
+                       sizeof(uint16_t)) ||
+      !CanMultiply(plan->batch_size,
+                   static_cast<uint64_t>(plan->max_model_len) *
+                       sizeof(float))) {
+    return Invalid("QSA score buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_score_query(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaScorePlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first QSA score donor is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_qsa_score_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_TILELANG_QSA_SCORE;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "sglang-tilelang-qsa-paged-score";
+  info->source_revision =
+      "sglang@d91c3682b0b429e4c70df63cd57f819588ce29b0+"
+      "tilelang@cd37ed5fc35ae7a60a1277c8eb49028174ac51e6";
+#ifdef SPARKSERVE_WITH_TILELANG_QSA_SCORE
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_qsa_score_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeQsaScoreArgs* args) {
+  if (args == nullptr) return Invalid("QSA score arguments are required");
+  SparkServeStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query_status =
+      sparkserve_qsa_score_query(caps, &args->plan, &info);
+  if (query_status.code != SPARKSERVE_STATUS_OK) return query_status;
+  if (args->query == nullptr || args->key_cache == nullptr ||
+      args->page_table == nullptr || args->context_lengths == nullptr ||
+      args->logits == nullptr) {
+    return Invalid("QSA score pointers cannot be null");
+  }
+  if (!(args->score_scale > 0.0f) || !std::isfinite(args->score_scale)) {
+    return Invalid("QSA score scale must be finite and positive");
+  }
+#ifdef SPARKSERVE_WITH_TILELANG_QSA_SCORE
+  return sparkserve_tilelang_qsa_score_cuda_launch(args);
+#else
+  return Unavailable("TileLang QSA score donor is not linked");
+#endif
+}
+
 extern "C" SparkServeStatus sparkserve_qsa_index_prep_validate(
     const SparkServeQsaIndexPrepPlan* plan) {
   if (plan == nullptr) return Invalid("QSA index-prep plan is required");
@@ -1149,6 +1255,7 @@ extern "C" SparkServeStatus sparkserve_qsa_index_prep_validate(
   }
   if (plan->num_q_heads != 4 || plan->head_dim != 128 ||
       plan->rotary_dim != 128 || plan->compress_ratio != 4 ||
+      plan->q_heads_padded != 8 ||
       (plan->num_position_axes != 1 && plan->num_position_axes != 3)) {
     return Unsupported("Qwen3.8 Flash-Next QSA index-prep shape is unsupported");
   }
@@ -1164,6 +1271,9 @@ extern "C" SparkServeStatus sparkserve_qsa_index_prep_validate(
                        plan->head_dim * sizeof(uint16_t)) ||
       !CanMultiply(plan->state_slots,
                    static_cast<uint64_t>(plan->head_dim) * sizeof(uint16_t)) ||
+      !CanMultiply(plan->tokens,
+                   static_cast<uint64_t>(plan->q_heads_padded) *
+                       plan->head_dim * sizeof(uint16_t)) ||
       !CanMultiply(plan->compressed_slots,
                    static_cast<uint64_t>(plan->head_dim) * sizeof(uint16_t))) {
     return Invalid("QSA index-prep buffer size overflow");

@@ -77,14 +77,14 @@ has passed CUDA reads from both the registered cache slab and a protected
 file-backed mapping. PLE now adds bit-exact scaled-BF16 gather parity on 16 real
 boundary rows plus simultaneous CUDA and `io_uring` registration of the same
 4 MiB physical slab. Its Rust two-window lease scheduler now fixes every graph
-address and prevents refill before compute completion. QSA now has its first
-borrowed primitive: SGLang's 512-block radix selector matches every selected
-index in the 65,536-column ragged fixture on SM121. Its fused Q/K preparation
-also matches Q output and all raw/compressed key and RoPE state bits. The
-selected-K/V adapter now matches SGLang's valid counts and all packed BF16 bits;
-Rust fixes its 64-token page table, scratch addresses, graph buckets, and
-128-MiB downstream workspace. The pinned FlashInfer XQA source now consumes
-that layout through the raw ABI with bit-exact BF16 output at batch one. Its
+address and prevents refill before compute completion. QSA now borrows all six
+arithmetic stages: SGLang fused Q/K preparation, the exact TileLang-generated
+score MMA, SGLang radix top-k, block expansion and K/V compaction, then pinned
+FlashInfer XQA. Index/state outputs, all 329 valid score values, selected sets,
+standalone packed BF16 rows, and batch-one XQA output pass their isolated gates.
+The 4.11-microsecond score object is linked ahead of time without Python, Torch,
+TVM-FFI, TileLang JIT, or SGLang at runtime. Rust fixes the 64-token page table,
+scratch addresses, graph buckets, and 128-MiB downstream workspace. Its
 Rust arena lifecycle now shares one coherent max-batch allocation across graph
 buckets, blocks early reuse with pack/ready/decode leases, resets after failed
 XQA launches, and owns the native mapping until scheduler teardown. The GB10
@@ -94,13 +94,12 @@ packer feeds FlashInfer XQA at the same fixed addresses; packed key, value,
 length, and attention output all have zero mismatches. Its reusable CUDA fence
 owns the pending scheduler lease and exposes it only after the recorded event
 completes, so host code cannot publish an in-flight arena accidentally. The
-same framework-free shared library and Rust launcher now cover fused index prep,
-radix top-k, and block-to-token expansion from coherent memory with exact
-Q/state/RoPE/compressed-key, selected-set, and expanded-index parity. The
-expansion fixture covers incomplete-tail insertion and padding with 0/12,306
-mismatches; its direct GB10 kernel mean is 4.10 microseconds. This document
-remains a completion checklist: PLE storage-thread/CUDA-event overlap, the QSA
-score-MQA kernel and full-token
-graph, tokenizer/server, GGUF, GLM
+same framework-free shared library and Rust launcher now run the joined six-stage
+chain from coherent memory. Q/state/RoPE, score values, selected sets, K/V packed
+for the execution's selection order, and valid length are exact. Radix top-k is
+set-stable rather than order-stable; the resulting attention reduction remains
+within 0.015625 maximum BF16 absolute error. This document remains a completion
+checklist: PLE storage-thread/CUDA-event overlap, the complete Qwen layer and
+full-token graph, tokenizer/server, GGUF, GLM
 graph, and end-to-end continuation gates are not implied to be finished by this
 graph fragment.

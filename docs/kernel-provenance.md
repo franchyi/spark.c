@@ -126,7 +126,7 @@ retaining a switch back to the legacy dispatch.
 | Qwen3.8 27B dense NVFP4 linear | live SGLang ModelOpt path | FlashInfer `mm_fp4` or direct CUTLASS 79a instantiation | wrap first; specialize later | packed bytes/scales exact, real-tensor output parity, greedy-token parity |
 | Flash-Next routed NVFP4 MoE | SGLang Qwen4-exp + ModelOpt | FlashInfer grouped NVFP4 GEMMs, AOT CuTe input/fused-activation quantizers, and adapted FlashInfer route/finalize kernels | pinned framework-free instantiations/objects behind C ABI; Rust owns the shared padded layout, route map, graph bucket, and residency | two-token/two-expert real-weight dispatch → quantize → gate/up → activation → down → weighted finalize is byte-exact at every intermediate; next router/top-k and shared-expert parity |
 | GDN projection and recurrence | SGLang Qwen4-exp + FlashInfer GDN | local raw CUDA K=V=128 BF16-state decode; later fuse QKV extraction | correctness kernel implemented; optimize behind the same ABI | CPU-reference parity now; real SGLang tensor/state and multi-step parity next |
-| QSA indexer and sparse attention | SGLang QSA backend at `7c66045`/`d91c368` + FlashInfer `906181e` | SGLang fused Q/K prep, radix top-k, block-to-token expansion, and selected-K/V pack, plus FlashInfer XQA BF16 paged decode | all five donors now share one framework-free library; Rust owns coherent ranges, streams/events, fixed page tables/workspace, and graph scheduling | Rust/coherent-memory prep, top-k, expansion, pack, and XQA fixtures pass exact parity; score MQA and joined layer parity next |
+| QSA indexer and sparse attention | SGLang QSA backend at `7c66045`/`d91c368`, TileLang `cd37ed5`, FlashInfer `906181e` | SGLang fused Q/K prep, TileLang-generated score MQA, radix top-k, block-to-token expansion, selected-K/V pack, and FlashInfer XQA BF16 paged decode | all six donors share one framework-free library; Rust owns coherent ranges, streams/events, fixed page tables/workspace, and graph scheduling | isolated fixtures pass exact parity; the joined coherent chain has exact selection/packing semantics and 0.015625 max BF16 attention error under legal top-k permutation; full Qwen-layer continuation next |
 | Hyperconnection mix/combine | SGLang Qwen4-exp | small SGLang CUDA/Triton kernels | port or vendor after license audit | per-stream output and residual-state parity |
 | PLE lookup | SGLang Qwen4-exp at `7c66045` + checkpoint | raw CUDA adapter matching the SGLang FP8-E4M3 load, BF16 conversion, and BF16 scaling; Rust supplies NVMe row residency | linked framework-free adapter plus original one-copy storage policy | passed: 16 real boundary rows, 2,560/2,560 scaled BF16 values bit-exact; 2.06 us mean on SM121 |
 | RMSNorm/RoPE/top-k/sampling | SGLang, FlashInfer, ds4 | smallest fastest proven candidate | benchmark and adopt independently | exact discrete ids; numerical parity for continuous outputs |
@@ -204,10 +204,9 @@ kernels—without importing either framework's scheduler, allocator, or graph.
    continuations from the live SGLang service.
 2. Double-buffer the completed PLE gather and fixed-slab reader, then connect its
    fixed descriptors to the token graph; keep routing/top-k separately tested.
-3. Join the completed QSA prep, radix top-k, block-to-token expansion,
-   selected-K/V pack, and borrowed FlashInfer XQA decode through the implemented
-   six-stage Rust lease scheduler; borrow the score MQA next, then complete
-   QSA/GDN/mHC state parity and connect the token graph.
+3. Connect the completed six-stage borrowed QSA chain to Qwen layer state,
+   then complete QSA/GDN/mHC layer parity and the token graph. Preserve radix
+   top-k's set contract instead of adding a canonical sort to the hot path.
 4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
 5. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
 6. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed

@@ -395,6 +395,47 @@ int main() {
   assert(sparkserve_qsa_expand_validate(&qsa_expand).code ==
          SPARKSERVE_STATUS_UNSUPPORTED);
 
+  SparkServeQsaScorePlan qsa_mqa = {
+      sizeof(SparkServeQsaScorePlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      1,
+      41,
+      17,
+      272,
+      8,
+      128,
+      16,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_DTYPE_F32,
+      SPARKSERVE_BACKEND_AUTO,
+  };
+  assert(sparkserve_qsa_score_validate(&qsa_mqa).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo qsa_mqa_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_qsa_score_query(&caps, &qsa_mqa, &qsa_mqa_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(qsa_mqa_info.backend == SPARKSERVE_BACKEND_TILELANG_QSA_SCORE);
+  assert(qsa_mqa_info.available == 0);
+  SparkServeQsaScoreArgs qsa_mqa_args = {};
+  qsa_mqa_args.struct_size = sizeof(qsa_mqa_args);
+  qsa_mqa_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  qsa_mqa_args.plan = qsa_mqa;
+  qsa_mqa_args.query = &output;
+  qsa_mqa_args.key_cache = &output;
+  qsa_mqa_args.page_table = &qsa_index;
+  qsa_mqa_args.context_lengths = &qsa_length;
+  qsa_mqa_args.logits = &qsa_score;
+  qsa_mqa_args.score_scale = 11.3137085f;
+  assert(sparkserve_qsa_score_launch(&caps, &qsa_mqa_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  qsa_mqa.page_size = 64;
+  assert(sparkserve_qsa_score_validate(&qsa_mqa).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeQsaIndexPrepPlan qsa_prep = {
       sizeof(SparkServeQsaIndexPrepPlan),
       SPARKSERVE_KERNEL_ABI_VERSION,
@@ -409,7 +450,7 @@ int main() {
       1,
       SPARKSERVE_DTYPE_BF16,
       SPARKSERVE_BACKEND_AUTO,
-      0,
+      8,
   };
   assert(sparkserve_qsa_index_prep_validate(&qsa_prep).code ==
          SPARKSERVE_STATUS_OK);

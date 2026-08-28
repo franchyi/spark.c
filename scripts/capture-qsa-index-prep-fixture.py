@@ -109,6 +109,7 @@ def main() -> None:
         rotary_dim=HEAD_DIM,
         eps=EPS,
         is_neox_style=True,
+        q_heads_padded=8,
     )
     qsa_index_k_compress_store(
         key_state,

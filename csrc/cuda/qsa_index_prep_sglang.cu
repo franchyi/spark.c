@@ -125,6 +125,7 @@ struct QPrepParams {
   int64_t* rope_positions;
   uint64_t positions_stride;
   uint32_t num_position_axes;
+  uint32_t q_heads_padded;
   float eps;
 };
 
@@ -146,14 +147,23 @@ __global__ __launch_bounds__(128) void QsaQPrepKernel(QPrepParams params) {
         static_cast<uint64_t>(source_axis) * params.positions_stride + token];
   }
 
-  const __nv_bfloat16* input_row =
-      params.qk + qk_row + static_cast<int64_t>(warp) * kHeadDim;
-  __nv_bfloat16* output_row =
-      params.q_output +
-      (static_cast<int64_t>(token) * kQueryHeads + warp) * kHeadDim;
-  GemmaNormRow(input_row, params.weight, params.eps, shared_rows[warp]);
-  ApplyNeoxMrope(shared_rows[warp], output_row, params.cos_sin_cache,
-                 params.axis_map, positions, kHeadDim);
+  for (uint32_t head = warp; head < params.q_heads_padded; head += 4) {
+    __nv_bfloat16* output_row =
+        params.q_output +
+        (static_cast<int64_t>(token) * params.q_heads_padded + head) * kHeadDim;
+    if (head < kQueryHeads) {
+      const __nv_bfloat16* input_row =
+          params.qk + qk_row + static_cast<int64_t>(head) * kHeadDim;
+      GemmaNormRow(input_row, params.weight, params.eps, shared_rows[warp]);
+      ApplyNeoxMrope(shared_rows[warp], output_row, params.cos_sin_cache,
+                     params.axis_map, positions, kHeadDim);
+    } else {
+#pragma unroll
+      for (int item = 0; item < kPerLane; ++item) {
+        output_row[lane * kPerLane + item] = Bf16(0.0f);
+      }
+    }
+  }
 
   if (warp == 0) {
 #pragma unroll
@@ -256,6 +266,7 @@ SparkServeStatus sparkserve_sglang_qsa_index_prep_cuda_launch(
       args->rope_positions,
       args->positions_stride,
       args->plan.num_position_axes,
+      args->plan.q_heads_padded,
       args->eps,
   };
   const cudaStream_t stream = static_cast<cudaStream_t>(args->cuda_stream);

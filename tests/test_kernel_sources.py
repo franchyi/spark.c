@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import tomllib
 from pathlib import Path
@@ -24,7 +25,12 @@ def test_kernel_sources_are_immutable_or_explicitly_blocked() -> None:
             assert source["status"].startswith("blocked-")
             continue
         assert re.fullmatch(r"[0-9a-f]{40}", revision), source["id"]
-        assert source["license"] in {"Apache-2.0", "BSD-3-Clause", "MIT"}
+        assert source["license"] in {
+            "Apache-2.0",
+            "Apache-2.0 AND MIT",
+            "BSD-3-Clause",
+            "MIT",
+        }
 
 
 def test_first_nvfp4_candidate_is_framework_free_and_pinned() -> None:
@@ -223,6 +229,40 @@ def test_sglang_qsa_expand_donor_is_pinned_and_hashed() -> None:
     assert hashes == [
         "5482e38d30bfaf1624ec0625b4896cbb395a1637f75c183c8ca723c9f6055ff8  "
         "python/sglang/srt/layers/attention/qsa/kernel.py"
+    ]
+
+
+def test_sglang_tilelang_qsa_score_donor_is_pinned_and_hashed() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-tilelang-qsa-score"
+    )
+    assert donor["revision"] == "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+    assert donor["license"] == "Apache-2.0 AND MIT"
+    assert donor["mode"] == "generated-source-vendor"
+    assert donor["status"].startswith("linked-aot-sm121-")
+    assert donor["entrypoint"] == (
+        "python/sglang/srt/layers/attention/qsa/mqa.py"
+    )
+
+    vendor = ROOT / "third_party" / "tilelang-qsa-score"
+    assert (vendor / "VENDOR.md").is_file()
+    assert (vendor / "LICENSE").is_file()
+    assert (vendor / "include" / "tl_templates" / "cuda" / "common.h").is_file()
+    generated = vendor / "generated" / "device_kernel.cu"
+    assert hashlib.sha256(generated.read_bytes()).hexdigest() == (
+        "52697eae776dba3b8212f8d6be75e8b1a6e574558dd9735293a2890f65d567d4"
+    )
+    hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
+    assert hashes == [
+        "af36d5c8f4fbda5b0e82b7f31046a95c9a709fcc57b3600c6473c49e87b7629f  "
+        "python/sglang/srt/layers/attention/qsa/mqa.py",
+        "52697eae776dba3b8212f8d6be75e8b1a6e574558dd9735293a2890f65d567d4  "
+        "generated/device_kernel.cu",
     ]
 
 

@@ -58,6 +58,7 @@ int main(int argc, char** argv) {
   constexpr uint32_t kCompressedSlots = 64;
   constexpr uint32_t kHeadDim = 128;
   constexpr uint32_t kQueryHeads = 4;
+  constexpr uint32_t kQueryHeadsPadded = 8;
   constexpr uint32_t kPositionRows = 512;
 
   const auto qk = Read<uint16_t>(fixture / "qk_bf16.bin",
@@ -75,7 +76,7 @@ int main(int argc, char** argv) {
       Read<int32_t>(fixture / "group_locs_i32.bin", kGroups * 4);
   const auto write_locs = Read<int32_t>(fixture / "write_locs_i32.bin", kGroups);
   const auto expected_q = Read<uint16_t>(fixture / "q_output_bf16.bin",
-                                         kTokens * kQueryHeads * kHeadDim);
+                                         kTokens * kQueryHeadsPadded * kHeadDim);
   const auto expected_state = Read<uint16_t>(fixture / "key_state_bf16.bin",
                                              kStateSlots * kHeadDim);
   const auto expected_rope =
@@ -122,7 +123,7 @@ int main(int argc, char** argv) {
       1,
       SPARKSERVE_DTYPE_BF16,
       SPARKSERVE_BACKEND_SGLANG_QSA_INDEX_PREP,
-      0,
+      kQueryHeadsPadded,
   };
   SparkServeKernelInfo info = {
       sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,

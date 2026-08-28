@@ -1,8 +1,8 @@
 //! End-to-end QSA token ordering owned by Rust.
 //!
 //! Arithmetic donors operate on raw pointers and CUDA streams. This module
-//! makes the semantic gaps between those donors explicit, prevents stages from
-//! being skipped, and publishes a transition only after its CUDA event has
+//! makes the semantic boundaries between those donors explicit, prevents stages
+//! from being skipped, and publishes a transition only after its CUDA event has
 //! completed. Persistent index state is quarantined after a partial index-prep
 //! or decode failure until the caller restores the token checkpoint.
 
@@ -174,10 +174,9 @@ pub struct QsaPipelineStats {
 
 /// Allocation-free semantic scheduler around the fixed QSA arena.
 ///
-/// `Score` and `SelectionExpand` are first-class stages even though their
-/// production kernels are not connected yet. This prevents the already
-/// validated index-prep/top-k/pack/XQA donors from being presented as a joined
-/// layer before the missing transformations exist.
+/// Every borrowed arithmetic kernel remains a first-class stage. The scheduler
+/// therefore owns ordering and failure recovery without embedding donor-specific
+/// allocation or dispatch policy.
 pub struct QsaPipelineScheduler {
     scheduler_id: u64,
     arena: QsaArenaScheduler,

@@ -147,35 +147,32 @@ reference implementation. This is a correctness kernel; profiling and fusion
 with QKV extraction come after real-tensor parity with SGLang.
 
 QSA sparse decode now borrows its proven arithmetic rather than reimplementing
-attention. SGLang-derived fused index prep, radix top-k, block-to-token
-expansion, and selected-K/V pack feed FlashInfer's pinned BF16 XQA kernel
-through raw C ABIs. On GB10, all packed
-K/V bits and the batch-one attention output match their framework oracles;
-the XQA launch itself takes 7.55 microseconds. Rust owns the fixed 64-token page
-tables, graph-bucket addresses, valid lengths, and 128-MiB workspace split. One
-max-batch coherent allocation now backs every graph bucket. An allocation-free
-Rust lease machine prevents repack while selected-K/V packing or XQA owns that
-allocation, rejects stale and foreign completions, and forces a semaphore reset
-after any failed XQA launch. The native `mmap`/CUDA registration handle also has
-a unique Rust owner, so the stable device mapping cannot be freed independently
-of its scheduler. A reusable `QsaCudaFence` owns both the pending scheduler lease
-and its timing-disabled CUDA event; only a successful event query or wait can
-publish `workspace-ready`, `pack-ready`, or `decode-complete`. The
-production-shaped Rust smoke now submits a real
-asynchronous workspace zero, launches the borrowed SGLang selected-K/V packer,
-records its CUDA completion, transfers the same fixed addresses to FlashInfer
-XQA, and records decode completion. On GB10 the joined path matches the oracle's
-packed key, packed value, valid length, and attention output with zero BF16
-mismatches and performs no CPU-to-GPU copy. The same framework-free shared
-library now links the borrowed SGLang fused index-prep, radix top-k, and
-block-to-token expansion kernels. A second Rust smoke runs all three from
-CUDA-registered coherent slabs: all Q output, persistent key state, RoPE state,
-and compressed-key elements are bit-exact; all four 65,536-column top-k rows
-select the oracle's exact 512-index sets; and all 12,306 expanded logical-token
-indices match, including incomplete-tail and padding cases. The direct expansion
-kernel takes 4.10 microseconds on GB10. This validates all five borrowed QSA
-donors in the shipping library without claiming the still-missing score-MQA
-stage or full semantic QSA layer is complete.
+attention. SGLang-derived fused index prep, TileLang-generated score MQA, radix
+top-k, block-to-token expansion, and selected-K/V pack feed FlashInfer's pinned
+BF16 XQA kernel through raw C ABIs. The exact score MMA and its 676-KiB MIT
+template-header subset are linked ahead of time; Torch, Python, TVM-FFI,
+TileLang JIT, and SGLang are absent at runtime. On GB10 the score fixture matches
+all 329 valid FP32 values bit-for-bit at 4.11 microseconds, expansion takes 4.10
+microseconds, and XQA takes 7.55 microseconds.
+
+Rust owns the six-stage order, fixed 64-token page tables, graph-bucket
+addresses, valid lengths, and 128-MiB workspace split. One max-batch coherent
+allocation backs every graph bucket. Its allocation-free lease machine rejects
+skipped, stale, and foreign completions, blocks reuse while a donor owns the
+mapping, and forces a semaphore reset after a failed XQA launch. A reusable
+CUDA fence publishes a stage only after its timing-disabled event completes;
+the native `mmap`/CUDA-registration owner keeps the stable mapping and scheduler
+alive together.
+
+The joined GB10 smoke now traverses index prep, score, top-k, expansion, K/V
+pack, and XQA from CUDA-registered coherent memory with no CPU-to-GPU copy.
+Q/state/RoPE, valid scores, selected block/token sets, packed K/V for the
+execution's selected order, and valid length all match their oracles exactly.
+Radix selection intentionally does not promise stable ordering; the resulting
+permutation changes BF16 reduction order but the final attention output remains
+within 0.015625 max absolute error. This validates the complete borrowed QSA
+arithmetic chain and Rust scheduling boundary; it does not yet claim a complete
+Qwen layer, whole-model token, or standalone server continuation.
 Rust now enforces that boundary with an allocation-free six-stage token
 scheduler: index-prep, score, block-top-k, selection-expand, K/V-pack, then XQA.
 No caller can jump from top-k directly to pack. One reusable CUDA fence
