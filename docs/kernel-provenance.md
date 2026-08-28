@@ -24,6 +24,7 @@ is tested first in the upstream layout.
 | Flash-Next Spark image inspected for kernel reuse | SGLang source `d91c3682b0b429e4c70df63cd57f819588ce29b0`; FlashInfer `0.6.17` source pin `906181e3f4cf4bcc81835fb480db4011bbd80b62` | Exact selected CUTLASS MoE path plus Apache-2.0 routing/finalize donor |
 | SGLang Qwen3.8 Flash-Next support | PR `sgl-project/sglang#36497`, current head and PLE pin `7c66045d71f067c1c5da2b85baad3c47d9a19cb7` | Qwen4-exp graph, PLE, QSA, GDN, mHC, MTP, and memory-state oracle |
 | DwarfStar / `ds4.c` | `c1d4597a80e300b803dc642519718f2c999589da` | Minimal-runtime design and GGUF validation oracle |
+| ds4 GLM-5.3 source engine | `a60a2a0d25137a849a101e04e86ea830a346073a` | First-release GLM tokenizer, graph, CUDA/MMQ implementation, and executable parity oracle |
 | llama.cpp kernels vendored by `ds4.c` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a` | Q8/Q2/IQ MMQ implementation donor |
 | llama.cpp GLM5Next support | Draft PR `ggml-org/llama.cpp#27754`; branch `unslothai/llama.cpp:glm5next/upstream`; revision deliberately `UNFROZEN` | Temporary GLM-5.3-Flash semantic oracle only; current CUDA and quantized verification is incomplete |
 
@@ -119,6 +120,15 @@ prefill changes FP32 reduction order relative to dequantize-plus-cuBLAS, causing
 ULP-scale logit drift. It validates continuation and top-logprob fixtures while
 retaining a switch back to the legacy dispatch.
 
+For GLM-5.3 specifically, the later `a60a2a0...` branch is adopted more
+directly. Its selected MIT source set is hash-checked and statically linked
+behind `ds4_glm53_api.h`; its allocator/graph remain inside the native engine,
+while Rust owns engine/session lifetimes, request admission, serialization,
+OpenAI/SSE, and cancellation. This deliberately replaces the unfinished
+operator-by-operator GLM critical path. It is still a standalone SparkServe
+binary: no ds4 executable, shared library, Python module, or framework process
+is loaded at serving time.
+
 ## Adoption matrix
 
 | SparkServe operation | Semantic oracle | Initial implementation candidate | Reuse mode | Required gate |
@@ -129,16 +139,18 @@ retaining a switch back to the legacy dispatch.
 | Flash-Next shared expert | SGLang BF16 activation at `d91c368` | cuBLAS merged gate/up and down plus adapted SGLang vector SiLU | framework-free raw CUDA; loader builds one final merged resident weight region | passed: isolated gated branch is exact at 30.69 us for eight tokens; production ungated branch is exact in the joined chain |
 | Flash-Next routed/shared join | SGLang `_fused_gate_sigmoid_mul_add_kernel` at `d91c368` | raw CUDA preserves the 4096-wide FP32 reduction, sigmoid, shared multiply, routed add, and BF16 store | one allocation-free ABI; Rust overlaps branches and gates publication by CUDA events | passed: 2,560/2,560 final BF16 values exact; complete sequential hot-cache MoE is 306.668 us |
 | GDN projection and recurrence | SGLang Qwen4-exp causal-conv/FLA norm at `d91c368` + FlashInfer CuTe GDN at `906181e` | cuBLAS projections, raw donor-exact causal convolution/norm, and offline-exported SM121 BF16-state recurrence | five allocation-free ABIs; Rust owns paired-state snapshots, stage leases, rollback, stream, and publication | passed: every real layer-0 projection, intermediate, 60 KiB convolution state, 1.5 MiB temporal state, output, and mHC boundary is byte-exact; recurrence 6.197 us, complete attention half-layer 693.755 us |
+| Complete Qwen layer scheduling | the validated GDN/QSA and mHC/MoE rows in this table | pass the attention output device pointer directly into MLP and ping-pong two 20 KiB coherent slabs | Rust owns the three-GDN/one-QSA pattern, cross-child publication, retry, quarantine, and fixed addresses | 156 Rust tests pass; the native full-layer device-handoff fixture is prepared for GB10 validation |
 | QSA indexer and sparse attention | SGLang QSA backend at `7c66045`/`d91c368`, TileLang `cd37ed5`, FlashInfer `906181e` | SGLang fused Q/K prep, TileLang-generated score MQA, radix top-k, block-to-token expansion, selected-K/V pack, and FlashInfer XQA BF16 paged decode | all six donors share one framework-free library; Rust owns coherent ranges, streams/events, fixed page tables/workspace, and graph scheduling | isolated fixtures pass exact parity; the joined coherent chain has exact selection/packing semantics and 0.015625 max BF16 attention error under legal top-k permutation; full Qwen-layer continuation next |
 | Hyperconnection mix/combine | SGLang grouped Gemma RMSNorm, `hc_combine.cuh`, and persistent mix at `d91c368` | raw RMSNorm/combine, cuBLAS low-rank projections, deterministic BF16 mix epilogue | pinned raw ABI; persistent atomic mix is performance-only oracle | passed: real layer-0 deterministic mix/combine byte-exact; persistent mix max BF16 error 0.015625; 41.217/8.213 us; composed mHC -> exact top-10 MoE -> combine half-layer exact at 418.123 us |
 | PLE lookup | SGLang Qwen4-exp at `7c66045` + checkpoint | raw CUDA adapter matching the SGLang FP8-E4M3 load, BF16 conversion, and BF16 scaling; Rust supplies NVMe row residency | linked framework-free adapter plus original one-copy storage policy | passed: 16 real boundary rows, 2,560/2,560 scaled BF16 values bit-exact; 2.06 us mean on SM121 |
 | RMSNorm/RoPE/top-k/sampling | SGLang, FlashInfer, ds4 | smallest fastest proven candidate | benchmark and adopt independently | exact discrete ids; numerical parity for continuous outputs |
 | MTP/speculative commit | SGLang Qwen4-exp | local scheduler using shared forward kernels | reimplement state machine | target-only greedy identity; verifier logit and committed-state parity |
-| GGUF Q8/IQ3/Q3 | llama.cpp and ds4 | selected `ggml-cuda` MMQ files | ds4-style pinned vendor + raw C shim | per-format dense/MoE parity, llama continuation fixtures, performance within target |
-| GLM KDA recurrence | pinned GLM5Next oracle | fixed-shape CUDA port behind the common recurrent-state ABI | reimplement from frozen equations and fixtures | multi-token state parity at every KDA layer |
-| GLM DSA/MLA and sparse indexer | pinned GLM5Next oracle | smallest proven CUDA primitives plus local orchestration | vendor or wrap only after quantized CUDA verification | exact pooled top-k indices; FP32 reference logits; no accidental RoPE |
+| GGUF mixed quant | llama.cpp and ds4 | strict native v3 index plus selected `ggml-cuda` MMVQ files | index/Q8 CPU reference plus a pinned, allocation-free mixed-quant dense/routed C ABI; Rust supplies fixed Q8 scratch, per-layer type/stride, paging, and scheduling | all four real header prefixes index 1,412 tensors; 164 Rust tests pass; GB10 CUDA dense/MoE parity and continuations remain |
+| Complete GLM-5.3 Q2 path | ds4 `glm-5.3-flash` at `a60a2a0` | statically linked ds4 engine/session/tokenizer plus CUDA/MMQ source | source-hashed narrow C ABI; Rust owns lifetime, session lease, Chat Completions, Responses/SSE, and cancellation | SM121 upstream/static builds, locked model load/continuation, both OpenAI APIs, both SSE protocols, and 170 Rust tests pass; corrected 2K/128 SparkServe result is 363.54 prefill, 71.602 ms first decode, 14.41 total and 14.42 steady generation tok/s versus the pinned 825.76/71.721/18.05/18.20 row |
+| GLM KDA block | pinned llama.cpp `gated_delta_net.cu`, `ssm-conv.cu`, `norm.cu`, and `unary.cu` at `5c0e946`; pinned SGLang GLM5Next branch `9a26e74` | allocation-free width-4 Q/K/V convolution, L2/decay/beta preparation, KDA=true recurrence, and sigmoid-gated RMSNorm behind four raw ABIs | preserve donor arithmetic/state layout; `ssm_a` is already `-exp(A_log)` in GGUF; strip graphs, tensors, pools, and dispatch | exact 4 MiB recurrent plus 288 KiB convolution state per layer (152,633,344 bytes across 34 layers at batch one) is planned in Rust; a 197,376-byte aligned decode arena and transactional convolution/recurrence rollback prevent partial publication; CPU-reference CUDA fixture covers every leaf, while multi-token GB10 parity remains |
+| GLM DSA/MLA and sparse indexer | pinned SGLang GLM5Next branch `9a26e74`, SGLang DeepGEMM `fa3a5ca`, FlashInfer `906181e`, and all four locked GGUF headers | strict Rust tensor/metadata/direct-MMVQ plan; reuse the extracted SGLang radix-512/4x expansion, KPool compression/update, Hadamard-128, FP8 group-quant arithmetic, DeepGEMM paged-MQA score, and FlashInfer GLM_NSA sparse MLA | Rust owns the 656-byte NoPE-compatible MLA cache, 64-token pages, full 4-token key/score state ring, 2048+3 selection buffer, immutable GGUF slices, graph addresses, ring checkpoint/rollback, and cache-length publication; SM120 block-scale QK is expressed as ordinary GB10 FP8 MMA plus identical FP32 scales | all 12 real DSA layers validate; direct Q6_K/Q8_0 projections use an 83,968-byte arena and avoid 384 MiB of BF16 K/V copies; batch-one 32K charges 270,950,400 persistent plus a 2,572,032-byte decode/checkpoint arena; 164 Rust, 31 Python, C ABI, exact-SM121 compilation, and the standalone 4+1 sparse-MLA GB10 fixture pass with zero observed BF16 output error; full GGUF-model parity remains |
 | GLM mHC and routing | pinned GLM5Next oracle | local small kernels plus common MoE dispatcher | reimplement; share Qwen hyperconnection/top-k primitives where contracts match | exact 288-expert top-8 ids/order/weights and stream coefficients |
-| GLM IQ3 routed MoE | pinned llama.cpp GGUF oracle | `ggml-cuda` IQ3 MMQ `_id` path | pinned ds4-style vendor and raw C shim | selected-slice byte offsets, dequant parity, expert-cache hit/miss parity, continuation fixtures |
+| GLM mixed-quant routed MoE | pinned llama.cpp GGUF oracle | `ggml-cuda` raw MMVQ selected-expert path | pinned llama arithmetic and ds4 raw-switch patch behind caller-owned Q8 scratch and fixed-slot stride | real selected-slice offsets and 460.7-MB/16-slot plan pass; dense/routed GB10 parity, cache hit/miss parity, continuation fixtures remain |
 
 ### GLM oracle invariants
 
@@ -146,7 +158,8 @@ The draft GLM5Next implementation is useful precisely because it exposes model
 details that generic operator names hide. Before it can become a frozen oracle,
 fixtures must preserve all of the following:
 
-- 45 trunk layers plus the MTP block, with the exact KDA/DSA layer pattern;
+- 45 trunk layers plus the MTP block: KDA on 34 blocks and DSA/MLA on
+  `[3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 45]`, with block 45 as MTP;
 - no RoPE anywhere in the text tower;
 - DSA as MLA and the indexer run with the reference precision policy;
 - pooled top-k selection semantics rather than an ordinary flat top-k;
@@ -202,21 +215,23 @@ kernels—without importing either framework's scheduler, allocator, or graph.
 
 ## Immediate implementation order
 
-1. Compose the byte-exact mHC-wrapped GDN attention and MLP half-layers into a
-   complete real Qwen layer; connect the completed six-stage QSA path for its
-   alternating layers, then capture logits and greedy continuations.
+1. Validate the prepared device-pointer composition of the byte-exact
+   mHC-wrapped GDN attention and MLP half-layers; connect the completed
+   six-stage QSA path for every fourth layer, then capture logits and greedy
+   continuations.
 2. Double-buffer the completed PLE gather and fixed-slab reader, then connect its
    fixed descriptors to the token graph; keep routing/top-k separately tested.
 3. Connect the completed six-stage borrowed QSA chain to Qwen layer state and
    the same Rust token transaction used by the completed GDN half-layer.
    Preserve radix top-k's set contract instead of adding a canonical sort to
    the hot path.
-4. Implement the standalone GGUF metadata/tensor index and a CPU Q8_0 reference.
-5. Freeze a GLM5Next oracle revision only after CUDA and quantized output checks.
-6. Lift the smallest ds4/llama-MMQ subset needed for IQ3_XXS, including routed
-   expert ids, while preserving its upstream pin and parity-test structure.
-7. Add the explicit NVMe expert cache and measure bytes/token before setting a
-   GLM decode-speed target. Add Q3_K only after the IQ3 path is stable.
+4. Hash the dedicated ds4 Q2 GGUF and reproduce one greedy continuation with the
+   pinned upstream executable and the statically linked SparkServe owner.
+5. Run the exact 2K/128-token GB10 benchmark and the SparkServe OpenAI/SSE smoke;
+   compare tokens, text, first-token latency, steady decode, and memory.
+6. Retain the four-shard IQ3 index/pager as a second profile. Promote it only
+   after the Q2 service passes and its expert-cache telemetry demonstrates a
+   bounded working set; do not rebuild the already-adopted GLM graph again.
 
 Do not begin with fusion. First reproduce the unfused SGLang graph and its
 intermediates; fuse only adjacent operations whose joint contract is already

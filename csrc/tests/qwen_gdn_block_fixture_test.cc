@@ -98,12 +98,21 @@ void Check(SparkServeStatus status) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  assert(argc == 2);
-  const std::filesystem::path fixture(argv[1]);
+int SparkServeRunQwenGdnBlockFixture(const char* fixture_path,
+                                     void** combined_output,
+                                     bool benchmark) {
+  assert(fixture_path != nullptr);
+  const std::filesystem::path fixture(fixture_path);
+  const size_t token_stride = kHc * kHidden * 2;
+  const size_t hyper_bytes =
+      std::filesystem::file_size(fixture / "mhc_hyper_input_bf16.bin");
+  assert(hyper_bytes % token_stride == 0);
+  const uint32_t tokens = static_cast<uint32_t>(hyper_bytes / token_stride);
+  assert(tokens == 1 || tokens == 2 || tokens == 4 || tokens == 8 ||
+         tokens == 16);
 
   const auto hyper_input =
-      Read(fixture / "mhc_hyper_input_bf16.bin", kHc * kHidden * 2);
+      Read(fixture / "mhc_hyper_input_bf16.bin", tokens * kHc * kHidden * 2);
   const auto mhc_norm_weight =
       Read(fixture / "mhc_norm_weight_bf16.bin", kHc * kHidden * 2);
   const auto mhc_down_weight = Read(fixture / "mhc_down_weight_bf16.bin",
@@ -113,17 +122,17 @@ int main(int argc, char** argv) {
   const auto mhc_inject_weight = Read(fixture / "mhc_inject_weight_bf16.bin",
                                       kHc * kHc * kHidden * 2);
   const auto mhc_normed_expected =
-      Read(fixture / "mhc_normed_bf16.bin", kHc * kHidden * 2);
+      Read(fixture / "mhc_normed_bf16.bin", tokens * kHc * kHidden * 2);
   const auto mhc_down_expected =
-      Read(fixture / "mhc_down_bf16.bin", kLowrank * 2);
+      Read(fixture / "mhc_down_bf16.bin", tokens * kLowrank * 2);
   const auto mhc_activated_expected =
-      Read(fixture / "mhc_activated_bf16.bin", kLowrank * 2);
+      Read(fixture / "mhc_activated_bf16.bin", tokens * kLowrank * 2);
   const auto mhc_up_expected =
-      Read(fixture / "mhc_up_bf16.bin", kHc * kHidden * 2);
+      Read(fixture / "mhc_up_bf16.bin", tokens * kHc * kHidden * 2);
   const auto mixed_expected =
-      Read(fixture / "mixed_hidden_bf16.bin", kHidden * 2);
+      Read(fixture / "mixed_hidden_bf16.bin", tokens * kHidden * 2);
   const auto combined_expected =
-      Read(fixture / "mhc_combined_bf16.bin", kHc * kHidden * 2);
+      Read(fixture / "mhc_combined_bf16.bin", tokens * kHc * kHidden * 2);
 
   const auto qkv_weight = Read(fixture / "in_proj_qkv_weight_bf16.bin",
                                kConvWidth * kHidden * 2);
@@ -144,30 +153,30 @@ int main(int argc, char** argv) {
   const auto indices = Read(fixture / "state_indices_i32.bin", sizeof(int32_t));
 
   const auto qkv_expected =
-      Read(fixture / "projected_qkv_bf16.bin", kConvWidth * 2);
+      Read(fixture / "projected_qkv_bf16.bin", tokens * kConvWidth * 2);
   const auto z_expected =
-      Read(fixture / "projected_z_bf16.bin", kValueWidth * 2);
+      Read(fixture / "projected_z_bf16.bin", tokens * kValueWidth * 2);
   const auto b_expected =
-      Read(fixture / "projected_b_bf16.bin", kValueHeads * 2);
+      Read(fixture / "projected_b_bf16.bin", tokens * kValueHeads * 2);
   const auto a_expected =
-      Read(fixture / "projected_a_bf16.bin", kValueHeads * 2);
+      Read(fixture / "projected_a_bf16.bin", tokens * kValueHeads * 2);
   const auto conv_before = Read(fixture / "conv_state_before_bf16.bin",
                                 kConvWidth * kConvStateWidth * 2);
   const auto conv_after = Read(fixture / "conv_state_after_bf16.bin",
                                kConvWidth * kConvStateWidth * 2);
   const auto convolved_expected =
-      Read(fixture / "convolved_qkv_bf16.bin", kConvWidth * 2);
+      Read(fixture / "convolved_qkv_bf16.bin", tokens * kConvWidth * 2);
   const auto temporal_before = Read(
       fixture / "temporal_state_before_bf16.bin",
       kValueHeads * kHeadDim * kHeadDim * 2);
   const auto temporal_after = Read(
       fixture / "temporal_state_after_bf16.bin", temporal_before.size());
   const auto core_expected =
-      Read(fixture / "gdn_core_output_bf16.bin", kValueWidth * 2);
+      Read(fixture / "gdn_core_output_bf16.bin", tokens * kValueWidth * 2);
   const auto gated_expected =
-      Read(fixture / "gated_norm_bf16.bin", kValueWidth * 2);
+      Read(fixture / "gated_norm_bf16.bin", tokens * kValueWidth * 2);
   const auto attention_expected =
-      Read(fixture / "attention_output_bf16.bin", kHidden * 2);
+      Read(fixture / "attention_output_bf16.bin", tokens * kHidden * 2);
 
   void* hyper_input_d = Upload(hyper_input);
   void* mhc_norm_weight_d = Upload(mhc_norm_weight);
@@ -213,7 +222,7 @@ int main(int argc, char** argv) {
   mhc.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
   mhc.plan = {sizeof(SparkServeMhcPlan),
               SPARKSERVE_KERNEL_ABI_VERSION,
-              1,
+              tokens,
               kHc,
               kHidden,
               kLowrank,
@@ -242,7 +251,7 @@ int main(int argc, char** argv) {
   block.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
   block.plan = {sizeof(SparkServeGdnBlockPlan),
                 SPARKSERVE_KERNEL_ABI_VERSION,
-                1,
+                tokens,
                 kHidden,
                 kQkHeads,
                 kValueHeads,
@@ -287,8 +296,8 @@ int main(int argc, char** argv) {
                      SPARKSERVE_GDN_BACKEND_FLASHINFER};
   auto* convolved_bytes = static_cast<uint8_t*>(convolved_d);
   recurrence.q = convolved_bytes;
-  recurrence.k = convolved_bytes + kQkWidth * 2;
-  recurrence.v = convolved_bytes + 2 * kQkWidth * 2;
+  recurrence.k = convolved_bytes + tokens * kQkWidth * 2;
+  recurrence.v = convolved_bytes + 2 * tokens * kQkWidth * 2;
   recurrence.a = a_d;
   recurrence.b = b_d;
   recurrence.a_log = static_cast<const float*>(a_log_d);
@@ -297,6 +306,7 @@ int main(int argc, char** argv) {
   recurrence.state_indices = static_cast<const int32_t*>(indices_d);
   recurrence.output = core_d;
   recurrence.scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+  recurrence.sequence_length = tokens;
 
   Check(sparkserve_mhc_mix_launch(&caps, &mhc));
   Check(sparkserve_gdn_block_prepare_launch(&caps, &block));
@@ -323,33 +333,36 @@ int main(int argc, char** argv) {
   ExpectBytes(attention_d, attention_expected, "GDN output projection");
   ExpectBytes(combined_d, combined_expected, "attention mHC combine");
 
-  constexpr int kIterations = 20;
-  float total_ms = 0.0F;
-  cudaEvent_t start = nullptr;
-  cudaEvent_t stop = nullptr;
-  CudaOk(cudaEventCreate(&start));
-  CudaOk(cudaEventCreate(&stop));
-  for (int iteration = 0; iteration < kIterations; ++iteration) {
-    CudaOk(cudaMemcpyAsync(conv_state_d, conv_seed_d, conv_before.size(),
-                           cudaMemcpyDeviceToDevice));
-    CudaOk(cudaMemcpyAsync(temporal_state_d, temporal_seed_d,
-                           temporal_before.size(), cudaMemcpyDeviceToDevice));
-    CudaOk(cudaEventRecord(start));
-    Check(sparkserve_mhc_mix_launch(&caps, &mhc));
-    Check(sparkserve_gdn_block_prepare_launch(&caps, &block));
-    Check(sparkserve_gdn_decode_launch(&caps, &recurrence));
-    Check(sparkserve_gdn_block_finish_launch(&caps, &block));
-    Check(sparkserve_mhc_combine_launch(&caps, &mhc));
-    CudaOk(cudaEventRecord(stop));
-    CudaOk(cudaEventSynchronize(stop));
-    float elapsed_ms = 0.0F;
-    CudaOk(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    total_ms += elapsed_ms;
+  if (benchmark) {
+    constexpr int kIterations = 20;
+    float total_ms = 0.0F;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    CudaOk(cudaEventCreate(&start));
+    CudaOk(cudaEventCreate(&stop));
+    for (int iteration = 0; iteration < kIterations; ++iteration) {
+      CudaOk(cudaMemcpyAsync(conv_state_d, conv_seed_d, conv_before.size(),
+                             cudaMemcpyDeviceToDevice));
+      CudaOk(cudaMemcpyAsync(temporal_state_d, temporal_seed_d,
+                             temporal_before.size(), cudaMemcpyDeviceToDevice));
+      CudaOk(cudaEventRecord(start));
+      Check(sparkserve_mhc_mix_launch(&caps, &mhc));
+      Check(sparkserve_gdn_block_prepare_launch(&caps, &block));
+      Check(sparkserve_gdn_decode_launch(&caps, &recurrence));
+      Check(sparkserve_gdn_block_finish_launch(&caps, &block));
+      Check(sparkserve_mhc_combine_launch(&caps, &mhc));
+      CudaOk(cudaEventRecord(stop));
+      CudaOk(cudaEventSynchronize(stop));
+      float elapsed_ms = 0.0F;
+      CudaOk(cudaEventElapsedTime(&elapsed_ms, start, stop));
+      total_ms += elapsed_ms;
+    }
+    std::cout << "full Qwen GDN attention half-layer: "
+              << total_ms * 1000.0F / kIterations / tokens << " us/token"
+              << " (T=" << tokens << ")\n";
+    CudaOk(cudaEventDestroy(stop));
+    CudaOk(cudaEventDestroy(start));
   }
-  std::cout << "full Qwen GDN attention half-layer: "
-            << total_ms * 1000.0F / kIterations << " us/token\n";
-  CudaOk(cudaEventDestroy(stop));
-  CudaOk(cudaEventDestroy(start));
 
   CublasOk(cublasDestroy(blas));
   for (void* pointer :
@@ -357,10 +370,22 @@ int main(int argc, char** argv) {
         convolved_d, conv_seed_d, conv_state_d, a_d, b_d, z_d, qkv_d,
         indices_d, dt_bias_d, a_log_d, out_weight_d, norm_weight_d,
         conv_weight_d, a_weight_d, b_weight_d, z_weight_d, qkv_weight_d,
-        combined_d, mixed_d, mhc_up_d, mhc_activated_d, mhc_down_d,
+        mixed_d, mhc_up_d, mhc_activated_d, mhc_down_d,
         mhc_normed_d, mhc_inject_weight_d, mhc_up_weight_d,
         mhc_down_weight_d, mhc_norm_weight_d, hyper_input_d}) {
     CudaOk(cudaFree(pointer));
   }
+  if (combined_output == nullptr) {
+    CudaOk(cudaFree(combined_d));
+  } else {
+    *combined_output = combined_d;
+  }
   return 0;
 }
+
+#ifndef SPARKSERVE_FIXTURE_LIBRARY
+int main(int argc, char** argv) {
+  assert(argc == 2);
+  return SparkServeRunQwenGdnBlockFixture(argv[1], nullptr, true);
+}
+#endif

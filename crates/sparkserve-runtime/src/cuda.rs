@@ -15,7 +15,8 @@ use crate::ffi::{
     sparkserve_cuda_event_destroy, sparkserve_cuda_event_query, sparkserve_cuda_event_record,
     sparkserve_cuda_event_synchronize, sparkserve_cuda_stream_create,
     sparkserve_cuda_stream_destroy, sparkserve_cuda_stream_memset_async,
-    sparkserve_cuda_stream_raw, sparkserve_cuda_stream_synchronize,
+    sparkserve_cuda_stream_memcpy_async, sparkserve_cuda_stream_raw,
+    sparkserve_cuda_stream_synchronize,
     sparkserve_cuda_stream_wait_event,
 };
 
@@ -188,6 +189,44 @@ impl CudaStreamOwner {
                 self.handle().as_ptr(),
                 pointer,
                 u32::from(value),
+                bytes,
+            )
+        })
+    }
+
+    /// Copy bytes between two CUDA-visible ranges on this stream. This is used
+    /// to promote selected mmap-backed expert tensors into the fixed hot cache.
+    ///
+    /// # Safety
+    ///
+    /// Both ranges must remain live through stream completion, the destination
+    /// must be writable, and the ranges must not overlap.
+    pub unsafe fn memcpy_async(
+        &mut self,
+        destination_device_address: u64,
+        source_device_address: u64,
+        bytes: usize,
+    ) -> Result<(), CudaRuntimeError> {
+        let bytes = u64::try_from(bytes).map_err(|_| CudaRuntimeError {
+            code: -1,
+            message: "CUDA memcpy size does not fit in u64".to_owned(),
+        })?;
+        let destination = usize::try_from(destination_device_address).map_err(|_| {
+            CudaRuntimeError {
+                code: -1,
+                message: "CUDA destination address does not fit in usize".to_owned(),
+            }
+        })?;
+        let source =
+            usize::try_from(source_device_address).map_err(|_| CudaRuntimeError {
+                code: -1,
+                message: "CUDA source address does not fit in usize".to_owned(),
+            })?;
+        status_result(unsafe {
+            sparkserve_cuda_stream_memcpy_async(
+                self.handle().as_ptr(),
+                destination as *mut c_void,
+                source as *const c_void,
                 bytes,
             )
         })

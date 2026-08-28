@@ -26,10 +26,19 @@ pub const QWEN38_FLASH_NEXT_NVFP4: ModelProfile = ModelProfile {
     sparse_store_bytes: 51_200_245_760,
 };
 
+// Exact tensor-payload split from the locked four-shard GGUF headers. Routed
+// gate/up/down tensors stay on NVMe; all other encoded tensors are resident.
+pub const GLM53_FLASH_UD_IQ3_XXS: ModelProfile = ModelProfile {
+    key: "glm53-flash-ud-iq3-xxs",
+    resident_weight_bytes: 7_866_817_912,
+    sparse_store_bytes: 112_491_233_280,
+};
+
 pub fn profile(key: &str) -> Option<ModelProfile> {
     match key {
         "qwen38-27b-nvfp4" => Some(QWEN38_27B_NVFP4),
         "qwen38-flash-next-nvfp4" => Some(QWEN38_FLASH_NEXT_NVFP4),
+        "glm53-flash-ud-iq3-xxs" => Some(GLM53_FLASH_UD_IQ3_XXS),
         _ => None,
     }
 }
@@ -86,5 +95,18 @@ mod tests {
         let plan = plan_memory(QWEN38_FLASH_NEXT_NVFP4, 121.0, ple_gib, 8.0, 12.0, 8.0)
             .expect("valid plan");
         assert!(!plan.fits);
+    }
+
+    #[test]
+    fn paged_glm_experts_fit_but_materializing_them_does_not() {
+        let paged = plan_memory(GLM53_FLASH_UD_IQ3_XXS, 121.0, 0.5, 8.0, 12.0, 8.0)
+            .expect("valid paged GLM plan");
+        assert!(paged.fits);
+        assert!(paged.required_gib > 35.0 && paged.required_gib < 36.0);
+
+        let full_sparse = GLM53_FLASH_UD_IQ3_XXS.sparse_store_bytes as f64 / GIB;
+        let materialized = plan_memory(GLM53_FLASH_UD_IQ3_XXS, 121.0, full_sparse, 8.0, 12.0, 8.0)
+            .expect("valid full-residency plan");
+        assert!(!materialized.fits);
     }
 }

@@ -43,30 +43,52 @@ Locked input: `qwen38-flash-next-nvfp4` at revision
   the same prompt; final target is within 20% of the repository's GB10 reference
   after graphs and tactic tuning.
 
-## GLM-5.3-Flash UD-IQ3_XXS
+## GLM-5.3-Flash Q2
 
-Locked input: `glm53-flash-iq3-xxs` at revision
-`d45e959d75bf3e0e809e2c7e461f111a8efa1f83` (four shards,
-120,367,571,715 bytes).
+Locked input: `antirez/glm-5.3-flash-gguf` at revision
+`d0d6394cad1046c6d8ad87fa9b0939b4760cb94f`, file
+`GLM-5.3-Flash-Q2.gguf`, 96,505,816,384 bytes, LFS SHA-256
+`e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32`.
 
-- The strict GGUF reader validates split metadata, tensor names, dimensions,
-  offsets, alignment, quant types, and every locked LFS SHA-256.
-- Dense trunk/state/router tensors and a fixed expert-cache budget are resident;
-  other encoded expert blocks remain on NVMe. Whole-checkpoint residency is
-  rejected rather than attempted.
-- The graph implements the locked layer order: 45 trunk layers plus MTP, 34 KDA
-  and 11 DSA/MLA layers, no text RoPE, pooled sparse top-k, mHC, one shared plus
-  288 routed experts, and exact top-8 sigmoid/no-aux routing.
-- IQ3 dequant/MMQ and selected-expert dispatch use the pinned llama.cpp/ggml CUDA
-  donor subset. SparkServe owns GGUF indexing, cache admission, I/O scheduling,
-  recurrent/KV state, and request scheduling.
-- Peak unified-memory residency remains below 105 GiB, and expert-cache misses
-  never allocate outside the fixed slabs.
-- Correctness is promoted from tensor/operator fixtures to teacher-forced logits
-  and deterministic continuations before a speed claim is made. Performance is
-  always reported with expert-cache hit rate and NVMe bytes per generated token.
+- The engine source is ds4 revision
+  `a60a2a0d25137a849a101e04e86ea830a346073a`; every selected source/MMQ file
+  passes the checked-in SHA-256 manifest before compilation.
+- The source is statically linked through `ds4_glm53_api.h`. Serving never
+  starts a ds4 process or loads a ds4/SGLang/Python/Torch runtime library.
+- Rust owns engine/session lifetimes, one-session serialization, request
+  validation, Chat Completions, Responses API, SSE, usage accounting, and
+  cancellation. The pinned native source owns the GLM tokenizer and complete
+  CUDA model graph.
+- Greedy prompt token ids and continuation must match the pinned ds4 executable.
+  Non-streaming and SSE chat responses must match text, finish reason, usage,
+  and `[DONE]` framing. Responses SSE must terminate with a
+  `response.completed` or `response.failed` event and use monotonically
+  increasing sequence numbers.
+- The exact 2K `promessi_sposi.txt`/128-token benchmark is reported against the
+  upstream GB10 row: 825.76 prefill and 18.05 generation tok/s, including its
+  71.721 ms first generation token and 18.20 steady tok/s.
+- Peak committed unified memory must leave a measured OS safety reserve; no
+  second decoded/BF16 model copy is allowed.
+
+The four-shard Unsloth `UD-IQ3_XXS` artifact remains a later paging profile,
+not the first-release GLM gate. Its existing strict index, topology, and cache
+planner stay covered by tests, but it is not allowed to delay Q2 serving.
 
 ## Current position
+
+The pinned ds4 GLM-5.3 revision now builds both upstream `cuda-spark` binaries
+and SparkServe's 62 MiB static archive on GB10. The release Rust first-token and
+OpenAI server examples link successfully into 22 MiB ARM64 executables; `ldd`
+shows only system libraries, CUDA runtime, and cuBLAS. The shared OpenAI
+tokenizer abstraction retains the Qwen path, and all 170 Spark Rust tests pass.
+The locked 89.88 GiB model matches its byte count and SHA-256. Native first-token,
+Chat Completions, Responses, chat SSE, and Responses SSE all execute on GB10.
+The corrected SparkServe 2K/128 run measured 363.54 prefill tok/s, 71.602 ms
+first decode, 14.41 total generation tok/s, and 14.42 steady generation tok/s.
+The upstream row remains 825.76/71.721 ms/18.05/18.20, so functional acceptance
+passes while the prefill performance target remains open. The tested host needed
+32 GiB of temporary NVMe swap plus `vm.overcommit_memory=1`; with no swap and
+the default overcommit mode, NVRM rejected the 94--97 GiB allocation.
 
 Artifact locks, strict Qwen checkpoint scanning, exact-FP8 PLE indexing, the
 native GDN correctness kernel, and the borrowed NVFP4 expert chain now exist.
@@ -117,9 +139,49 @@ chain from coherent memory. Q/state/RoPE, score values, selected sets, K/V packe
 for the execution's selection order, and valid length are exact. Radix top-k is
 set-stable rather than order-stable; the resulting attention reduction remains
 within 0.015625 maximum BF16 absolute error. This document remains a completion
-checklist: PLE storage-thread/CUDA-event overlap, the complete Qwen layer and
-full-token graph, tokenizer/server, GGUF, GLM
-graph, and end-to-end continuation gates are not implied to be finished by this
-graph fragment. The next Qwen arithmetic boundary is the remaining surrounding
-norm/projection glue needed to turn these exact MoE and mHC pieces into one
-complete layer.
+checklist: PLE storage-thread/CUDA-event overlap, the Qwen full-token graph,
+GLM graph, and end-to-end continuation gates are not implied to be finished by
+this graph fragment. The native tokenizer/OpenAI streaming boundary and the
+two-slab complete-layer scheduler exist, but their joined GB10 continuation
+gate remains.
+
+The GLM storage path now has a strict native GGUF v3 split index and scalar Q8_0
+correctness reference. Locked prefixes from all four real shards validate 1,412
+tensors and 120,358,051,192 payload bytes against the declared full-file sizes.
+The dynamic quant mix is measured rather than inferred from the model label:
+experts use Q2_K/IQ2_S/IQ3_S for gate/up and Q3_K/IQ3_S/IQ4_XS for down. A
+16-slot fixed-stride cache plans 460,697,600 committed bytes and at most
+11,665,408 useful source bytes per cold expert. The exact split is
+7,866,817,912 resident bytes plus 112,491,233,280 NVMe expert bytes. Pinned
+llama.cpp/ds4 arithmetic
+is source-hashed behind an allocation-free mixed-quant dense/routed ABI. This
+does not imply that GB10 CUDA parity or the complete GLM graph has passed yet.
+The KDA block now has framework-free width-4 Q/K/V convolution, L2/decay/beta
+preparation, fused recurrence, and sigmoid-gated RMSNorm ABIs. The locked real
+`blk.0.ssm_a` range confirms its values are already `-exp(A_log)`, and Rust
+charges 152,633,344 bytes for all 34 batch-one convolution plus recurrent state
+slabs. The CPU-reference CUDA fixture covers every leaf and both in-place state
+paths; execution on GB10 is the next gate.
+All 12 DSA/indexer tensor families also pass the strict four-header contract:
+64 attention heads, 1536/512 Q/KV LoRA, 256-wide NoPE QK/V, 32x128 index heads,
+top-k 2048, KPool 4, and `glm5next.rope.dimension_count=0`. The batch-one 32K
+fixed plan charges 270,950,400 persistent cache/state bytes and 2,569,116
+decode-workspace bytes. The MLA portion is 257,949,696 bytes: 656 bytes/token
+for 512 FP8 values, four arbitrary FP32 scales, and an exact-zero 64-BF16
+compatibility tail for the borrowed fixed-shape kernel. Its state
+charge includes the full four-slot BF16 key/score ring; only sparse-selection
+output has a three-token unpooled tail. The transactional scheduler adds a
+reusable 2,048-byte ring checkpoint plus alignment, making its physical decode
+arena 2,572,032 bytes. The native decode adapter wraps the ring and publishes a
+new FP8 pooled entry only on every fourth token. A strict direct-GGUF projection
+plan covers all nine quantized DSA operations per layer, including eight
+8-head MMVQ calls for each split Q8_0 MLA K/V matrix. Its 83,968-byte global
+scratch avoids 384 MiB of derived BF16 weights. The framework-free index-query
+adapter now preserves the SGLang Hadamard, BF16, FP8 E4M3/power-of-two scale,
+head-gate, and key-LayerNorm boundaries and compiles for SM121. The standalone
+FlashInfer GLM_NSA adapter directly instantiates top-k 2048 and 128 kernels,
+replaces the unavailable SM120 block-scale QK instruction with ordinary GB10
+FP8 MMA plus the same FP32 scales, and LSE-merges history with the 0--3 token
+tail. A real GB10 device fixture passes the 4+1 segmentation, 656-byte cache
+packing, zero no-RoPE lanes, and all 64x512 outputs with zero observed BF16
+error. Full-model GGUF oracle parity remains open.

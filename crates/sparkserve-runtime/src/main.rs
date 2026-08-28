@@ -1,10 +1,18 @@
 use sparkserve_runtime::checkpoint::{CheckpointPlan, load_flash_next_plan};
+use sparkserve_runtime::gguf::{GgmlTensorType, GgufSet};
+use sparkserve_runtime::gguf_paging::GgufExpertCatalog;
+use sparkserve_runtime::glm_dsa::GlmDsaSpec;
+use sparkserve_runtime::glm_dsa_quant::{GlmDsaQuantModelPlan, GlmDsaQuantRole};
+use sparkserve_runtime::glm_model::Glm53ModelSpec;
+use sparkserve_runtime::glm_topology::GlmTopology;
+use sparkserve_runtime::glm_weights::GlmResidentPlan;
 use sparkserve_runtime::kernel::{DenseNvfp4Spec, DeviceCaps, select_dense_nvfp4_candidate};
 use sparkserve_runtime::model::{plan_memory, profile};
 use sparkserve_runtime::model_lock::{LockedModel, load_model_lock};
 #[cfg(target_os = "linux")]
 use sparkserve_runtime::storage::FixedPleCache;
 use sparkserve_runtime::storage::{ClockPageCache, FilePageSource, PleIndex};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -15,6 +23,22 @@ fn usage() -> ! {
     eprintln!("  sparkserve-runtime model-lock <lock-file> [model-id]");
     eprintln!("  sparkserve-runtime kernel-plan nvfp4-dense <M> <N> <K> [SM]");
     eprintln!("  sparkserve-runtime ple-inspect <index>");
+    eprintln!("  sparkserve-runtime gguf-index <shard> [shard ...]");
+    eprintln!(
+        "  sparkserve-runtime gguf-header-index <prefix> <declared-bytes> [prefix declared-bytes ...]"
+    );
+    eprintln!(
+        "  sparkserve-runtime gguf-header-tensor <name> <prefix> <declared-bytes> [prefix declared-bytes ...]"
+    );
+    eprintln!(
+        "  sparkserve-runtime gguf-header-metadata <key> <prefix> <declared-bytes> [prefix declared-bytes ...]"
+    );
+    eprintln!(
+        "  sparkserve-runtime gguf-header-schema <prefix> <declared-bytes> [prefix declared-bytes ...]"
+    );
+    eprintln!(
+        "  sparkserve-runtime gguf-header-metadata-prefix <key-prefix> <prefix> <declared-bytes> [prefix declared-bytes ...]"
+    );
     eprintln!(
         "  sparkserve-runtime ple-bench <index> <model-root> [tokens] [cache-mib] [chunk-tokens] [workers]"
     );
@@ -33,10 +57,435 @@ fn main() {
         Some("model-lock") => run_model_lock(args),
         Some("kernel-plan") => run_kernel_plan(args),
         Some("ple-inspect") => run_ple_inspect(args),
+        Some("gguf-index") => run_gguf_index(args),
+        Some("gguf-header-index") => run_gguf_header_index(args),
+        Some("gguf-header-tensor") => run_gguf_header_tensor(args),
+        Some("gguf-header-metadata") => run_gguf_header_metadata(args),
+        Some("gguf-header-schema") => run_gguf_header_schema(args),
+        Some("gguf-header-metadata-prefix") => run_gguf_header_metadata_prefix(args),
         Some("ple-bench") => run_ple_bench(args),
         #[cfg(target_os = "linux")]
         Some("ple-fixed-bench") => run_ple_fixed_bench(args),
         _ => usage(),
+    }
+}
+
+fn run_gguf_index(args: impl Iterator<Item = String>) {
+    let paths = args.map(std::path::PathBuf::from).collect::<Vec<_>>();
+    if paths.is_empty() {
+        usage();
+    }
+    let index = GgufSet::open(&paths).unwrap_or_else(|error| {
+        eprintln!("invalid GGUF set: {error}");
+        std::process::exit(1);
+    });
+    print_gguf_index(&index, false);
+}
+
+fn run_gguf_header_index(mut args: impl Iterator<Item = String>) {
+    let mut headers = Vec::new();
+    while let Some(path) = args.next() {
+        let declared_bytes = args
+            .next()
+            .unwrap_or_else(|| usage())
+            .parse::<u64>()
+            .unwrap_or_else(|_| usage());
+        headers.push((std::path::PathBuf::from(path), declared_bytes));
+    }
+    if headers.is_empty() {
+        usage();
+    }
+    let index = GgufSet::open_headers(&headers).unwrap_or_else(|error| {
+        eprintln!("invalid GGUF header set: {error}");
+        std::process::exit(1);
+    });
+    print_gguf_index(&index, true);
+}
+
+fn run_gguf_header_tensor(mut args: impl Iterator<Item = String>) {
+    let name = args.next().unwrap_or_else(|| usage());
+    let mut headers = Vec::new();
+    while let Some(path) = args.next() {
+        let declared_bytes = args
+            .next()
+            .unwrap_or_else(|| usage())
+            .parse::<u64>()
+            .unwrap_or_else(|_| usage());
+        headers.push((std::path::PathBuf::from(path), declared_bytes));
+    }
+    if headers.is_empty() {
+        usage();
+    }
+    let index = GgufSet::open_headers(&headers).unwrap_or_else(|error| {
+        eprintln!("invalid GGUF header set: {error}");
+        std::process::exit(1);
+    });
+    let tensor = index.tensors.get(&name).unwrap_or_else(|| {
+        eprintln!("GGUF tensor not found: {name}");
+        std::process::exit(1);
+    });
+    println!("strict GGUF tensor location");
+    println!("  name              {name}");
+    println!("  shard             {}", tensor.shard);
+    println!(
+        "  path              {}",
+        index.shards[tensor.shard].path.display()
+    );
+    println!("  absolute offset   {}", tensor.absolute_offset);
+    println!("  data bytes        {}", tensor.data_bytes);
+    println!("  dimensions        {:?}", tensor.dimensions);
+    println!("  type              {:?}", tensor.tensor_type);
+}
+
+fn run_gguf_header_metadata(mut args: impl Iterator<Item = String>) {
+    let key = args.next().unwrap_or_else(|| usage());
+    let mut headers = Vec::new();
+    while let Some(path) = args.next() {
+        let declared_bytes = args
+            .next()
+            .unwrap_or_else(|| usage())
+            .parse::<u64>()
+            .unwrap_or_else(|_| usage());
+        headers.push((std::path::PathBuf::from(path), declared_bytes));
+    }
+    if headers.is_empty() {
+        usage();
+    }
+    let index = GgufSet::open_headers(&headers).unwrap_or_else(|error| {
+        eprintln!("invalid GGUF header set: {error}");
+        std::process::exit(1);
+    });
+    let entry = index.shards[0].metadata.get(&key).unwrap_or_else(|| {
+        eprintln!("GGUF metadata key not found: {key}");
+        std::process::exit(1);
+    });
+    println!("strict GGUF metadata");
+    println!("  key               {key}");
+    println!("  type              {:?}", entry.value_type);
+    println!("  value             {:?}", entry.value);
+    if let sparkserve_runtime::gguf::GgufMetadataValue::Array { element_type, .. } = &entry.value {
+        match element_type {
+            sparkserve_runtime::gguf::GgufValueType::Int32 => println!(
+                "  decoded           {:?}",
+                index.shards[0]
+                    .metadata_i32_array(&key)
+                    .unwrap_or_else(|error| {
+                        eprintln!("cannot decode GGUF metadata array {key}: {error}");
+                        std::process::exit(1);
+                    })
+            ),
+            sparkserve_runtime::gguf::GgufValueType::Float32 => println!(
+                "  decoded           {:?}",
+                index.shards[0]
+                    .metadata_f32_array(&key)
+                    .unwrap_or_else(|error| {
+                        eprintln!("cannot decode GGUF metadata array {key}: {error}");
+                        std::process::exit(1);
+                    })
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn run_gguf_header_schema(mut args: impl Iterator<Item = String>) {
+    let mut headers = Vec::new();
+    while let Some(path) = args.next() {
+        let declared_bytes = args
+            .next()
+            .unwrap_or_else(|| usage())
+            .parse::<u64>()
+            .unwrap_or_else(|_| usage());
+        headers.push((std::path::PathBuf::from(path), declared_bytes));
+    }
+    if headers.is_empty() {
+        usage();
+    }
+    let index = GgufSet::open_headers(&headers).unwrap_or_else(|error| {
+        eprintln!("invalid GGUF header set: {error}");
+        std::process::exit(1);
+    });
+
+    let mut schema = BTreeMap::<
+        (String, Vec<u64>, GgmlTensorType),
+        (usize, u64, BTreeSet<u16>),
+    >::new();
+    for (name, tensor) in &index.tensors {
+        let (role, layer) = canonical_gguf_tensor_role(name);
+        let entry = schema
+            .entry((role, tensor.dimensions.clone(), tensor.tensor_type))
+            .or_default();
+        entry.0 += 1;
+        entry.1 = entry
+            .1
+            .checked_add(tensor.data_bytes)
+            .expect("validated GGUF schema byte sum");
+        if let Some(layer) = layer {
+            entry.2.insert(layer);
+        }
+    }
+
+    println!("strict GGUF tensor schema");
+    println!("  architecture      {}", index.architecture);
+    println!("  roles             {}", schema.len());
+    for ((role, dimensions, tensor_type), (count, bytes, layers)) in schema {
+        if layers.is_empty() {
+            println!(
+                "  {role:<44} {dimensions:?} {tensor_type:?} x{count} {bytes} bytes"
+            );
+        } else {
+            println!(
+                "  {role:<44} {dimensions:?} {tensor_type:?} x{count} {bytes} bytes layers={layers:?}"
+            );
+        }
+    }
+}
+
+fn run_gguf_header_metadata_prefix(mut args: impl Iterator<Item = String>) {
+    let key_prefix = args.next().unwrap_or_else(|| usage());
+    let mut headers = Vec::new();
+    while let Some(path) = args.next() {
+        let declared_bytes = args
+            .next()
+            .unwrap_or_else(|| usage())
+            .parse::<u64>()
+            .unwrap_or_else(|_| usage());
+        headers.push((std::path::PathBuf::from(path), declared_bytes));
+    }
+    if headers.is_empty() {
+        usage();
+    }
+    let index = GgufSet::open_headers(&headers).unwrap_or_else(|error| {
+        eprintln!("invalid GGUF header set: {error}");
+        std::process::exit(1);
+    });
+
+    let entries = index.shards[0]
+        .metadata
+        .iter()
+        .filter(|(key, _)| key.starts_with(&key_prefix))
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        eprintln!("GGUF metadata prefix not found: {key_prefix}");
+        std::process::exit(1);
+    }
+    println!("strict GGUF metadata prefix");
+    println!("  prefix            {key_prefix}");
+    for (key, entry) in entries {
+        println!("  {key} {:?} {:?}", entry.value_type, entry.value);
+    }
+}
+
+fn canonical_gguf_tensor_role(name: &str) -> (String, Option<u16>) {
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return (name.to_owned(), None);
+    };
+    let Some((layer, suffix)) = rest.split_once('.') else {
+        return (name.to_owned(), None);
+    };
+    let Ok(layer) = layer.parse::<u16>() else {
+        return (name.to_owned(), None);
+    };
+    (format!("blk.*.{suffix}"), Some(layer))
+}
+
+fn print_gguf_index(index: &GgufSet, headers_only: bool) {
+    let tensor_bytes = index
+        .tensors
+        .values()
+        .try_fold(0_u64, |total, tensor| total.checked_add(tensor.data_bytes))
+        .expect("validated GGUF tensor byte sum");
+    let mut type_distribution = BTreeMap::<GgmlTensorType, (usize, u64)>::new();
+    let mut expert_layouts = BTreeMap::<(String, Vec<u64>, GgmlTensorType), (usize, u64)>::new();
+    let mut glm_attention_layouts = BTreeMap::<(String, Vec<u64>, GgmlTensorType), usize>::new();
+    for (name, tensor) in &index.tensors {
+        let entry = type_distribution.entry(tensor.tensor_type).or_default();
+        entry.0 += 1;
+        entry.1 = entry
+            .1
+            .checked_add(tensor.data_bytes)
+            .expect("validated GGUF type byte sum");
+        let canonical_name = name
+            .strip_prefix("blk.")
+            .and_then(|suffix| suffix.split_once('.').map(|(_, rest)| rest))
+            .unwrap_or(name)
+            .to_owned();
+        if name.contains("exp") {
+            let entry = expert_layouts
+                .entry((
+                    canonical_name.clone(),
+                    tensor.dimensions.clone(),
+                    tensor.tensor_type,
+                ))
+                .or_default();
+            entry.0 += 1;
+            entry.1 = entry
+                .1
+                .checked_add(tensor.data_bytes)
+                .expect("validated GGUF expert byte sum");
+        }
+        if canonical_name.starts_with("attn_")
+            || canonical_name.starts_with("ssm_")
+            || canonical_name.starts_with("indexer")
+        {
+            *glm_attention_layouts
+                .entry((
+                    canonical_name,
+                    tensor.dimensions.clone(),
+                    tensor.tensor_type,
+                ))
+                .or_default() += 1;
+        }
+    }
+    println!(
+        "strict GGUF v3 {}set",
+        if headers_only { "header " } else { "" }
+    );
+    println!("  architecture      {}", index.architecture);
+    println!("  shards            {:12}", index.shards.len());
+    println!("  tensors           {:12}", index.tensors.len());
+    println!("  tensor bytes      {tensor_bytes:12}");
+    println!("  tensor type distribution");
+    for (tensor_type, (count, bytes)) in type_distribution {
+        println!("    {tensor_type:?} {count:8} tensors {bytes:12} bytes");
+    }
+    println!("  expert tensor layouts");
+    for ((name, dimensions, tensor_type), (count, bytes)) in expert_layouts {
+        println!("    {name:<36} {dimensions:?} {tensor_type:?} x{count} {bytes} bytes");
+    }
+    if index.architecture == "glm5next" {
+        let model = Glm53ModelSpec::from_gguf(index).unwrap_or_else(|error| {
+            eprintln!("invalid locked GLM-5.3 model contract: {error}");
+            std::process::exit(1);
+        });
+        println!("  locked GLM-5.3 execution contract");
+        println!("    trunk blocks      {:12}", model.topology.trunk_layer_count());
+        println!("    MTP blocks        {:12}", model.topology.mtp_layer_count());
+        println!("    hidden            {:12}", model.hidden_size);
+        println!("    vocabulary        {:12}", model.vocabulary);
+        println!("    context           {:12}", model.context_length);
+        println!("    hyper connections {:12}", model.hyper_connections);
+        println!("    routed experts    {:12}", model.routed_experts);
+        let resident = GlmResidentPlan::from_gguf(index, false).unwrap_or_else(|error| {
+            eprintln!("invalid GLM base resident mapping plan: {error}");
+            std::process::exit(1);
+        });
+        println!("  GLM base resident mapping plan");
+        println!("    tensors           {:12}", resident.tensors().len());
+        println!("    file ranges       {:12}", resident.ranges().len());
+        println!("    tensor bytes      {:12}", resident.tensor_bytes());
+        println!("    mapped payload    {:12}", resident.mapped_payload_bytes());
+        println!(
+            "    mapped 4K pages   {:12}",
+            resident.mapped_page_bytes(4096).expect("validated 4K plan")
+        );
+        println!("    paged experts     {:12}", resident.excluded_expert_bytes());
+        println!("    deferred MTP      {:12}", resident.excluded_mtp_bytes());
+        println!("  GLM attention tensor layouts");
+        for ((name, dimensions, tensor_type), count) in glm_attention_layouts {
+            println!("    {name:<36} {dimensions:?} {tensor_type:?} x{count}");
+        }
+        let topology = GlmTopology::from_gguf(index).unwrap_or_else(|error| {
+            eprintln!("invalid GLM layer topology: {error}");
+            std::process::exit(1);
+        });
+        let dsa_layers = topology.dsa_layers().collect::<Vec<_>>();
+        println!("  GLM layer topology");
+        println!("    blocks            {:12}", topology.layers().len());
+        println!("    trunk blocks      {:12}", topology.trunk_layer_count());
+        println!("    MTP blocks        {:12}", topology.mtp_layer_count());
+        println!(
+            "    leading dense     {:12}",
+            topology.leading_dense_layers()
+        );
+        println!("    KDA layers         {:12}", topology.kda_layers());
+        println!("    DSA/MLA layers     {dsa_layers:?}");
+        println!(
+            "    trunk DSA/MLA      {:?}",
+            topology.trunk_dsa_layers().collect::<Vec<_>>()
+        );
+        let dsa = GlmDsaSpec::from_gguf_trunk(index).unwrap_or_else(|error| {
+            eprintln!("invalid GLM DSA/KPool contract: {error}");
+            std::process::exit(1);
+        });
+        let dsa_plan = dsa.plan(1, 32 * 1024).expect("locked 32K DSA plan");
+        println!("  GLM DSA/KPool batch-one 32K plan");
+        println!("    pooled entries    {:12}", dsa_plan.pooled_entries);
+        println!(
+            "    persistent bytes  {:12}",
+            dsa_plan
+                .persistent_bytes()
+                .expect("validated persistent DSA bytes")
+        );
+        println!(
+            "    decode workspace  {:12}",
+            dsa_plan
+                .decode_workspace_bytes()
+                .expect("validated DSA workspace bytes")
+        );
+        let quant_plan = GlmDsaQuantModelPlan::from_gguf_trunk(index).unwrap_or_else(|error| {
+            eprintln!("invalid GLM DSA quant projection plan: {error}");
+            std::process::exit(1);
+        });
+        let first_quant_layer = quant_plan.layers.first().expect("validated DSA layer set");
+        let absorb = first_quant_layer
+            .operation(GlmDsaQuantRole::AbsorbKey)
+            .expect("validated MLA K absorption");
+        let absorb_stride = match &absorb.dispatch {
+            sparkserve_runtime::glm_dsa_quant::GlmDsaQuantDispatch::HeadBatched {
+                spec, ..
+            } => spec.weight_slot_stride_bytes,
+            _ => unreachable!("MLA K absorption is head-batched"),
+        };
+        println!("  GLM DSA direct-GGUF projection plan");
+        println!("    layers            {:12}", quant_plan.layers.len());
+        println!(
+            "    MMVQ arena bytes  {:12}",
+            quant_plan.workspace.total_bytes
+        );
+        println!("    head launches     {:12}", 8);
+        println!("    Q8 head stride    {:12}", absorb_stride);
+        println!(
+            "    BF16 copies saved {:12}",
+            quant_plan.avoided_bf16_kv_projection_bytes
+        );
+        let catalog = GgufExpertCatalog::build_glm53_trunk(index, 16).unwrap_or_else(|error| {
+            eprintln!("invalid GLM expert paging catalog: {error}");
+            std::process::exit(1);
+        });
+        println!("  GLM base fixed expert cache (16 slots)");
+        println!(
+            "    expert payload    {:12} bytes",
+            catalog.expert_source_bytes()
+        );
+        println!(
+            "    resident payload  {:12} bytes",
+            resident.tensor_bytes()
+        );
+        println!(
+            "    max useful/slot  {:12} bytes",
+            catalog.useful_expert_bytes()
+        );
+        println!("    allocated arena  {:12} bytes", catalog.arena_bytes());
+        for component in catalog.components() {
+            println!(
+                "    {:<8} K {:>4} rows {:>4} max {:>8} stride {:>8} {:?}",
+                component.name,
+                component.k,
+                component.rows,
+                component.max_slice_bytes,
+                component.slot_stride_bytes,
+                component.quant_types
+            );
+        }
+    }
+    for (number, shard) in index.shards.iter().enumerate() {
+        println!(
+            "  shard {:>3}         {:12} bytes  {}",
+            number,
+            shard.file_bytes,
+            shard.path.display()
+        );
     }
 }
 

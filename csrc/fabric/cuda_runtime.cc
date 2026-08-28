@@ -86,6 +86,22 @@ extern "C" SparkServeStatus sparkserve_cuda_stream_memset_async(
   return Ok();
 }
 
+extern "C" SparkServeStatus sparkserve_cuda_stream_memcpy_async(
+    SparkServeCudaStream* owner, void* destination_device_pointer,
+    const void* source_device_pointer, uint64_t bytes) {
+  if (owner == nullptr || destination_device_pointer == nullptr ||
+      source_device_pointer == nullptr || bytes == 0) {
+    return Invalid("CUDA asynchronous memcpy arguments are invalid");
+  }
+  const cudaError_t error = cudaMemcpyAsync(
+      destination_device_pointer, source_device_pointer,
+      static_cast<size_t>(bytes), cudaMemcpyDefault, owner->stream);
+  if (error != cudaSuccess) {
+    return CudaStatus("CUDA asynchronous memcpy failed: ", error);
+  }
+  return Ok();
+}
+
 extern "C" SparkServeStatus sparkserve_cuda_stream_wait_event(
     SparkServeCudaStream* stream, const SparkServeCudaEvent* event) {
   if (stream == nullptr || event == nullptr) {

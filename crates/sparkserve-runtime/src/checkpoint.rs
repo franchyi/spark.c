@@ -57,6 +57,35 @@ pub struct CheckpointPlan {
     pub vision_ignored: TensorStats,
 }
 
+/// Exact byte location of one tensor in the original safetensors checkpoint.
+///
+/// SparkServe keeps these locations instead of materializing an intermediate
+/// weight archive. The serving owner can map a shard once and pass
+/// `absolute_offset` directly to CUDA, or read only selected expert tensors
+/// into its fixed hot cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorLocation {
+    pub relative_file: PathBuf,
+    pub absolute_offset: u64,
+    pub data_bytes: u64,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlashNextCheckpoint {
+    pub plan: CheckpointPlan,
+    pub tensors: BTreeMap<String, SafetensorLocation>,
+}
+
+impl FlashNextCheckpoint {
+    pub fn tensor(&self, name: &str) -> Result<&SafetensorLocation, CheckpointError> {
+        self.tensors.get(name).ok_or_else(|| {
+            CheckpointError::Invalid(format!("checkpoint tensor is missing: {name}"))
+        })
+    }
+}
+
 impl CheckpointPlan {
     pub fn total(&self) -> TensorStats {
         TensorStats {
@@ -112,6 +141,12 @@ enum TensorClass {
 }
 
 pub fn load_flash_next_plan(root: &Path) -> Result<CheckpointPlan, CheckpointError> {
+    Ok(load_flash_next_checkpoint(root)?.plan)
+}
+
+pub fn load_flash_next_checkpoint(
+    root: &Path,
+) -> Result<FlashNextCheckpoint, CheckpointError> {
     let config_value: Value = serde_json::from_reader(File::open(root.join(CONFIG_FILE))?)?;
     let config = parse_config(&config_value)?;
     let index_value: Value = serde_json::from_reader(File::open(root.join(INDEX_FILE))?)?;
@@ -140,8 +175,15 @@ pub fn load_flash_next_plan(root: &Path) -> Result<CheckpointPlan, CheckpointErr
         mtp_deferred: TensorStats::default(),
         vision_ignored: TensorStats::default(),
     };
+    let mut tensor_index = BTreeMap::new();
     for (relative_file, tensors) in by_file {
-        scan_safetensors_header(root, relative_file, &tensors, &mut plan)?;
+        scan_safetensors_header(
+            root,
+            relative_file,
+            &tensors,
+            &mut plan,
+            &mut tensor_index,
+        )?;
     }
     if plan.ple_nvme.tensors != EXPECTED_PLE_SHARDS {
         return Err(CheckpointError::Invalid(format!(
@@ -149,7 +191,10 @@ pub fn load_flash_next_plan(root: &Path) -> Result<CheckpointPlan, CheckpointErr
             plan.ple_nvme.tensors
         )));
     }
-    Ok(plan)
+    Ok(FlashNextCheckpoint {
+        plan,
+        tensors: tensor_index,
+    })
 }
 
 fn parse_config(value: &Value) -> Result<FlashNextConfig, CheckpointError> {
@@ -241,6 +286,7 @@ fn scan_safetensors_header(
     relative_file: &str,
     tensors: &[&str],
     plan: &mut CheckpointPlan,
+    tensor_index: &mut BTreeMap<String, SafetensorLocation>,
 ) -> Result<(), CheckpointError> {
     let path = root.join(relative_file);
     let mut file = File::open(&path)?;
@@ -292,6 +338,25 @@ fn scan_safetensors_header(
                 "tensor {tensor} exceeds {relative_file}"
             )));
         }
+        let absolute_offset = data_start
+            .checked_add(start)
+            .ok_or_else(|| CheckpointError::Invalid("tensor offset overflow".into()))?;
+        let dtype = metadata
+            .get("dtype")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CheckpointError::Invalid(format!("tensor {tensor} has no dtype")))?
+            .to_owned();
+        let shape = array_field(metadata, "shape")?
+            .iter()
+            .map(|dimension| json_u64(dimension, "tensor dimension"))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Safetensors represents a scalar as rank zero (`shape: []`). Qwen's
+        // NVFP4 input_scale and weight_scale_2 tensors use that valid form.
+        if shape.contains(&0) || bytes == 0 {
+            return Err(CheckpointError::Invalid(format!(
+                "tensor {tensor} has a zero dimension or empty payload"
+            )));
+        }
         let class = classify_tensor(tensor);
         if class == TensorClass::PleNvme {
             expect_string(metadata, "dtype", "F8_E4M3")?;
@@ -302,6 +367,18 @@ fn scan_safetensors_header(
             TensorClass::PleNvme => plan.ple_nvme.add(bytes)?,
             TensorClass::MtpDeferred => plan.mtp_deferred.add(bytes)?,
             TensorClass::VisionIgnored => plan.vision_ignored.add(bytes)?,
+        }
+        let location = SafetensorLocation {
+            relative_file: PathBuf::from(relative_file),
+            absolute_offset,
+            data_bytes: bytes,
+            dtype,
+            shape,
+        };
+        if tensor_index.insert((*tensor).to_owned(), location).is_some() {
+            return Err(CheckpointError::Invalid(format!(
+                "checkpoint tensor is duplicated: {tensor}"
+            )));
         }
     }
     Ok(())
@@ -467,7 +544,9 @@ mod tests {
     fn builds_strict_flash_next_load_plan_from_headers_only() {
         let directory = TestDir::new();
         write_valid_checkpoint(&directory.0);
-        let plan = load_flash_next_plan(&directory.0).expect("valid checkpoint plan");
+        let checkpoint =
+            load_flash_next_checkpoint(&directory.0).expect("valid checkpoint index");
+        let plan = &checkpoint.plan;
         assert_eq!(plan.files, 2);
         assert_eq!(
             plan.resident,
@@ -479,6 +558,14 @@ mod tests {
         assert_eq!(plan.ple_nvme.tensors, 128);
         assert_eq!(plan.ple_nvme.bytes, 128 * 160);
         assert_eq!(plan.total().tensors, 129);
+        let embedding = checkpoint
+            .tensor("model.language_model.embed_tokens.weight")
+            .expect("embedding location");
+        assert_eq!(embedding.relative_file, Path::new("resident.safetensors"));
+        assert_eq!(embedding.dtype, "BF16");
+        assert_eq!(embedding.shape, [2, 2]);
+        assert_eq!(embedding.data_bytes, 8);
+        assert!(embedding.absolute_offset >= 8);
     }
 
     #[test]

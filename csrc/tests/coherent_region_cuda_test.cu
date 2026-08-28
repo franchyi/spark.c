@@ -106,6 +106,18 @@ void TestAnonymousSlab() {
   Require(sparkserve_cuda_stream_wait_event(stream, event));
   Require(sparkserve_cuda_stream_synchronize(stream));
   for (uint64_t index = 0; index < 4096; ++index) assert(payload[index] == 0x5a);
+
+  constexpr uint64_t kCopyBytes = 8192;
+  uint8_t* copy_source = nullptr;
+  CudaOk(cudaMalloc(&copy_source, kCopyBytes));
+  CudaOk(cudaMemset(copy_source, 0x3c, kCopyBytes));
+  Require(sparkserve_cuda_stream_memcpy_async(
+      stream, view.device_pointer, copy_source, kCopyBytes));
+  Require(sparkserve_cuda_stream_synchronize(stream));
+  for (uint64_t index = 0; index < kCopyBytes; ++index) {
+    assert(payload[index] == 0x3c);
+  }
+  CudaOk(cudaFree(copy_source));
   Require(sparkserve_cuda_event_destroy(event));
   Require(sparkserve_cuda_stream_destroy(stream));
   assert(DeviceSum(view.device_pointer, kBytes) == HostSum(payload, kBytes));

@@ -115,7 +115,17 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=Path("/model"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--with-mhc", action="store_true")
+    parser.add_argument(
+        "--hyper-input-bf16",
+        type=Path,
+        help=(
+            "optional raw [1,4,2560] BF16 hyper-connection input; used to "
+            "capture an MLP fixture chained directly after attention"
+        ),
+    )
     args = parser.parse_args()
+    if args.hyper_input_bf16 is not None and not args.with_mhc:
+        parser.error("--hyper-input-bf16 requires --with-mhc")
     if not torch.cuda.is_available():
         raise SystemExit("fixture capture requires the Spark CUDA device")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -150,9 +160,21 @@ def main() -> None:
     generator = torch.Generator(device="cpu").manual_seed(0x5A17)
     mhc_payloads: dict[str, torch.Tensor] = {}
     if args.with_mhc:
-        hyper_input = torch.randn(
-            TOKENS, 4 * HIDDEN, generator=generator, dtype=torch.float32
-        ).to(torch.bfloat16)
+        if args.hyper_input_bf16 is None:
+            hyper_input = torch.randn(
+                TOKENS, 4 * HIDDEN, generator=generator, dtype=torch.float32
+            ).to(torch.bfloat16)
+        else:
+            hyper_bytes = bytearray(args.hyper_input_bf16.read_bytes())
+            expected_bytes = TOKENS * 4 * HIDDEN * 2
+            if len(hyper_bytes) != expected_bytes:
+                raise RuntimeError(
+                    f"{args.hyper_input_bf16} has {len(hyper_bytes)} bytes; "
+                    f"expected {expected_bytes}"
+                )
+            hyper_input = torch.frombuffer(
+                hyper_bytes, dtype=torch.bfloat16
+            ).clone().reshape(TOKENS, 4 * HIDDEN)
         hyper_gpu = hyper_input.cuda()
         mhc_normed = grouped_gemma_rmsnorm(
             hyper_gpu, resident["mhc_norm_weight"].cuda(), HIDDEN, 1.0e-6
@@ -435,6 +457,9 @@ def main() -> None:
         "sglang_revision": SGLANG_REVISION,
         "layer": 0,
         "with_mhc": args.with_mhc,
+        "hyper_input_source": (
+            str(args.hyper_input_bf16) if args.hyper_input_bf16 else "seeded-random"
+        ),
         "slot_experts": slot_experts,
         "shape": {
             "tokens": TOKENS,

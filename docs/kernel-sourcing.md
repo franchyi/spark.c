@@ -19,10 +19,12 @@ contracts, and promotion gates are recorded in
 | PLE row gather | SGLang Qwen4 gather; SGLang PR 36567 storage design | Rust reads original safetensors; borrow the proven gather/scale path and own only the NVMe residency policy | cold-page tail latency during long prefill |
 | QSA decode | SGLang Qwen4 backend, TileLang-generated score MMA, and FlashInfer XQA | Pinned index prep, AOT score, radix top-k, block expansion, selected-K/V pack, and BF16 H=256 page-64 XQA are linked behind the raw ABI; Rust owns coherent buffers, scratch, leases, and page tables | full-layer/token integration, prefill split, and FP8-KV edge cases |
 | Qwen GDN attention | SGLang causal-conv/FLA norm + pinned FlashInfer CuTe recurrence + cuBLAS | Offline-export the exact SM121 recurrence; adapt SGLang's allocation-free framing arithmetic; Rust schedules five explicit stages and checkpoints both state pools | decode is byte-exact end to end at 693.755 us; prefill and full-layer/token integration remain |
-| GLM KDA/DSA state and sparse indexer | pinned GLM5Next llama.cpp oracle | Port only after exact index, state, and FP32-reference fixtures are frozen | draft upstream CUDA path, pooled top-k semantics, accidental RoPE |
+| Qwen layer composition | borrowed GDN/QSA + mHC/MoE kernels above | Rust ping-pongs two fixed coherent 20-KiB hidden slabs and passes the attention output pointer directly to the MLP; arithmetic stays in donor kernels | native device-pointer composition fixture and graph/event integration |
+| GLM KDA state | pinned llama.cpp gated-delta-net, convolution, norm, and unary CUDA plus pinned SGLang GLM5Next graph | Width-4 Q/K/V convolution, prepare, recurrence, and gated RMSNorm are extracted behind allocation-free ABIs; Rust owns 152,633,344 bytes of batch-one state/streams | GB10 multi-token parity and prefill throughput |
+| GLM DSA/MLA and sparse indexer | pinned SGLang GLM5Next branch `9a26e74` plus locked GGUF headers | Freeze strict NoPE MLA/KPool geometry and fixed 32K cache/workspace first; then adapt proven FlashInfer/SGLang arithmetic without their runtimes | GB10 arithmetic parity, pooled top-k semantics, accidental RoPE |
 | Hyperconnection mix/combine | pinned SGLang grouped norm/combine plus cuBLAS | Raw deterministic HC=4,H=2560,R=320 path is reference-exact; persistent atomic Triton remains a speed oracle | prefill tactics and persistent-kernel speed gap |
 | RMSNorm, RoPE, sampling | FlashInfer or compact local CUDA | Reuse only when it wins a GB10 microbenchmark | launch overhead at batch one |
-| GGUF Q8/IQ3/Q3 | llama.cpp `ggml-cuda` MMQ kernels | Use Q8_0 as the reference, then vendor only IQ3_XXS and Q3_K pieces behind our ABI | coupling to ggml metadata and selected-expert slice layout |
+| GGUF mixed quant | llama.cpp `ggml-cuda` MMVQ kernels plus ds4's raw-switch patch | the real Q2_K/Q3_K/Q6_K/IQ2_S/IQ3_S/IQ4_XS mix is pinned behind a dense/routed fixed-scratch, fixed-stride ABI; keep Q8_0 scalar as reference | GB10 parity for every locked type and complete GLM graph |
 
 ## License boundary
 
@@ -45,6 +47,17 @@ Only the Spark-specific glue and kernels whose specialization is the product:
 4. fixed-address GGUF expert-block cache with async NVMe admission and telemetry;
 5. adaptive MTP width tied to measured acceptance and QSA ring capacity;
 6. Rust scheduler/state machine and stable C ABI.
+
+The scheduler, not a kernel library, owns the three-GDN/one-QSA layer pattern,
+the two-slab hidden-state ping-pong, expert-page admission, stream/event
+dependencies, rollback, and publication. This is the main SparkServe-specific
+surface; borrowed kernels remain replaceable arithmetic leaves.
+
+The same split applies outside CUDA: Hugging Face's Rust tokenizer owns exact
+BPE mechanics and `tiny_http` owns transport framing. Rust code in this
+repository owns the pinned chat semantics, fixed sequence/memory transaction,
+live token stream, cancellation, and metrics. Neither library is allowed to
+allocate GPU state, page weights, select a kernel, or schedule a decode step.
 
 Everything else starts as an upstream kernel candidate and earns replacement
 only through a repeatable GB10 benchmark.

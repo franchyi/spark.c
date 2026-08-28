@@ -5,8 +5,14 @@
 //! explicit boundary; donor kernels never allocate or register memory.
 
 use std::ffi::CStr;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -120,6 +126,30 @@ impl CoherentRegionOwner {
         ))
     }
 
+    /// Map bytes directly from their original NVMe file and register those
+    /// pages with CUDA. The native owner opens the file during `create`, so the
+    /// temporary C path does not need to outlive this call. No weight payload is
+    /// copied into a second CPU or device allocation.
+    #[cfg(unix)]
+    pub fn file_read_only(
+        path: &Path,
+        file_offset: u64,
+        payload_bytes: u64,
+        required_alignment: u64,
+        flags: u32,
+    ) -> Result<Self, CoherentRegionError> {
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            CoherentRegionError::invalid_view("coherent file path contains a NUL byte")
+        })?;
+        Self::create(&CoherentRegionConfig::file_read_only(
+            payload_bytes,
+            file_offset,
+            required_alignment,
+            flags,
+            path.as_ptr(),
+        ))
+    }
+
     pub fn view(&self) -> &CoherentRegionView {
         &self.view
     }
@@ -146,6 +176,17 @@ impl CoherentRegionOwner {
         // SAFETY: the native view is validated at creation; the caller promises
         // that CUDA does not concurrently access the same coherent bytes.
         Ok(unsafe { std::slice::from_raw_parts_mut(self.view.host_pointer.cast::<u8>(), bytes) })
+    }
+
+    /// Borrow the CPU alias after the scheduler has established that all CUDA
+    /// writers are complete.
+    ///
+    /// # Safety
+    ///
+    /// No CUDA operation may write the region for the returned borrow.
+    pub unsafe fn host_payload(&self) -> Result<&[u8], CoherentRegionError> {
+        let bytes = self.payload_bytes()?;
+        Ok(unsafe { std::slice::from_raw_parts(self.view.host_pointer.cast::<u8>(), bytes) })
     }
 
     pub fn close(mut self) -> Result<(), CoherentRegionError> {

@@ -1,5 +1,15 @@
 #include "sparkserve/fabric_api.h"
+#include "sparkserve/ggml_quant_api.h"
+#include "sparkserve/glm_dsa_api.h"
+#include "sparkserve/glm_kda_api.h"
 #include "sparkserve/kernel_api.h"
+#include "sparkserve/glm_mqa_api.h"
+#include "sparkserve/glm_sparse_mla_api.h"
+#include "sparkserve/qwen_expert_pack_api.h"
+#include "sparkserve/qwen_gdn_aux_api.h"
+#include "sparkserve/qwen_qsa_block_api.h"
+#include "sparkserve/qwen_ple_block_api.h"
+#include "sparkserve/qwen_decode_glue_api.h"
 
 #include <stddef.h>
 
@@ -56,12 +66,50 @@ _Static_assert(sizeof(SparkServeGdnBlockPlan) == 48u,
                "C GDN block plan layout drifted");
 _Static_assert(sizeof(SparkServeGdnBlockArgs) == 216u,
                "C GDN block arguments layout drifted");
+_Static_assert(sizeof(SparkServeQwenQsaProjectArgs) == 168u,
+               "C Qwen QSA projection arguments layout drifted");
+_Static_assert(sizeof(SparkServeQwenQsaFinishArgs) == 72u,
+               "C Qwen QSA finish arguments layout drifted");
+_Static_assert(sizeof(SparkServeQwenPleBlockArgs) == 144u,
+               "C Qwen PLE block arguments layout drifted");
+_Static_assert(sizeof(SparkServeQwenDecodeGlueArgs) == 32u,
+               "C Qwen decode glue arguments layout drifted");
+_Static_assert(sizeof(SparkServeQwenLmHeadArgs) == 56u,
+               "C Qwen LM-head arguments layout drifted");
 _Static_assert(sizeof(SparkServeCoherentRegionConfig) == 48u,
                "C coherent region config layout drifted");
 _Static_assert(sizeof(SparkServeCoherentRegionView) == 80u,
                "C coherent region view layout drifted");
+_Static_assert(sizeof(SparkServeGgmlQuantDenseArgs) == 88u,
+               "C GGML quant dense arguments layout drifted");
+_Static_assert(sizeof(SparkServeGgmlQuantRoutedArgs) == 120u,
+               "C GGML quant routed arguments layout drifted");
+_Static_assert(sizeof(SparkServeGlmKdaArgs) == 104u,
+               "C GLM KDA arguments layout drifted");
+_Static_assert(sizeof(SparkServeGlmKdaConvArgs) == 80u,
+               "C GLM KDA conv arguments layout drifted");
+_Static_assert(sizeof(SparkServeGlmKdaPrepareArgs) == 128u,
+               "C GLM KDA prepare arguments layout drifted");
+_Static_assert(sizeof(SparkServeGlmKdaGateArgs) == 80u,
+               "C GLM KDA gate arguments layout drifted");
+_Static_assert(sizeof(SparkServeGlmKPoolCompressArgs) == 104u,
+               "C GLM KPool compress arguments layout drifted");
+_Static_assert(sizeof(SparkServeGlmKPoolDecodeArgs) == 168u,
+               "C GLM KPool decode arguments layout drifted");
+_Static_assert(sizeof(SparkServeGlmIndexerPrepArgs) == 112u,
+               "C GLM indexer prep arguments layout drifted");
 
 int main(void) {
+  _Static_assert(sizeof(SparkServeGlmPagedMqaArgs) == 136,
+                 "GLM paged-MQA ABI size changed");
+  _Static_assert(SPARKSERVE_GLM_MQA_SCHEDULE_WORDS == 98,
+                 "GB10 paged-MQA metadata size changed");
+  _Static_assert(sizeof(SparkServeGlmSparseMlaPackKvArgs) == 72,
+                 "GLM sparse-MLA KV-pack ABI size changed");
+  _Static_assert(sizeof(SparkServeGlmSparseMlaPadQueryArgs) == 56,
+                 "GLM sparse-MLA query-pad ABI size changed");
+  _Static_assert(sizeof(SparkServeGlmSparseMlaDecodeArgs) == 224,
+                 "GLM sparse-MLA decode ABI size changed");
   SparkServeDenseNvfp4Plan plan = {0};
   plan.struct_size = (uint32_t)sizeof(plan);
   plan.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;

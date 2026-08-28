@@ -26,8 +26,9 @@ def test_kernel_sources_are_immutable_or_explicitly_blocked() -> None:
             continue
         assert re.fullmatch(r"[0-9a-f]{40}", revision), source["id"]
         assert source["license"] in {
-            "Apache-2.0",
-            "Apache-2.0 AND MIT",
+                "Apache-2.0",
+                "Apache-2.0 AND BSD-3-Clause",
+                "Apache-2.0 AND MIT",
             "BSD-3-Clause",
             "MIT",
         }
@@ -159,6 +160,38 @@ def test_sglang_storage_donor_is_pinned_and_hashed() -> None:
         "d359ebd45c1624e480cb04d9001b424534345154670ab3121135c33c2f8b70e9  "
         "rust/sglang-storage/Cargo.toml",
     ]
+
+
+def test_flashinfer_glm_nsa_sparse_mla_is_pinned_and_hashed() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "flashinfer-glm-nsa-sparse-mla"
+    )
+    assert donor["revision"] == "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+    assert donor["license"] == "BSD-3-Clause"
+    assert donor["mode"] == "direct-template-specialization"
+    assert donor["status"] == "linked-framework-free-sm121-synthetic-parity-passed"
+    assert donor["entrypoint"] == "csrc/sparse_mla_sm120_decode_dsv3_2.cu"
+
+    vendor = ROOT / "third_party" / "flashinfer-sparse-mla"
+    assert (vendor / "VENDOR.md").is_file()
+    hashes = (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines()
+    expected = [
+        "a38740b891e23f3eb1c38d1fa9e3156d9a490a59adde7b57ebef726e5115d5ab  third_party/_deps/flashinfer/csrc/sparse_mla_sm120_decode_dsv3_2.cu",
+        "b7860563129fbbfcf1faaab0a12195e5be1d2ce6ba64054413d7a1b2bc999ad1  third_party/_deps/flashinfer/include/flashinfer/attention/sparse_mla_sm120/decode_dsv3_2_kernel.cuh",
+        "014c668d9bc9b30adc98f05dbc4bb5bedd9989def585a0d88347efb57f4eed54  third_party/_deps/flashinfer/include/flashinfer/attention/sparse_mla_sm120/decode_dsv4_kernel.cuh",
+        "95499904538b2f708f596887ea1128ba45d24bdb1f491502d541d08e4439d559  third_party/_deps/flashinfer/include/flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh",
+        "d8eb2cfdc3eb228f1671f37c50233ff2a0c07908799cc9dcb8848d74a33cf0e9  third_party/_deps/flashinfer/include/flashinfer/attention/sparse_mla_sm120/model/model_type.h",
+        "c4c503f6139d8e80ea9d0be7e876178f5af1c0b94a225975f91e49266b6c14b4  third_party/_deps/flashinfer/include/flashinfer/attention/sparse_mla_sm120/common/fp8_quant.cuh",
+    ]
+    assert hashes == expected
+    for line in hashes:
+        digest, relative = line.split("  ", maxsplit=1)
+        assert hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() == digest
 
 
 def test_sglang_ple_oracle_is_pinned_and_hashed() -> None:

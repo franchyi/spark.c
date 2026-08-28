@@ -19,11 +19,18 @@ def test_repository_model_lock_is_valid_and_complete() -> None:
     assert {model.id for model in lock.models} == {
         "qwen38-flash-next-nvfp4",
         "glm53-flash-iq3-xxs",
+        "glm53-flash-ds4-q2",
     }
     glm = lock.model("glm53-flash-iq3-xxs")
     assert glm.inventory == "complete_checkpoint"
     assert len(glm.files) == 4
     assert sum(file.size for file in glm.files) == 120_367_571_715
+    q2 = lock.model("glm53-flash-ds4-q2")
+    assert q2.inventory == "complete_checkpoint"
+    assert q2.checkpoint_bytes == 96_505_816_384
+    assert q2.files[0].sha256 == (
+        "e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32"
+    )
 
 
 def test_lock_rejects_moving_revision() -> None:

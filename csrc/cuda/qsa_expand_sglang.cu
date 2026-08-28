@@ -1,8 +1,8 @@
 // Adapted from SGLang's Apache-2.0
 // srt/layers/attention/qsa/kernel.py at commit
 // d91c3682b0b429e4c70df63cd57f819588ce29b0. This retains the fixed-width
-// compressed-block expansion and incomplete-tail semantics while removing
-// Torch/Triton allocation and dispatch.
+// compressed-block expansion and incomplete-tail semantics shared by Qwen QSA
+// and GLM KPool DSA while removing Torch/Triton allocation and dispatch.
 
 #include "internal/qsa_expand_backend.h"
 

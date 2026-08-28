@@ -199,6 +199,14 @@ impl PendingMoeStep {
             .expect("pending residency remains owned")
             .addresses()
     }
+
+    /// Exact two-phase residency transaction consumed by fixed-buffer storage
+    /// backends. It remains unpublishable until `commit_step` consumes `self`.
+    pub fn residency_plan(&self) -> &ExpertResidencyPlan {
+        self.residency
+            .as_ref()
+            .expect("pending residency remains owned")
+    }
 }
 
 impl Drop for PendingMoeStep {

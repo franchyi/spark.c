@@ -80,6 +80,10 @@ SparkServeStatus sparkserve_cuda_stream_memset_async(
     SparkServeCudaStream* stream, void* device_pointer, uint32_t value,
     uint64_t bytes);
 
+SparkServeStatus sparkserve_cuda_stream_memcpy_async(
+    SparkServeCudaStream* stream, void* destination_device_pointer,
+    const void* source_device_pointer, uint64_t bytes);
+
 SparkServeStatus sparkserve_cuda_stream_wait_event(
     SparkServeCudaStream* stream, const SparkServeCudaEvent* event);
 

@@ -100,12 +100,15 @@ SparkServeGroupedNvfp4Args GroupedArgs(
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  assert(argc == 2);
-  const std::filesystem::path fixture(argv[1]);
+int SparkServeRunQwenMoeFixture(const char* fixture_path,
+                                void* hyper_input_override,
+                                bool benchmark) {
+  assert(fixture_path != nullptr);
+  const std::filesystem::path fixture(fixture_path);
   const bool joined = std::filesystem::exists(fixture / "joined_output_bf16.bin");
   const bool with_mhc =
       std::filesystem::exists(fixture / "mhc_hyper_input_bf16.bin");
+  assert(hyper_input_override == nullptr || with_mhc);
   const uint32_t num_tokens = joined ? 1 : 2;
   const uint32_t top_k = joined ? 10 : 2;
   const uint32_t experts = joined ? 10 : 2;
@@ -192,6 +195,7 @@ int main(int argc, char** argv) {
   void* mhc_activated = nullptr;
   void* mhc_up = nullptr;
   void* mhc_combined = nullptr;
+  bool owns_mhc_hyper_input = false;
   SparkServeMhcArgs mhc = {};
   std::vector<uint8_t> mhc_combined_expected;
   if (with_mhc) {
@@ -216,7 +220,12 @@ int main(int argc, char** argv) {
     mhc_combined_expected =
         Read(fixture / "mhc_combined_bf16.bin", num_tokens * 4 * kHidden * 2);
 
-    mhc_hyper_input = Upload(hyper_input_host);
+    if (hyper_input_override == nullptr) {
+      mhc_hyper_input = Upload(hyper_input_host);
+      owns_mhc_hyper_input = true;
+    } else {
+      mhc_hyper_input = hyper_input_override;
+    }
     mhc_norm_weight = Upload(norm_weight_host);
     mhc_down_weight = Upload(down_weight_host);
     mhc_up_weight = Upload(up_weight_host);
@@ -260,6 +269,8 @@ int main(int argc, char** argv) {
       std::cerr << mhc_status.message << '\n';
     assert(mhc_status.code == SPARKSERVE_STATUS_OK);
     CudaOk(cudaDeviceSynchronize());
+    ExpectBytes(mhc_hyper_input, hyper_input_host,
+                "MLP block attention-to-MLP boundary");
     ExpectBytes(mhc_normed, normed_expected, "MLP block mHC norm");
     ExpectBytes(mhc_down, down_expected, "MLP block mHC down");
     ExpectBytes(mhc_activated, activated_expected, "MLP block mHC activation");
@@ -526,51 +537,55 @@ int main(int argc, char** argv) {
                   "MLP block mHC combine");
     }
 
-    // Hot-cache arithmetic timing. The fixed physical route map is already
-    // resident, as it is after Rust completes its coherent top-k handoff.
-    // This deliberately excludes CPU scheduling and NVMe miss service.
-    route.route_weights = static_cast<const float*>(gate_weights);
-    cudaEvent_t begin;
-    cudaEvent_t end;
-    CudaOk(cudaEventCreate(&begin));
-    CudaOk(cudaEventCreate(&end));
-    constexpr int kIterations = 100;
-    CudaOk(cudaEventRecord(begin));
-    for (int iteration = 0; iteration < kIterations; ++iteration) {
-      if (with_mhc)
-        assert(sparkserve_mhc_mix_launch(&caps, &mhc).code ==
+    if (benchmark) {
+      // Hot-cache arithmetic timing. The fixed physical route map is already
+      // resident, as it is after Rust completes its coherent top-k handoff.
+      // This deliberately excludes CPU scheduling and NVMe miss service.
+      route.route_weights = static_cast<const float*>(gate_weights);
+      cudaEvent_t begin;
+      cudaEvent_t end;
+      CudaOk(cudaEventCreate(&begin));
+      CudaOk(cudaEventCreate(&end));
+      constexpr int kIterations = 100;
+      CudaOk(cudaEventRecord(begin));
+      for (int iteration = 0; iteration < kIterations; ++iteration) {
+        if (with_mhc)
+          assert(sparkserve_mhc_mix_launch(&caps, &mhc).code ==
+                 SPARKSERVE_STATUS_OK);
+        assert(sparkserve_moe_gate_launch(&caps, &gate).code ==
                SPARKSERVE_STATUS_OK);
-      assert(sparkserve_moe_gate_launch(&caps, &gate).code ==
-             SPARKSERVE_STATUS_OK);
-      assert(sparkserve_moe_route_dispatch(&caps, &route).code ==
-             SPARKSERVE_STATUS_OK);
-      assert(sparkserve_segmented_nvfp4_quantize_launch(&caps, &quantize).code ==
-             SPARKSERVE_STATUS_OK);
-      assert(sparkserve_grouped_nvfp4_launch(&caps, &gateup_args).code ==
-             SPARKSERVE_STATUS_OK);
-      assert(sparkserve_segmented_silu_nvfp4_launch(&caps, &activation).code ==
-             SPARKSERVE_STATUS_OK);
-      assert(sparkserve_grouped_nvfp4_launch(&caps, &down_args).code ==
-             SPARKSERVE_STATUS_OK);
-      assert(sparkserve_moe_route_finalize(&caps, &route).code ==
-             SPARKSERVE_STATUS_OK);
-      assert(sparkserve_shared_expert_launch(&caps, &shared).code ==
-             SPARKSERVE_STATUS_OK);
-      assert(sparkserve_moe_join_launch(&caps, &join).code ==
-             SPARKSERVE_STATUS_OK);
-      if (with_mhc)
-        assert(sparkserve_mhc_combine_launch(&caps, &mhc).code ==
+        assert(sparkserve_moe_route_dispatch(&caps, &route).code ==
                SPARKSERVE_STATUS_OK);
+        assert(
+            sparkserve_segmented_nvfp4_quantize_launch(&caps, &quantize).code ==
+            SPARKSERVE_STATUS_OK);
+        assert(sparkserve_grouped_nvfp4_launch(&caps, &gateup_args).code ==
+               SPARKSERVE_STATUS_OK);
+        assert(
+            sparkserve_segmented_silu_nvfp4_launch(&caps, &activation).code ==
+            SPARKSERVE_STATUS_OK);
+        assert(sparkserve_grouped_nvfp4_launch(&caps, &down_args).code ==
+               SPARKSERVE_STATUS_OK);
+        assert(sparkserve_moe_route_finalize(&caps, &route).code ==
+               SPARKSERVE_STATUS_OK);
+        assert(sparkserve_shared_expert_launch(&caps, &shared).code ==
+               SPARKSERVE_STATUS_OK);
+        assert(sparkserve_moe_join_launch(&caps, &join).code ==
+               SPARKSERVE_STATUS_OK);
+        if (with_mhc)
+          assert(sparkserve_mhc_combine_launch(&caps, &mhc).code ==
+                 SPARKSERVE_STATUS_OK);
+      }
+      CudaOk(cudaEventRecord(end));
+      CudaOk(cudaEventSynchronize(end));
+      float elapsed_ms = 0.0F;
+      CudaOk(cudaEventElapsedTime(&elapsed_ms, begin, end));
+      std::cout << (with_mhc ? "one-token hot-cache MLP half-layer mean: "
+                             : "joined one-token hot-cache MoE mean: ")
+                << elapsed_ms * 1000.0F / kIterations << " us\n";
+      CudaOk(cudaEventDestroy(end));
+      CudaOk(cudaEventDestroy(begin));
     }
-    CudaOk(cudaEventRecord(end));
-    CudaOk(cudaEventSynchronize(end));
-    float elapsed_ms = 0.0F;
-    CudaOk(cudaEventElapsedTime(&elapsed_ms, begin, end));
-    std::cout << (with_mhc ? "one-token hot-cache MLP half-layer mean: "
-                           : "joined one-token hot-cache MoE mean: ")
-              << elapsed_ms * 1000.0F / kIterations << " us\n";
-    CudaOk(cudaEventDestroy(end));
-    CudaOk(cudaEventDestroy(begin));
 
     CudaOk(cudaFree(shared_ungated));
     CudaOk(cudaFree(shared_activated));
@@ -595,7 +610,7 @@ int main(int argc, char** argv) {
     CudaOk(cudaFree(mhc_up_weight));
     CudaOk(cudaFree(mhc_down_weight));
     CudaOk(cudaFree(mhc_norm_weight));
-    CudaOk(cudaFree(mhc_hyper_input));
+    if (owns_mhc_hyper_input) CudaOk(cudaFree(mhc_hyper_input));
   }
 
   CudaOk(cudaFree(float_workspace));
@@ -622,3 +637,10 @@ int main(int argc, char** argv) {
   CudaOk(cudaFree(token_input));
   return 0;
 }
+
+#ifndef SPARKSERVE_FIXTURE_LIBRARY
+int main(int argc, char** argv) {
+  assert(argc == 2);
+  return SparkServeRunQwenMoeFixture(argv[1], nullptr, true);
+}
+#endif

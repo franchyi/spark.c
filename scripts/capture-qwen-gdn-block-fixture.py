@@ -29,7 +29,6 @@ SGLANG_REVISION = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
 FLASHINFER_REVISION = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
 PREFIX = "model.language_model.layers.0"
 SHARD = "model-bf16-00001.safetensors"
-TOKENS = 1
 HC = 4
 HIDDEN = 2560
 LOWRANK = 320
@@ -60,7 +59,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, default=Path("/model"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--tokens", type=int, choices=(1, 2, 4, 8, 16), default=1)
     args = parser.parse_args()
+    tokens = args.tokens
     if not torch.cuda.is_available():
         raise SystemExit("Qwen GDN fixture capture requires CUDA")
     props = torch.cuda.get_device_properties(0)
@@ -107,7 +108,7 @@ def main() -> None:
 
     generator = torch.Generator(device="cpu").manual_seed(0x6D4E10)
     hyper_input = (
-        torch.randn(TOKENS, HC * HIDDEN, generator=generator, dtype=torch.float32)
+        torch.randn(tokens, HC * HIDDEN, generator=generator, dtype=torch.float32)
         * 0.2
     ).to(torch.bfloat16)
     hyper_gpu = hyper_input.cuda()
@@ -119,8 +120,8 @@ def main() -> None:
     mhc_activated = F.silu(mhc_down / HC)
     mhc_up = F.linear(mhc_activated, weights["mhc_up_weight"].cuda())
     mhc_weighted = torch.sigmoid(mhc_up).reshape(
-        TOKENS, HC, HIDDEN
-    ) * mhc_normed.reshape(TOKENS, HC, HIDDEN)
+        tokens, HC, HIDDEN
+    ) * mhc_normed.reshape(tokens, HC, HIDDEN)
     mixed_hidden = mhc_weighted.mean(dim=1).to(torch.bfloat16)
 
     projected_qkv = F.linear(mixed_hidden, weights["in_proj_qkv_weight"].cuda())
@@ -134,15 +135,27 @@ def main() -> None:
     conv_state = conv_state_before.cuda()
     state_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
     conv_weight_view = weights["conv_weight"].view(CONV_WIDTH, CONV_KERNEL)
-    convolved_qkv = causal_conv1d_update(
-        projected_qkv,
-        conv_state,
-        conv_weight_view.cuda(),
-        activation="silu",
-        conv_state_indices=state_indices,
+    convolved_qkv = torch.cat(
+        [
+            causal_conv1d_update(
+                projected_qkv[token : token + 1],
+                conv_state,
+                conv_weight_view.cuda(),
+                activation="silu",
+                conv_state_indices=state_indices,
+            )
+            for token in range(tokens)
+        ],
+        dim=0,
     )
     query, key, value = convolved_qkv.split(
         [QK_WIDTH, QK_WIDTH, VALUE_WIDTH], dim=-1
+    )
+    # The native short-prefill convolution writes the three contiguous planes
+    # required by the pinned FlashInfer AOT ABI. Preserve both that ABI boundary
+    # and the logical SGLang result in one deterministic payload.
+    convolved_qkv_packed = torch.cat(
+        [query.contiguous().flatten(), key.contiguous().flatten(), value.contiguous().flatten()]
     )
 
     temporal_state_before = (
@@ -158,23 +171,36 @@ def main() -> None:
     ).to(torch.bfloat16)
     temporal_state = temporal_state_before.cuda()
 
-    from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+    from flashinfer.gdn_kernels import gdn_decode_bf16_state
 
-    core_output, _ = gated_delta_rule_decode_pretranspose(
-        q=query.reshape(TOKENS, 1, QK_HEADS, HEAD_DIM),
-        k=key.reshape(TOKENS, 1, QK_HEADS, HEAD_DIM),
-        v=value.reshape(TOKENS, 1, VALUE_HEADS, HEAD_DIM),
-        state=None,
-        A_log=weights["a_log"].cuda().float(),
-        a=projected_a.reshape(TOKENS, 1, VALUE_HEADS),
-        dt_bias=weights["dt_bias"].cuda(),
-        b=projected_b.reshape(TOKENS, 1, VALUE_HEADS),
-        use_qk_l2norm=True,
-        initial_state=temporal_state,
-        initial_state_indices=state_indices,
+    q = query.contiguous().reshape(1, tokens, QK_HEADS, HEAD_DIM)
+    k = key.contiguous().reshape(1, tokens, QK_HEADS, HEAD_DIM)
+    v = value.contiguous().reshape(1, tokens, VALUE_HEADS, HEAD_DIM)
+    gate_a = projected_a.reshape(1, tokens, VALUE_HEADS)
+    gate_b = projected_b.reshape(1, tokens, VALUE_HEADS)
+    core_output = torch.empty_like(v)
+    recurrence = (
+        gdn_decode_bf16_state.gated_delta_rule
+        if tokens == 1
+        else gdn_decode_bf16_state.gated_delta_rule_mtp
     )
-    core_flat = core_output.reshape(TOKENS * VALUE_HEADS, HEAD_DIM)
-    z_flat = projected_z.reshape(TOKENS * VALUE_HEADS, HEAD_DIM)
+    recurrence(
+        A_log=weights["a_log"].cuda().float(),
+        a=gate_a,
+        dt_bias=weights["dt_bias"].cuda(),
+        q=q,
+        k=k,
+        v=v,
+        b=gate_b,
+        initial_state_source=temporal_state,
+        initial_state_indices=state_indices,
+        output=core_output,
+        use_qk_l2norm_in_kernel=True,
+        scale=1.0 / HEAD_DIM**0.5,
+    )
+    core_output = core_output.reshape(tokens, VALUE_HEADS, HEAD_DIM)
+    core_flat = core_output.reshape(tokens * VALUE_HEADS, HEAD_DIM)
+    z_flat = projected_z.reshape(tokens * VALUE_HEADS, HEAD_DIM)
     gated_norm = rms_norm_gated(
         x=core_flat,
         weight=weights["gated_norm_weight"].cuda(),
@@ -185,7 +211,7 @@ def main() -> None:
         norm_before_gate=True,
         is_rms_norm=True,
         activation="sigmoid",
-    ).reshape(TOKENS, VALUE_WIDTH)
+    ).reshape(tokens, VALUE_WIDTH)
     attention_output = F.linear(gated_norm, weights["out_proj_weight"].cuda())
     combined = hc_combine(
         attention_output,
@@ -211,7 +237,7 @@ def main() -> None:
         "projected_a_bf16.bin": projected_a,
         "conv_state_before_bf16.bin": conv_state_before,
         "conv_state_after_bf16.bin": conv_state,
-        "convolved_qkv_bf16.bin": convolved_qkv,
+        "convolved_qkv_bf16.bin": convolved_qkv_packed,
         "temporal_state_before_bf16.bin": temporal_state_before,
         "temporal_state_after_bf16.bin": temporal_state,
         "gdn_core_output_bf16.bin": core_output,
@@ -237,7 +263,7 @@ def main() -> None:
         "flashinfer_revision": FLASHINFER_REVISION,
         "layer": 0,
         "shape": {
-            "tokens": TOKENS,
+            "tokens": tokens,
             "hc": HC,
             "hidden": HIDDEN,
             "lowrank": LOWRANK,

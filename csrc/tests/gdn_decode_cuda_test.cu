@@ -149,7 +149,7 @@ int main() {
       a_log_device,                     dt_bias_device,
       state_device,                     state_index_device,
       output_device,                    scale,
-      0,                                nullptr};
+      1,                                nullptr};
   assert(sparkserve_gdn_decode_launch(&caps, &args).code ==
          SPARKSERVE_STATUS_OK);
   CheckCuda(cudaDeviceSynchronize());

@@ -83,6 +83,28 @@
           "role": "gguf_shard"
         }
       ]
+    },
+    {
+      "id": "glm53-flash-ds4-q2",
+      "repo": "antirez/glm-5.3-flash-gguf",
+      "revision": "d0d6394cad1046c6d8ad87fa9b0939b4760cb94f",
+      "architecture": "GLM5NextForConditionalGeneration",
+      "format": "gguf",
+      "quantization": "DS4-Q2-IQ2_XXS-Q2_K",
+      "inventory": "complete_checkpoint",
+      "checkpoint_bytes": 96505816384,
+      "storage": {
+        "resident_bytes": 96505816384,
+        "paged_tensor_class": "none"
+      },
+      "files": [
+        {
+          "path": "GLM-5.3-Flash-Q2.gguf",
+          "size": 96505816384,
+          "sha256": "e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32",
+          "role": "gguf_checkpoint"
+        }
+      ]
     }
   ]
 }

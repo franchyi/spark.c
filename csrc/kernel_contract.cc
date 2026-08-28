@@ -257,6 +257,14 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("mHC backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_CUBLAS_GDN_BLOCK:
       return Invalid("GDN block backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_LLAMA_GGML_QUANT_MMVQ:
+      return Invalid("GGML quant MMVQ backend cannot serve an NVFP4 dense plan");
+    case SPARKSERVE_BACKEND_LLAMA_GLM_KDA:
+      return Invalid("GLM KDA backend cannot serve an NVFP4 dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_GLM_KPOOL:
+      return Invalid("GLM KPool backend cannot serve an NVFP4 dense plan");
+    case SPARKSERVE_BACKEND_DEEPGEMM_GLM_PAGED_MQA:
+      return Invalid("GLM paged-MQA backend cannot serve an NVFP4 dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1384,7 +1392,7 @@ extern "C" SparkServeStatus sparkserve_qsa_topk_validate(
     return Invalid("QSA top-k matrix shape is invalid");
   }
   if (plan->topk != 512) {
-    return Unsupported("Qwen3.8 Flash-Next QSA requires block top-k 512");
+    return Unsupported("pooled sparse attention requires block top-k 512");
   }
   if (plan->input_dtype != SPARKSERVE_DTYPE_F32 ||
       plan->output_dtype != SPARKSERVE_DTYPE_INT32) {
@@ -1422,7 +1430,7 @@ extern "C" SparkServeStatus sparkserve_qsa_topk_query(
   info->backend = SPARKSERVE_BACKEND_SGLANG_QSA_TOPK;
   info->workspace_bytes = 0;
   info->available = 0;
-  info->name = "sglang-qsa-radix-topk-512";
+  info->name = "sglang-pooled-radix-topk-512";
   info->source_revision =
       "sglang@7c66045d71f067c1c5da2b85baad3c47d9a19cb7";
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_TOPK
@@ -1469,7 +1477,7 @@ extern "C" SparkServeStatus sparkserve_qsa_expand_validate(
   }
   if (plan->block_topk != 512 || plan->compress_ratio != 4 ||
       plan->token_topk != 2048 || plan->final_topk != 2051) {
-    return Unsupported("Qwen3.8 Flash-Next QSA expansion geometry is required");
+    return Unsupported("pooled sparse attention expansion geometry is required");
   }
   if (plan->output_dtype != SPARKSERVE_DTYPE_INT32) {
     return Unsupported("QSA expansion output must be INT32");
@@ -1504,7 +1512,7 @@ extern "C" SparkServeStatus sparkserve_qsa_expand_query(
   info->backend = SPARKSERVE_BACKEND_SGLANG_QSA_EXPAND;
   info->workspace_bytes = 0;
   info->available = 0;
-  info->name = "sglang-qsa-block-to-token-expand";
+  info->name = "sglang-pooled-block-to-token-expand";
   info->source_revision =
       "sglang@d91c3682b0b429e4c70df63cd57f819588ce29b0";
 #ifdef SPARKSERVE_WITH_SGLANG_QSA_EXPAND
@@ -1652,7 +1660,8 @@ extern "C" SparkServeStatus sparkserve_qsa_index_prep_validate(
     return Invalid("QSA index-prep state shape is invalid");
   }
   if (plan->num_q_heads != 4 || plan->head_dim != 128 ||
-      plan->rotary_dim != 128 || plan->compress_ratio != 4 ||
+      (plan->rotary_dim != 64 && plan->rotary_dim != 128) ||
+      plan->compress_ratio != 4 ||
       plan->q_heads_padded != 8 ||
       (plan->num_position_axes != 1 && plan->num_position_axes != 3)) {
     return Unsupported("Qwen3.8 Flash-Next QSA index-prep shape is unsupported");
@@ -2026,6 +2035,11 @@ extern "C" SparkServeStatus sparkserve_gdn_decode_launch(
   if (args_header.code != SPARKSERVE_STATUS_OK) return args_header;
   SparkServeStatus plan_status = sparkserve_gdn_decode_validate(&args->plan);
   if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (args->sequence_length != 1 && args->sequence_length != 2 &&
+      args->sequence_length != 4 && args->sequence_length != 8 &&
+      args->sequence_length != 16) {
+    return Invalid("GDN sequence length must use an AOT bucket 1/2/4/8/16");
+  }
   if (args->q == nullptr || args->k == nullptr || args->v == nullptr ||
       args->a == nullptr || args->b == nullptr || args->a_log == nullptr ||
       args->dt_bias == nullptr || args->state_pool == nullptr ||
@@ -2046,6 +2060,10 @@ extern "C" SparkServeStatus sparkserve_gdn_decode_launch(
           : args->plan.requested_backend;
   if (backend == SPARKSERVE_GDN_BACKEND_FLASHINFER) {
 #ifdef SPARKSERVE_WITH_FLASHINFER_GDN_AOT
+#ifndef SPARKSERVE_WITH_FLASHINFER_GDN_PREFILL_AOT
+    if (args->sequence_length != 1)
+      return Unavailable("FlashInfer GDN short-prefill AOT artifacts are not linked");
+#endif
     return sparkserve_gdn_decode_flashinfer_aot_launch(args);
 #else
     return Unavailable("the FlashInfer GDN AOT artifact is not linked");
@@ -2053,6 +2071,8 @@ extern "C" SparkServeStatus sparkserve_gdn_decode_launch(
   }
   if (backend != SPARKSERVE_GDN_BACKEND_LOCAL_CUDA)
     return Invalid("unknown resolved GDN decode backend");
+  if (args->sequence_length != 1)
+    return Unsupported("local CUDA GDN supports decode T=1 only");
 #ifdef SPARKSERVE_WITH_CUDA
   return sparkserve_gdn_decode_cuda_launch(args);
 #else

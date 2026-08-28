@@ -1,7 +1,7 @@
 // Adapted from SGLang's Apache-2.0 qsa_indexer.cuh at commit
 // 7c66045d71f067c1c5da2b85baad3c47d9a19cb7. The locked Qwen3.8
-// Flash-Next specialization is BF16, head_dim=rotary_dim=128, four query
-// heads, one key head, compression ratio four, and NeoX RoPE. TVM-FFI,
+// Flash-Next specialization is BF16, head_dim=128, four query heads, one key
+// head, compression ratio four, and partial/full NeoX RoPE. TVM-FFI,
 // sgl-kernel containers, framework allocation, and PDL dispatch are removed.
 
 #include "internal/qsa_index_prep_backend.h"
@@ -126,6 +126,7 @@ struct QPrepParams {
   uint64_t positions_stride;
   uint32_t num_position_axes;
   uint32_t q_heads_padded;
+  int rotary_dim;
   float eps;
 };
 
@@ -156,7 +157,7 @@ __global__ __launch_bounds__(128) void QsaQPrepKernel(QPrepParams params) {
           params.qk + qk_row + static_cast<int64_t>(head) * kHeadDim;
       GemmaNormRow(input_row, params.weight, params.eps, shared_rows[warp]);
       ApplyNeoxMrope(shared_rows[warp], output_row, params.cos_sin_cache,
-                     params.axis_map, positions, kHeadDim);
+                     params.axis_map, positions, params.rotary_dim);
     } else {
 #pragma unroll
       for (int item = 0; item < kPerLane; ++item) {
@@ -188,6 +189,7 @@ struct KCompressParams {
   const int32_t* write_locs;
   __nv_bfloat16* compressed_keys;
   uint32_t groups;
+  int rotary_dim;
   float eps;
 };
 
@@ -247,7 +249,7 @@ __global__ __launch_bounds__(128) void QsaKCompressKernel(
       params.compressed_keys +
       static_cast<int64_t>(params.write_locs[group]) * kHeadDim;
   ApplyNeoxMrope(shared_rows[warp], output, params.cos_sin_cache,
-                 params.axis_map, positions, kHeadDim);
+                 params.axis_map, positions, params.rotary_dim);
 }
 
 }  // namespace
@@ -267,6 +269,7 @@ SparkServeStatus sparkserve_sglang_qsa_index_prep_cuda_launch(
       args->positions_stride,
       args->plan.num_position_axes,
       args->plan.q_heads_padded,
+      static_cast<int>(args->plan.rotary_dim),
       args->eps,
   };
   const cudaStream_t stream = static_cast<cudaStream_t>(args->cuda_stream);
@@ -285,6 +288,7 @@ SparkServeStatus sparkserve_sglang_qsa_index_prep_cuda_launch(
         args->write_locs,
         static_cast<__nv_bfloat16*>(args->compressed_keys),
         args->plan.groups,
+        static_cast<int>(args->plan.rotary_dim),
         args->eps,
     };
     const uint32_t blocks = (args->plan.groups + 3) / 4;

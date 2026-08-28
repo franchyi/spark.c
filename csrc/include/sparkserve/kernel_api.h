@@ -83,6 +83,18 @@ typedef enum SparkServeKernelBackend {
   // SGLang/causal-conv1d update, and SGLang FLA gated RMSNorm. The recurrent
   // FlashInfer GDN remains a separate stage so Rust owns state scheduling.
   SPARKSERVE_BACKEND_SGLANG_CUBLAS_GDN_BLOCK = 18,
+  // Pinned llama.cpp/ggml mixed-quant Q8_1-MMVQ arithmetic. SparkServe owns
+  // the GGUF index, fixed scratch, expert cache, paging, and dispatch schedule.
+  SPARKSERVE_BACKEND_LLAMA_GGML_QUANT_MMVQ = 19,
+  // Pinned llama.cpp fused gated-delta-net CUDA arithmetic specialized to
+  // GLM-5.3's KDA=true, head_dim=128 recurrence. Rust owns state and streams.
+  SPARKSERVE_BACKEND_LLAMA_GLM_KDA = 20,
+  // SGLang GLM5Next KPool softmax/Hadamard/FP8 cache compression extracted
+  // behind caller-owned fixed pages.
+  SPARKSERVE_BACKEND_SGLANG_GLM_KPOOL = 21,
+  // SGLang DeepGEMM's exact SM120 FP8 paged-MQA specialization. SparkServe
+  // owns TMA descriptors, pages, schedule storage, streams, and publication.
+  SPARKSERVE_BACKEND_DEEPGEMM_GLM_PAGED_MQA = 22,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -675,8 +687,8 @@ typedef struct SparkServeQsaKvPackPlan {
   uint32_t request_capacity;
   // INT32 elements between rows of req_to_token.
   uint32_t request_stride;
-  // Qwen's final QSA selection width: 2048 sparse positions plus three tail
-  // positions. Invalid tail entries must follow the valid prefix.
+  // Final pooled QSA/DSA selection width: 2048 sparse positions plus three
+  // tail positions. Invalid tail entries must follow the valid prefix.
   uint32_t topk;
   // Page-aligned destination stride. For page size 64 and topk 2051 this is
   // 2112 tokens, matching SGLang's TRT-LLM-gen path.
@@ -760,9 +772,10 @@ typedef struct SparkServeKernelInfo {
   const char* source_revision;
 } SparkServeKernelInfo;
 
-// Single-token Gated Delta Network decode. The first native implementation is
-// deliberately fixed to the Qwen3.8 Flash shape K=V=128 and BF16 recurrent
-// state. Q/K use H heads, V/state use HV heads, and HV must be a multiple of H.
+// Gated Delta Network decode/short-prefill. Sequence length is fixed by an AOT
+// bucket (1/2/4/8/16); longer prompts are decomposed by the Rust scheduler.
+// The native implementation is fixed to the Qwen3.8 Flash shape K=V=128 and
+// BF16 recurrent state. Q/K use H heads, V/state use HV heads.
 typedef struct SparkServeGdnDecodePlan {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -780,11 +793,11 @@ typedef struct SparkServeGdnDecodeArgs {
   uint32_t struct_size;
   uint32_t abi_version;
   SparkServeGdnDecodePlan plan;
-  // BF16 Q/K: [B,H,K]. BF16 V: [B,HV,V].
+  // BF16 Q/K: [B,T,H,K]. BF16 V: [B,T,HV,V].
   const void* q;
   const void* k;
   const void* v;
-  // BF16 input-dependent gates: [B,HV].
+  // BF16 input-dependent gates: [B,T,HV].
   const void* a;
   const void* b;
   // FP32 persistent gate parameters: [HV].
@@ -795,10 +808,10 @@ typedef struct SparkServeGdnDecodeArgs {
   // INT32 slot per batch row. A negative index produces zero output and no
   // state write. Active rows must name distinct slots within one launch.
   const int32_t* state_indices;
-  // BF16 output: [B,HV,V].
+  // BF16 output: [B,T,HV,V].
   void* output;
   float scale;
-  uint32_t reserved;
+  uint32_t sequence_length;
   void* cuda_stream;
 } SparkServeGdnDecodeArgs;
 

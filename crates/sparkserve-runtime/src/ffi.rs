@@ -1,5 +1,6 @@
 use std::ffi::{c_char, c_void};
 
+use crate::gguf::GgmlTensorType;
 use crate::kernel::{
     DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION, SegmentedNvfp4QuantizeSpec,
     SegmentedSiluNvfp4Spec, SiluNvfp4Spec,
@@ -7,6 +8,34 @@ use crate::kernel::{
 use crate::routing::MoeRouteSpec;
 
 pub const FABRIC_ABI_VERSION: u32 = 1;
+pub const GGML_QUANT_ABI_VERSION: u32 = 1;
+pub const GLM_DSA_ABI_VERSION: u32 = 1;
+pub const GLM_KDA_ABI_VERSION: u32 = 1;
+pub const GLM_MQA_ABI_VERSION: u32 = 1;
+pub const GLM_MQA_GB10_SMS: u32 = 48;
+pub const GLM_MQA_SCHEDULE_WORDS: u32 = 98;
+pub const GLM_SPARSE_MLA_ABI_VERSION: u32 = 1;
+pub const GLM_SPARSE_MLA_GB10_SMS: u32 = 48;
+pub const GLM_SPARSE_MLA_PAGE_SIZE: u32 = 64;
+pub const GLM_SPARSE_MLA_HEADS: u32 = 64;
+pub const GLM_SPARSE_MLA_LATENT_DIM: u32 = 512;
+pub const GLM_SPARSE_MLA_PADDED_Q_DIM: u32 = 576;
+pub const GLM_SPARSE_MLA_TOKEN_BYTES: u32 = 656;
+pub const GLM_SPARSE_MLA_HISTORY_TOPK: u32 = 2048;
+pub const GLM_SPARSE_MLA_TAIL_TOPK: u32 = 128;
+pub const GLM_SPARSE_MLA_HISTORY_SPLITS: u32 = 32;
+pub const GLM_SPARSE_MLA_TAIL_SPLITS: u32 = 2;
+pub const GLM_SPARSE_MLA_SELECTION_WIDTH: u32 = 2051;
+pub const QWEN_EXPERT_PACK_ABI_VERSION: u32 = 1;
+pub const QWEN_GDN_AUX_ABI_VERSION: u32 = 1;
+pub const QWEN_QSA_BLOCK_ABI_VERSION: u32 = 1;
+pub const QWEN_PLE_BLOCK_ABI_VERSION: u32 = 1;
+pub const QWEN_DECODE_GLUE_ABI_VERSION: u32 = 1;
+pub const QWEN_EXPERT_CAPACITY: u32 = 16;
+pub const QWEN_W13_WEIGHT_BYTES: u64 = 1_638_400;
+pub const QWEN_W2_WEIGHT_BYTES: u64 = 819_200;
+pub const QWEN_W13_SCALE_BYTES: u64 = 204_800;
+pub const QWEN_W2_SCALE_BYTES: u64 = 102_400;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +78,25 @@ impl CoherentRegionConfig {
             file_offset: 0,
             required_alignment,
             file_path: std::ptr::null(),
+        }
+    }
+
+    pub fn file_read_only(
+        payload_bytes: u64,
+        file_offset: u64,
+        required_alignment: u64,
+        flags: u32,
+        file_path: *const c_char,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: FABRIC_ABI_VERSION,
+            kind: CoherentRegionKind::FileReadOnly as u32,
+            flags,
+            payload_bytes,
+            file_offset,
+            required_alignment,
+            file_path,
         }
     }
 }
@@ -112,6 +160,139 @@ pub struct CudaBlas {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenExpertPackArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub fills: u32,
+    pub capacity: u32,
+    pub destination_slots: *const u32,
+    pub gate_weights: *const *const u8,
+    pub up_weights: *const *const u8,
+    pub down_weights: *const *const u8,
+    pub gate_weight_scales: *const *const u8,
+    pub up_weight_scales: *const *const u8,
+    pub down_weight_scales: *const *const u8,
+    pub gate_input_scales: *const *const f32,
+    pub gate_weight_scale_2: *const *const f32,
+    pub down_input_scales: *const *const f32,
+    pub down_weight_scale_2: *const *const f32,
+    pub w13_weights: *mut u8,
+    pub w2_weights: *mut u8,
+    pub w13_scales: *mut u8,
+    pub w2_scales: *mut u8,
+    pub w13_input_global_scales: *mut f32,
+    pub w13_alpha: *mut f32,
+    pub w2_input_global_scales: *mut f32,
+    pub w2_alpha: *mut f32,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenBf16ToF32Args {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub input_bf16: *const u16,
+    pub output_f32: *mut f32,
+    pub elements: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenQsaProjectArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub tokens: u32,
+    pub rotary_dim: u32,
+    pub cos_sin_stride: u64,
+    pub hidden_states: *const c_void,
+    pub q_weight: *const c_void,
+    pub k_weight: *const c_void,
+    pub v_weight: *const c_void,
+    pub index_qk_weight: *const c_void,
+    pub q_norm_weight: *const c_void,
+    pub k_norm_weight: *const c_void,
+    pub cos_sin_cache: *const f32,
+    pub positions: *const i64,
+    pub projected_q: *mut c_void,
+    pub projected_k: *mut c_void,
+    pub query: *mut c_void,
+    pub key: *mut c_void,
+    pub value: *mut c_void,
+    pub gate: *mut c_void,
+    pub index_qk: *mut c_void,
+    pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenQsaFinishArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub tokens: u32,
+    pub reserved: u32,
+    pub attention_output: *const c_void,
+    pub gate: *const c_void,
+    pub out_weight: *const c_void,
+    pub gated_output: *mut c_void,
+    pub output: *mut c_void,
+    pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenPleBlockArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub tokens: u32,
+    pub reserved: u32,
+    pub hidden_states: *const c_void,
+    pub embedding: *const c_void,
+    pub key_weight: *const c_void,
+    pub value_weight: *const c_void,
+    pub norm_key_weight: *const c_void,
+    pub norm_query_weight: *const c_void,
+    pub norm_conv_weight: *const c_void,
+    pub conv_weight: *const c_void,
+    pub conv_state: *mut c_void,
+    pub key_scratch: *mut c_void,
+    pub value_scratch: *mut c_void,
+    pub gated_scratch: *mut c_void,
+    pub normed_scratch: *mut c_void,
+    pub output: *mut c_void,
+    pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenDecodeGlueArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub input: *const c_void,
+    pub output: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenLmHeadArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub vocabulary: u32,
+    pub hidden_size: u32,
+    pub hidden_states: *const c_void,
+    pub weight: *const c_void,
+    pub logits: *mut f32,
+    pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCaps {
     pub struct_size: u32,
@@ -129,6 +310,812 @@ impl DeviceCaps {
             sm: 121,
             supports_fp4_tensor_cores: 1,
             workspace_limit_bytes,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GgmlQuantDenseArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub quant_type: u32,
+    pub input: *const f32,
+    pub weights: *const c_void,
+    pub output: *mut f32,
+    pub q8_scratch: *mut c_void,
+    pub q8_scratch_bytes: u64,
+    pub vectors: u64,
+    pub rows: u64,
+    pub k: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GgmlQuantDenseArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        quant_type: GgmlTensorType,
+        input: *const f32,
+        weights: *const c_void,
+        output: *mut f32,
+        q8_scratch: *mut c_void,
+        q8_scratch_bytes: u64,
+        vectors: u64,
+        rows: u64,
+        k: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GGML_QUANT_ABI_VERSION,
+            quant_type: quant_type as u32,
+            input,
+            weights,
+            output,
+            q8_scratch,
+            q8_scratch_bytes,
+            vectors,
+            rows,
+            k,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GgmlQuantRoutedArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub quant_type: u32,
+    pub input: *const f32,
+    pub weights: *const c_void,
+    pub expert_ids: *const i32,
+    pub output: *mut f32,
+    pub q8_scratch: *mut c_void,
+    pub q8_scratch_bytes: u64,
+    pub tokens: u64,
+    pub top_k: u64,
+    pub experts: u64,
+    pub rows: u64,
+    pub k: u64,
+    pub weight_slot_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GgmlQuantRoutedArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        quant_type: GgmlTensorType,
+        input: *const f32,
+        weights: *const c_void,
+        expert_ids: *const i32,
+        output: *mut f32,
+        q8_scratch: *mut c_void,
+        q8_scratch_bytes: u64,
+        tokens: u64,
+        top_k: u64,
+        experts: u64,
+        rows: u64,
+        k: u64,
+        weight_slot_stride_bytes: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GGML_QUANT_ABI_VERSION,
+            quant_type: quant_type as u32,
+            input,
+            weights,
+            expert_ids,
+            output,
+            q8_scratch,
+            q8_scratch_bytes,
+            tokens,
+            top_k,
+            experts,
+            rows,
+            k,
+            weight_slot_stride_bytes,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmKdaArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub head_dim: u32,
+    pub heads: u32,
+    pub q: *const f32,
+    pub k: *const f32,
+    pub v: *const f32,
+    pub log_decay: *const f32,
+    pub beta: *const f32,
+    pub state_input: *const f32,
+    pub output: *mut f32,
+    pub state_output: *mut f32,
+    pub tokens: u64,
+    pub sequences: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmKdaArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        head_dim: u32,
+        heads: u32,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        log_decay: *const f32,
+        beta: *const f32,
+        state_input: *const f32,
+        output: *mut f32,
+        state_output: *mut f32,
+        tokens: u64,
+        sequences: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_KDA_ABI_VERSION,
+            head_dim,
+            heads,
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            state_input,
+            output,
+            state_output,
+            tokens,
+            sequences,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmKdaConvArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub channels: u32,
+    pub kernel_width: u32,
+    pub projected: *const f32,
+    pub weight: *const f32,
+    pub state_input: *const f32,
+    pub output: *mut f32,
+    pub state_output: *mut f32,
+    pub tokens: u64,
+    pub sequences: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmKdaConvArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        channels: u32,
+        projected: *const f32,
+        weight: *const f32,
+        state_input: *const f32,
+        output: *mut f32,
+        state_output: *mut f32,
+        tokens: u64,
+        sequences: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_KDA_ABI_VERSION,
+            channels,
+            kernel_width: 4,
+            projected,
+            weight,
+            state_input,
+            output,
+            state_output,
+            tokens,
+            sequences,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmKdaPrepareArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub head_dim: u32,
+    pub heads: u32,
+    pub q: *const f32,
+    pub k: *const f32,
+    pub dt: *const f32,
+    pub beta_logits: *const f32,
+    pub a: *const f32,
+    pub dt_bias: *const f32,
+    pub normalized_q: *mut f32,
+    pub normalized_k: *mut f32,
+    pub log_decay: *mut f32,
+    pub beta: *mut f32,
+    pub l2_epsilon: f32,
+    pub reserved: u32,
+    pub tokens: u64,
+    pub sequences: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmKdaPrepareArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        head_dim: u32,
+        heads: u32,
+        q: *const f32,
+        k: *const f32,
+        dt: *const f32,
+        beta_logits: *const f32,
+        a: *const f32,
+        dt_bias: *const f32,
+        normalized_q: *mut f32,
+        normalized_k: *mut f32,
+        log_decay: *mut f32,
+        beta: *mut f32,
+        l2_epsilon: f32,
+        tokens: u64,
+        sequences: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_KDA_ABI_VERSION,
+            head_dim,
+            heads,
+            q,
+            k,
+            dt,
+            beta_logits,
+            a,
+            dt_bias,
+            normalized_q,
+            normalized_k,
+            log_decay,
+            beta,
+            l2_epsilon,
+            reserved: 0,
+            tokens,
+            sequences,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmKdaGateArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub head_dim: u32,
+    pub heads: u32,
+    pub input: *const f32,
+    pub gate: *const f32,
+    pub norm_weight: *const f32,
+    pub output: *mut f32,
+    pub rms_epsilon: f32,
+    pub reserved: u32,
+    pub tokens: u64,
+    pub sequences: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmKdaGateArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        head_dim: u32,
+        heads: u32,
+        input: *const f32,
+        gate: *const f32,
+        norm_weight: *const f32,
+        output: *mut f32,
+        rms_epsilon: f32,
+        tokens: u64,
+        sequences: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_KDA_ABI_VERSION,
+            head_dim,
+            heads,
+            input,
+            gate,
+            norm_weight,
+            output,
+            rms_epsilon,
+            reserved: 0,
+            tokens,
+            sequences,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmKPoolCompressArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub rows: u32,
+    pub pool_size: u32,
+    pub head_dim: u32,
+    pub page_size: u32,
+    pub round_scale: u32,
+    pub reserved: u32,
+    pub slot_key_bf16: *const u16,
+    pub slot_score_bf16: *const u16,
+    pub ape: *const f32,
+    pub locations: *const i64,
+    pub key_cache_fp8: *mut u8,
+    pub scale_cache: *mut f32,
+    pub key_page_stride_bytes: u64,
+    pub scale_page_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmKPoolCompressArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rows: u32,
+        slot_key_bf16: *const u16,
+        slot_score_bf16: *const u16,
+        ape: *const f32,
+        locations: *const i64,
+        key_cache_fp8: *mut u8,
+        scale_cache: *mut f32,
+        key_page_stride_bytes: u64,
+        scale_page_stride_bytes: u64,
+        round_scale: bool,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_DSA_ABI_VERSION,
+            rows,
+            pool_size: 4,
+            head_dim: 128,
+            page_size: 64,
+            round_scale: u32::from(round_scale),
+            reserved: 0,
+            slot_key_bf16,
+            slot_score_bf16,
+            ape,
+            locations,
+            key_cache_fp8,
+            scale_cache,
+            key_page_stride_bytes,
+            scale_page_stride_bytes,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmKPoolDecodeArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub rows: u32,
+    pub request_capacity: u32,
+    pub tail_size: u32,
+    pub head_dim: u32,
+    pub pool_size: u32,
+    pub page_size: u32,
+    pub slots_per_page: u32,
+    pub round_scale: u32,
+    pub tail_key_bf16: *mut u16,
+    pub tail_score_bf16: *mut u16,
+    pub key_bf16: *const u16,
+    pub score_bf16: *const u16,
+    pub ape: *const f32,
+    pub block_tables: *const i32,
+    pub request_indices: *const i32,
+    pub positions: *const i64,
+    pub sequence_lengths: *const i32,
+    pub output_cache_locations: *const i64,
+    pub key_cache_fp8: *mut u8,
+    pub scale_cache: *mut f32,
+    pub block_table_stride: u64,
+    pub key_page_stride_bytes: u64,
+    pub scale_page_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmIndexerPrepArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub query_fp32: *const f32,
+    pub key_fp32: *const f32,
+    pub key_norm_weight: *const f32,
+    pub key_norm_bias: *const f32,
+    pub head_gate_fp32: *const f32,
+    pub query_fp8: *mut u8,
+    pub query_scale: *mut f32,
+    pub key_bf16: *mut u16,
+    pub logit_weights: *mut f32,
+    pub tokens: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    pub layer_norm_epsilon: f32,
+    pub round_scale: u32,
+    pub reserved: u32,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmIndexerPrepArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        query_fp32: *const f32,
+        key_fp32: *const f32,
+        key_norm_weight: *const f32,
+        key_norm_bias: *const f32,
+        head_gate_fp32: *const f32,
+        query_fp8: *mut u8,
+        query_scale: *mut f32,
+        key_bf16: *mut u16,
+        logit_weights: *mut f32,
+        tokens: u32,
+        layer_norm_epsilon: f32,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_DSA_ABI_VERSION,
+            query_fp32,
+            key_fp32,
+            key_norm_weight,
+            key_norm_bias,
+            head_gate_fp32,
+            query_fp8,
+            query_scale,
+            key_bf16,
+            logit_weights,
+            tokens,
+            heads: 32,
+            head_dim: 128,
+            layer_norm_epsilon,
+            round_scale: 1,
+            reserved: 0,
+            cuda_stream,
+        }
+    }
+}
+
+impl GlmKPoolDecodeArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rows: u32,
+        request_capacity: u32,
+        tail_key_bf16: *mut u16,
+        tail_score_bf16: *mut u16,
+        key_bf16: *const u16,
+        score_bf16: *const u16,
+        ape: *const f32,
+        block_tables: *const i32,
+        request_indices: *const i32,
+        positions: *const i64,
+        sequence_lengths: *const i32,
+        output_cache_locations: *const i64,
+        key_cache_fp8: *mut u8,
+        scale_cache: *mut f32,
+        block_table_stride: u64,
+        key_page_stride_bytes: u64,
+        scale_page_stride_bytes: u64,
+        round_scale: bool,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_DSA_ABI_VERSION,
+            rows,
+            request_capacity,
+            tail_size: 4,
+            head_dim: 128,
+            pool_size: 4,
+            page_size: 64,
+            slots_per_page: 64,
+            round_scale: u32::from(round_scale),
+            tail_key_bf16,
+            tail_score_bf16,
+            key_bf16,
+            score_bf16,
+            ape,
+            block_tables,
+            request_indices,
+            positions,
+            sequence_lengths,
+            output_cache_locations,
+            key_cache_fp8,
+            scale_cache,
+            block_table_stride,
+            key_page_stride_bytes,
+            scale_page_stride_bytes,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmPagedMqaArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub batch_size: u32,
+    pub num_heads: u32,
+    pub head_dim: u32,
+    pub page_size: u32,
+    pub num_pages: u32,
+    pub num_sms: u32,
+    pub max_context_len: u32,
+    pub logits_stride: u32,
+    pub block_table_stride: u32,
+    pub reserved: u32,
+    pub query_fp8: *const u8,
+    pub key_cache_fp8: *const u8,
+    pub scale_cache: *const f32,
+    pub logit_weights: *const f32,
+    pub context_lens: *const u32,
+    pub logits: *mut f32,
+    pub block_tables: *const u32,
+    pub schedule_metadata: *mut u32,
+    pub key_page_stride_bytes: u64,
+    pub scale_page_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmPagedMqaArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn gb10_decode(
+        batch_size: u32,
+        num_pages: u32,
+        max_context_len: u32,
+        logits_stride: u32,
+        block_table_stride: u32,
+        query_fp8: *const u8,
+        key_cache_fp8: *const u8,
+        scale_cache: *const f32,
+        logit_weights: *const f32,
+        context_lens: *const u32,
+        logits: *mut f32,
+        block_tables: *const u32,
+        schedule_metadata: *mut u32,
+        key_page_stride_bytes: u64,
+        scale_page_stride_bytes: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_MQA_ABI_VERSION,
+            batch_size,
+            num_heads: 32,
+            head_dim: 128,
+            page_size: 64,
+            num_pages,
+            num_sms: GLM_MQA_GB10_SMS,
+            max_context_len,
+            logits_stride,
+            block_table_stride,
+            reserved: 0,
+            query_fp8,
+            key_cache_fp8,
+            scale_cache,
+            logit_weights,
+            context_lens,
+            logits,
+            block_tables,
+            schedule_metadata,
+            key_page_stride_bytes,
+            scale_page_stride_bytes,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmSparseMlaPackKvArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub tokens: u32,
+    pub page_size: u32,
+    pub latent_dim: u32,
+    pub quant_group: u32,
+    pub num_pages: u32,
+    pub reserved: u32,
+    pub input_bf16: *const u16,
+    pub locations: *const i32,
+    pub cache: *mut u8,
+    pub page_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmSparseMlaPackKvArgs {
+    pub fn no_rope(
+        tokens: u32,
+        num_pages: u32,
+        input_bf16: *const u16,
+        locations: *const i32,
+        cache: *mut u8,
+        page_stride_bytes: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_SPARSE_MLA_ABI_VERSION,
+            tokens,
+            page_size: GLM_SPARSE_MLA_PAGE_SIZE,
+            latent_dim: GLM_SPARSE_MLA_LATENT_DIM,
+            quant_group: 128,
+            num_pages,
+            reserved: 0,
+            input_bf16,
+            locations,
+            cache,
+            page_stride_bytes,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmSparseMlaPadQueryArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub batch_size: u32,
+    pub num_heads: u32,
+    pub input_dim: u32,
+    pub padded_dim: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub input_bf16: *const u16,
+    pub output_bf16: *mut u16,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmSparseMlaPadQueryArgs {
+    pub fn no_rope(
+        batch_size: u32,
+        input_bf16: *const u16,
+        output_bf16: *mut u16,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_SPARSE_MLA_ABI_VERSION,
+            batch_size,
+            num_heads: GLM_SPARSE_MLA_HEADS,
+            input_dim: GLM_SPARSE_MLA_LATENT_DIM,
+            padded_dim: GLM_SPARSE_MLA_PADDED_Q_DIM,
+            reserved0: 0,
+            reserved1: 0,
+            input_bf16,
+            output_bf16,
+            cuda_stream,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlmSparseMlaDecodeArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub batch_size: u32,
+    pub num_heads: u32,
+    pub query_dim: u32,
+    pub value_dim: u32,
+    pub page_size: u32,
+    pub history_topk: u32,
+    pub tail_topk: u32,
+    pub history_splits: u32,
+    pub tail_splits: u32,
+    pub num_pages: u32,
+    pub num_sms: u32,
+    pub selected_stride: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub query_bf16: *const u16,
+    pub cache: *const u8,
+    pub selected_indices: *const i32,
+    pub query_positions: *const i64,
+    pub sequence_lengths: *const i32,
+    pub history_indices: *mut i32,
+    pub tail_indices: *mut i32,
+    pub history_lengths: *mut i32,
+    pub tail_lengths: *mut i32,
+    pub history_mid_out_bf16: *mut u16,
+    pub history_mid_lse: *mut f32,
+    pub output_bf16: *mut u16,
+    pub output_lse: *mut f32,
+    pub tail_mid_out_bf16: *mut u16,
+    pub tail_mid_lse: *mut f32,
+    pub tail_output_bf16: *mut u16,
+    pub tail_output_lse: *mut f32,
+    pub page_stride_bytes: u64,
+    pub softmax_scale: f32,
+    pub reserved2: u32,
+    pub cuda_stream: *mut c_void,
+}
+
+impl GlmSparseMlaDecodeArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn gb10_no_rope(
+        batch_size: u32,
+        num_pages: u32,
+        query_bf16: *const u16,
+        cache: *const u8,
+        selected_indices: *const i32,
+        query_positions: *const i64,
+        sequence_lengths: *const i32,
+        history_indices: *mut i32,
+        tail_indices: *mut i32,
+        history_lengths: *mut i32,
+        tail_lengths: *mut i32,
+        history_mid_out_bf16: *mut u16,
+        history_mid_lse: *mut f32,
+        output_bf16: *mut u16,
+        output_lse: *mut f32,
+        tail_mid_out_bf16: *mut u16,
+        tail_mid_lse: *mut f32,
+        tail_output_bf16: *mut u16,
+        tail_output_lse: *mut f32,
+        page_stride_bytes: u64,
+        cuda_stream: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: GLM_SPARSE_MLA_ABI_VERSION,
+            batch_size,
+            num_heads: GLM_SPARSE_MLA_HEADS,
+            query_dim: GLM_SPARSE_MLA_PADDED_Q_DIM,
+            value_dim: GLM_SPARSE_MLA_LATENT_DIM,
+            page_size: GLM_SPARSE_MLA_PAGE_SIZE,
+            history_topk: GLM_SPARSE_MLA_HISTORY_TOPK,
+            tail_topk: GLM_SPARSE_MLA_TAIL_TOPK,
+            history_splits: GLM_SPARSE_MLA_HISTORY_SPLITS,
+            tail_splits: GLM_SPARSE_MLA_TAIL_SPLITS,
+            num_pages,
+            num_sms: GLM_SPARSE_MLA_GB10_SMS,
+            selected_stride: GLM_SPARSE_MLA_SELECTION_WIDTH,
+            reserved0: 0,
+            reserved1: 0,
+            query_bf16,
+            cache,
+            selected_indices,
+            query_positions,
+            sequence_lengths,
+            history_indices,
+            tail_indices,
+            history_lengths,
+            tail_lengths,
+            history_mid_out_bf16,
+            history_mid_lse,
+            output_bf16,
+            output_lse,
+            tail_mid_out_bf16,
+            tail_mid_lse,
+            tail_output_bf16,
+            tail_output_lse,
+            page_stride_bytes,
+            softmax_scale: 1.0 / 16.0,
+            reserved2: 0,
+            cuda_stream,
         }
     }
 }
@@ -769,6 +1756,10 @@ pub struct QsaTopkPlan {
 
 impl QsaTopkPlan {
     pub fn qwen38_flash(rows: u32, columns: u32, input_stride: u64) -> Self {
+        Self::pooled_history(rows, columns, input_stride)
+    }
+
+    pub fn pooled_history(rows: u32, columns: u32, input_stride: u64) -> Self {
         Self {
             struct_size: size_u32::<Self>(),
             abi_version: KERNEL_ABI_VERSION,
@@ -813,6 +1804,10 @@ pub struct QsaExpandPlan {
 
 impl QsaExpandPlan {
     pub fn qwen38_flash(rows: u32) -> Self {
+        Self::pooled_history(rows)
+    }
+
+    pub fn pooled_history(rows: u32) -> Self {
         Self {
             struct_size: size_u32::<Self>(),
             abi_version: KERNEL_ABI_VERSION,
@@ -920,6 +1915,24 @@ impl QsaIndexPrepPlan {
         compressed_slots: u32,
         num_position_axes: u32,
     ) -> Self {
+        Self::qwen38_flash_with_rotary(
+            tokens,
+            groups,
+            state_slots,
+            compressed_slots,
+            num_position_axes,
+            128,
+        )
+    }
+
+    pub fn qwen38_flash_with_rotary(
+        tokens: u32,
+        groups: u32,
+        state_slots: u32,
+        compressed_slots: u32,
+        num_position_axes: u32,
+        rotary_dim: u32,
+    ) -> Self {
         Self {
             struct_size: size_u32::<Self>(),
             abi_version: KERNEL_ABI_VERSION,
@@ -929,7 +1942,7 @@ impl QsaIndexPrepPlan {
             compressed_slots,
             num_q_heads: 4,
             head_dim: 128,
-            rotary_dim: 128,
+            rotary_dim,
             compress_ratio: 4,
             num_position_axes,
             dtype: DataType::BFloat16 as u32,
@@ -1140,7 +2153,7 @@ pub struct GdnDecodeArgs {
     pub state_indices: *const i32,
     pub output: *mut c_void,
     pub scale: f32,
-    pub reserved: u32,
+    pub sequence_length: u32,
     pub cuda_stream: *mut c_void,
 }
 
@@ -1256,6 +2269,12 @@ unsafe extern "C" {
         value: u32,
         bytes: u64,
     ) -> Status;
+    pub fn sparkserve_cuda_stream_memcpy_async(
+        stream: *mut CudaStream,
+        destination_device_pointer: *mut c_void,
+        source_device_pointer: *const c_void,
+        bytes: u64,
+    ) -> Status;
     pub fn sparkserve_cuda_stream_wait_event(
         stream: *mut CudaStream,
         event: *const CudaEvent,
@@ -1270,6 +2289,73 @@ unsafe extern "C" {
     pub fn sparkserve_cuda_blas_create(blas: *mut *mut CudaBlas) -> Status;
     pub fn sparkserve_cuda_blas_raw(blas: *const CudaBlas, raw_blas: *mut *mut c_void) -> Status;
     pub fn sparkserve_cuda_blas_destroy(blas: *mut CudaBlas) -> Status;
+    pub fn sparkserve_qwen_expert_pack_validate(args: *const QwenExpertPackArgs) -> Status;
+    pub fn sparkserve_qwen_expert_pack_launch(args: *const QwenExpertPackArgs) -> Status;
+    pub fn sparkserve_qwen_bf16_to_f32_launch(args: *const QwenBf16ToF32Args) -> Status;
+    pub fn sparkserve_qwen_qsa_project_launch(args: *const QwenQsaProjectArgs) -> Status;
+    pub fn sparkserve_qwen_qsa_finish_launch(args: *const QwenQsaFinishArgs) -> Status;
+    pub fn sparkserve_qwen_ple_block_launch(args: *const QwenPleBlockArgs) -> Status;
+    pub fn sparkserve_qwen_repeat_embedding_launch(args: *const QwenDecodeGlueArgs) -> Status;
+    pub fn sparkserve_qwen_add_hyper_launch(args: *const QwenDecodeGlueArgs) -> Status;
+    pub fn sparkserve_qwen_qsa_single_value_launch(args: *const QwenDecodeGlueArgs) -> Status;
+    pub fn sparkserve_qwen_lm_head_launch(args: *const QwenLmHeadArgs) -> Status;
+    pub fn sparkserve_qwen_runtime_mhc_mix(
+        caps: *const DeviceCaps,
+        args: *const MhcArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_mhc_combine(
+        caps: *const DeviceCaps,
+        args: *const MhcArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_gdn_prepare(
+        caps: *const DeviceCaps,
+        args: *const GdnBlockArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_gdn_decode(
+        caps: *const DeviceCaps,
+        args: *const GdnDecodeArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_gdn_finish(
+        caps: *const DeviceCaps,
+        args: *const GdnBlockArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_bf16_to_f32(args: *const QwenBf16ToF32Args) -> Status;
+    pub fn sparkserve_qwen_runtime_grouped_nvfp4(
+        caps: *const DeviceCaps,
+        args: *const GroupedNvfp4Args,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_segmented_quantize(
+        caps: *const DeviceCaps,
+        args: *const SegmentedNvfp4QuantizeArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_segmented_silu(
+        caps: *const DeviceCaps,
+        args: *const SegmentedSiluNvfp4Args,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_moe_gate(
+        caps: *const DeviceCaps,
+        args: *const MoeGateArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_moe_dispatch(
+        caps: *const DeviceCaps,
+        args: *const MoeRouteArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_moe_finalize(
+        caps: *const DeviceCaps,
+        args: *const MoeRouteArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_shared_expert(
+        caps: *const DeviceCaps,
+        args: *const SharedExpertArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_moe_join(
+        caps: *const DeviceCaps,
+        args: *const MoeJoinArgs,
+    ) -> Status;
+    pub fn sparkserve_qwen_runtime_ple_gather(
+        caps: *const DeviceCaps,
+        args: *const PleGatherArgs,
+    ) -> Status;
     pub fn sparkserve_kernel_abi_version() -> u32;
     pub fn sparkserve_dense_nvfp4_validate(plan: *const DenseNvfp4Plan) -> Status;
     pub fn sparkserve_dense_nvfp4_query(
@@ -1460,6 +2546,43 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const GdnBlockArgs,
     ) -> Status;
+    pub fn sparkserve_ggml_quant_q8_scratch_bytes(vectors: u64, k: u64, bytes: *mut u64) -> Status;
+    pub fn sparkserve_ggml_quant_dense_launch(args: *const GgmlQuantDenseArgs) -> Status;
+    pub fn sparkserve_ggml_quant_routed_launch(args: *const GgmlQuantRoutedArgs) -> Status;
+    pub fn sparkserve_glm_kda_validate(args: *const GlmKdaArgs) -> Status;
+    pub fn sparkserve_glm_kda_launch(args: *const GlmKdaArgs) -> Status;
+    pub fn sparkserve_glm_kda_conv_validate(args: *const GlmKdaConvArgs) -> Status;
+    pub fn sparkserve_glm_kda_conv_launch(args: *const GlmKdaConvArgs) -> Status;
+    pub fn sparkserve_glm_kda_prepare_validate(args: *const GlmKdaPrepareArgs) -> Status;
+    pub fn sparkserve_glm_kda_prepare_launch(args: *const GlmKdaPrepareArgs) -> Status;
+    pub fn sparkserve_glm_kda_gate_validate(args: *const GlmKdaGateArgs) -> Status;
+    pub fn sparkserve_glm_kda_gate_launch(args: *const GlmKdaGateArgs) -> Status;
+    pub fn sparkserve_glm_kpool_compress_validate(args: *const GlmKPoolCompressArgs) -> Status;
+    pub fn sparkserve_glm_kpool_compress_launch(args: *const GlmKPoolCompressArgs) -> Status;
+    pub fn sparkserve_glm_kpool_decode_validate(args: *const GlmKPoolDecodeArgs) -> Status;
+    pub fn sparkserve_glm_kpool_decode_launch(args: *const GlmKPoolDecodeArgs) -> Status;
+    pub fn sparkserve_glm_indexer_prep_validate(args: *const GlmIndexerPrepArgs) -> Status;
+    pub fn sparkserve_glm_indexer_prep_launch(args: *const GlmIndexerPrepArgs) -> Status;
+    pub fn sparkserve_glm_paged_mqa_validate(args: *const GlmPagedMqaArgs) -> Status;
+    pub fn sparkserve_glm_paged_mqa_launch(args: *const GlmPagedMqaArgs) -> Status;
+    pub fn sparkserve_glm_sparse_mla_pack_kv_validate(
+        args: *const GlmSparseMlaPackKvArgs,
+    ) -> Status;
+    pub fn sparkserve_glm_sparse_mla_pack_kv_launch(
+        args: *const GlmSparseMlaPackKvArgs,
+    ) -> Status;
+    pub fn sparkserve_glm_sparse_mla_pad_query_validate(
+        args: *const GlmSparseMlaPadQueryArgs,
+    ) -> Status;
+    pub fn sparkserve_glm_sparse_mla_pad_query_launch(
+        args: *const GlmSparseMlaPadQueryArgs,
+    ) -> Status;
+    pub fn sparkserve_glm_sparse_mla_decode_validate(
+        args: *const GlmSparseMlaDecodeArgs,
+    ) -> Status;
+    pub fn sparkserve_glm_sparse_mla_decode_launch(
+        args: *const GlmSparseMlaDecodeArgs,
+    ) -> Status;
 }
 
 fn size_u32<T>() -> u32 {
@@ -1476,6 +2599,19 @@ mod tests {
         assert_eq!(std::mem::size_of::<CoherentRegionConfig>(), 48);
         assert_eq!(std::mem::size_of::<CoherentRegionView>(), 80);
         assert_eq!(std::mem::size_of::<DeviceCaps>(), 24);
+        assert_eq!(std::mem::size_of::<GgmlQuantDenseArgs>(), 88);
+        assert_eq!(std::mem::size_of::<GgmlQuantRoutedArgs>(), 120);
+        assert_eq!(std::mem::size_of::<GlmKdaArgs>(), 104);
+        assert_eq!(std::mem::size_of::<GlmKdaConvArgs>(), 80);
+        assert_eq!(std::mem::size_of::<GlmKdaPrepareArgs>(), 128);
+        assert_eq!(std::mem::size_of::<GlmKdaGateArgs>(), 80);
+        assert_eq!(std::mem::size_of::<GlmKPoolCompressArgs>(), 104);
+        assert_eq!(std::mem::size_of::<GlmKPoolDecodeArgs>(), 168);
+        assert_eq!(std::mem::size_of::<GlmIndexerPrepArgs>(), 112);
+        assert_eq!(std::mem::size_of::<GlmPagedMqaArgs>(), 136);
+        assert_eq!(std::mem::size_of::<GlmSparseMlaPackKvArgs>(), 72);
+        assert_eq!(std::mem::size_of::<GlmSparseMlaPadQueryArgs>(), 56);
+        assert_eq!(std::mem::size_of::<GlmSparseMlaDecodeArgs>(), 224);
         assert_eq!(std::mem::size_of::<DenseNvfp4Plan>(), 80);
         assert_eq!(std::mem::size_of::<Nvfp4MatrixView>(), 32);
         assert_eq!(std::mem::size_of::<DenseNvfp4Args>(), 208);
@@ -1517,7 +2653,31 @@ mod tests {
         assert_eq!(std::mem::size_of::<GdnDecodeArgs>(), 144);
         assert_eq!(std::mem::size_of::<GdnBlockPlan>(), 48);
         assert_eq!(std::mem::size_of::<GdnBlockArgs>(), 216);
+        assert_eq!(std::mem::size_of::<QwenExpertPackArgs>(), 176);
+        assert_eq!(std::mem::size_of::<QwenBf16ToF32Args>(), 40);
+        assert_eq!(std::mem::size_of::<QwenQsaProjectArgs>(), 168);
+        assert_eq!(std::mem::size_of::<QwenQsaFinishArgs>(), 72);
+        assert_eq!(std::mem::size_of::<QwenPleBlockArgs>(), 144);
+        assert_eq!(std::mem::size_of::<QwenDecodeGlueArgs>(), 32);
+        assert_eq!(std::mem::size_of::<QwenLmHeadArgs>(), 56);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
+    }
+
+    #[test]
+    fn coherent_file_config_keeps_original_file_range() {
+        let path = std::ptr::NonNull::<c_char>::dangling().as_ptr();
+        let config = CoherentRegionConfig::file_read_only(
+            64 * 1024,
+            4096,
+            256,
+            COHERENT_REGION_PREFAULT,
+            path,
+        );
+        assert_eq!(config.kind, CoherentRegionKind::FileReadOnly as u32);
+        assert_eq!(config.payload_bytes, 64 * 1024);
+        assert_eq!(config.file_offset, 4096);
+        assert_eq!(config.required_alignment, 256);
+        assert_eq!(config.file_path, path);
     }
 
     #[test]

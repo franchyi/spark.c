@@ -2,6 +2,7 @@
 name = "sparkserve-runtime"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 license = "Apache-2.0"
 description = "Minimal Rust control plane for the SparkServe GB10 inference runtime"
 
@@ -9,10 +10,70 @@ description = "Minimal Rust control plane for the SparkServe GB10 inference runt
 name = "sparkserve-runtime"
 path = "src/main.rs"
 
+[[bin]]
+name = "sparkserve-glm53"
+path = "src/bin/sparkserve_glm53.rs"
+required-features = ["native-ds4-glm53"]
+
 [[example]]
 name = "coherent_uring_smoke"
 path = "examples/coherent_uring_smoke.rs"
 required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "qwen_expert_cache_smoke"
+path = "examples/qwen_expert_cache_smoke.rs"
+required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "qwen_real_moe_smoke"
+path = "examples/qwen_real_moe_smoke.rs"
+required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "qwen_real_gdn_smoke"
+path = "examples/qwen_real_gdn_smoke.rs"
+required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "qwen_real_qsa_smoke"
+path = "examples/qwen_real_qsa_smoke.rs"
+required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "qwen_real_ple_smoke"
+path = "examples/qwen_real_ple_smoke.rs"
+required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "qwen_first_token"
+path = "examples/qwen_first_token.rs"
+required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "qwen_decode"
+path = "examples/qwen_decode.rs"
+required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "qwen_serve"
+path = "examples/qwen_serve.rs"
+required-features = ["native-fabric-smoke"]
+
+[[example]]
+name = "glm53_ds4_first_token"
+path = "examples/glm53_ds4_first_token.rs"
+required-features = ["native-ds4-glm53"]
+
+[[example]]
+name = "glm53_ds4_serve"
+path = "examples/glm53_ds4_serve.rs"
+required-features = ["native-ds4-glm53"]
+
+[[example]]
+name = "glm53_ds4_bench"
+path = "examples/glm53_ds4_bench.rs"
+required-features = ["native-ds4-glm53"]
 
 [[example]]
 name = "qsa_xqa_smoke"
@@ -39,9 +100,17 @@ native-fabric = []
 native-fabric-smoke = ["native-fabric"]
 native-qsa-smoke = ["native-fabric"]
 native-moe-gate-smoke = ["native-fabric"]
+native-ds4-glm53 = []
 
 [dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+# Hugging Face's Apache-2.0 Rust implementation preserves the checkpoint's
+# byte-level BPE, added-token, and Oniguruma regex semantics without Python.
+tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"] }
+# tiny_http is a small MIT/Apache-2.0 transport. SparkServe retains all request,
+# scheduling, streaming-token, and admission semantics above this layer.
+tiny_http = "=0.12.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pinned to the versions used by SGLang storage donor e14d1c3.

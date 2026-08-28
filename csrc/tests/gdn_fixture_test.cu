@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
       static_cast<const int32_t*>(state_indices_device),
       output_device,
       1.0F / std::sqrt(static_cast<float>(kHeadDim)),
-      0,
+      1,
       nullptr};
   SparkServeStatus status = sparkserve_gdn_decode_launch(&caps, &args);
   if (status.code != SPARKSERVE_STATUS_OK) std::cerr << status.message << '\n';

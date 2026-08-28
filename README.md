@@ -4,15 +4,18 @@ SparkServe is a lightweight GB10-native inference runtime for DGX Spark. The
 shipping server is one Rust binary calling a narrow C ABI implemented by
 C++/CUDA kernels. Python is tooling only and is never in the serving hot path.
 It is deliberately not an SGLang fork. SGLang and llama.cpp are correctness and
-performance oracles; SparkServe owns the memory hierarchy, scheduler, model IR,
-and kernels needed to make models fit and run well on coherent-memory GB10.
+performance oracles. SparkServe owns the memory hierarchy, request scheduler,
+and service boundary; model arithmetic is either linked through narrow borrowed
+kernels or, for the first GLM release, a pinned source engine behind one C ABI.
 
 The ordered model targets are:
 
 1. `Qwen3.8-27B-SGLang-NVFP4` as the resident, measurable baseline.
 2. `RadixArk/Qwen3.8-Flash-Next-NVFP4` with its sparse PLE table on NVMe.
-3. `unsloth/GLM-5.3-Flash-GGUF:UD-IQ3_XXS` as the first explicitly paged
-   3-bit MoE target; `UD-Q3_K_XL` follows as a higher-quality stretch target.
+3. `antirez/glm-5.3-flash-gguf:GLM-5.3-Flash-Q2.gguf` as the first complete GLM
+   service and GB10 performance baseline.
+4. `unsloth/GLM-5.3-Flash-GGUF:UD-IQ3_XXS` as the explicitly paged 3-bit MoE
+   profile; `UD-Q3_K_XL` follows as a higher-quality stretch target.
 
 SparkServe intentionally has two checkpoint-format families: ModelOpt NVFP4 in
 safetensors and quantized GGUF blocks. Qwen4-exp and GLM5Next are model graphs
@@ -33,6 +36,9 @@ inside the same runtime, not separate serving stacks.
 - **Borrow kernels, not frameworks:** CUTLASS, selected FlashInfer/SGLang kernels,
   and ggml CUDA kernels sit behind our small C ABI; their Python schedulers,
   allocators, and servers are not runtime dependencies.
+- **Source-adopt the complete GLM path:** ds4 revision `a60a2a0...` is
+  hash-checked and statically linked; Rust keeps request/session scheduling and
+  OpenAI/SSE while no ds4 subprocess or installed runtime library is needed.
 - **Two formats, one execution core:** NVFP4 and GGUF tensors feed the same model
   IR, scheduler, state manager, and OpenAI-compatible server.
 
@@ -102,6 +108,63 @@ make test-cuda-nvfp4
 The defaults reserve 8 GiB for KV cache, 12 GiB for the runtime, 8 GiB as a hard
 safety margin, and 2 GiB for sparse PLE rows. They are intentionally conservative
 and will be replaced by measurements from the target machine.
+
+## Build and run GLM-5.3 Q2 on Spark
+
+Fetch the immutable MIT source through the configured GitHub proxy and build the
+SM121 static engine:
+
+```bash
+./scripts/fetch-ds4-glm53-sources.sh
+make glm53-ds4-static CUDA_ARCH=sm_121
+cargo build --release -p sparkserve-runtime \
+  --bin sparkserve-glm53 --features native-ds4-glm53
+```
+
+The locked model is one 89.88-GiB file. Download through the HF mirror at the
+immutable revision and verify it before loading:
+
+```bash
+mkdir -p /home/chaoyi/models/antirez/glm-5.3-flash-gguf
+curl -fL -C - \
+  -o /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf \
+  'https://hf-mirror.com/antirez/glm-5.3-flash-gguf/resolve/d0d6394cad1046c6d8ad87fa9b0939b4760cb94f/GLM-5.3-Flash-Q2.gguf?download=true'
+echo 'e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32  /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf' | sha256sum -c -
+```
+
+On the tested 128-GB Spark, the 2K profile plans 94.50 GiB and the 4K server
+plans 96.67 GiB of unified memory. A host with no swap and the default
+`vm.overcommit_memory=0` fails inside the NVIDIA driver with
+`NV_ERR_NO_MEMORY`, even when `free` reports more than 100 GiB available. The
+validated run used a temporary 32-GiB NVMe swap file and
+`vm.overcommit_memory=1`, then restored both settings after the process exited.
+Check `free -h`, `swapon --show`, and `sysctl vm.overcommit_memory` before
+starting; production deployments should provision swap through the host's
+normal system configuration rather than hiding this prerequisite in the
+server.
+
+Start the standalone service, discover its model id at `/v1/models`, and send
+OpenAI-compatible Chat Completions or Responses requests to port 8010:
+
+```bash
+./target/release/sparkserve-glm53 \
+  /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf \
+  --bind 0.0.0.0:8010 --context 16384
+```
+
+`sparkserve-glm53` is one Rust/ARM64 binary statically containing the pinned
+GLM C/CUDA graph. Its external runtime dependencies are the system C/C++
+libraries, CUDA runtime, and cuBLAS only. The exact 2K/128-token comparison is
+available as the `glm53_ds4_bench` example using
+`third_party/_deps/ds4-glm53/speed-bench/promessi_sposi.txt`.
+
+The 2026-08-29 Spark run verified both non-streaming and SSE forms of
+`/v1/chat/completions` and `/v1/responses`. The corrected same-shape
+SparkServe benchmark measured 363.54 prefill tok/s, 71.602 ms first decode,
+14.41 total generation tok/s, and 14.42 steady generation tok/s. The pinned
+repository GB10 row is 825.76, 71.721 ms, 18.05, and 18.20 respectively, so
+the local prefill environment remains below the performance target even though
+the standalone path is functionally complete.
 
 See [docs/architecture.md](docs/architecture.md) for the runtime design and gates.
 See [docs/acceptance.md](docs/acceptance.md) for the exact definition of done for
@@ -269,12 +332,14 @@ enough stateful and failure-sensitive machinery that Rust gives us a smaller
 operational system than hand-building networking, JSON, concurrency, and I/O
 safety around a monolithic C inference loop.
 
-## After Qwen Flash: GLM-5.3-Flash
+## After the resident GLM Q2 profile: paged IQ3
 
-The first GLM target is Unsloth's `UD-IQ3_XXS` GGUF. Its advertised 120 GB file
-is about 111.8 GiB, leaving less than 10 GiB on the 121.7-GiB Spark after the
-weights alone. That is not enough for the OS, runtime, recurrent/attention state,
-workspaces, and KV cache, so whole-model residency is explicitly unsupported.
+The first complete GLM target is the pinned ds4 Q2 GGUF above. Unsloth's
+`UD-IQ3_XXS` GGUF remains the second, explicitly paged profile. Its advertised
+120 GB file is about 111.8 GiB, leaving less than 10 GiB on the 121.7-GiB Spark
+after the weights alone. That is not enough for the OS, runtime,
+recurrent/attention state, workspaces, and KV cache, so whole-model residency is
+explicitly unsupported.
 
 The loader will keep the dense trunk, routers, KDA/DSA state, mHC parameters,
 and a measured hot-expert set resident. Remaining IQ3 expert blocks stay on NVMe

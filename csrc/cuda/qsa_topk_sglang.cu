@@ -1,7 +1,8 @@
 // Adapted from SGLang's Apache-2.0 fast_topk.cuh at commit
 // 7c66045d71f067c1c5da2b85baad3c47d9a19cb7. The radix-selection arithmetic
 // and unspecified atomic output order are retained; TVM-FFI, sgl-kernel
-// tensor wrappers, allocation, and framework dispatch are removed.
+// tensor wrappers, allocation, and framework dispatch are removed. The same
+// 512-group radix contract is used by Qwen QSA and GLM KPool DSA.
 
 #include "internal/qsa_topk_backend.h"
 

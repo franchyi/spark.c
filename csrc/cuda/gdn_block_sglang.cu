@@ -123,6 +123,65 @@ __global__ __launch_bounds__(kConvThreads) void SglangCausalConvUpdate(
   output[token * kConvWidth + channel] = __float2bfloat16_rn(result);
 }
 
+// Short-prefill specialization for one logical sequence. The decode donor's
+// token-parallel grid is unsafe when several tokens name the same recurrent
+// slot: all CTAs race on the width-three state. One thread owns a channel and
+// advances every token in program order, preserving the donor's BF16 product
+// rounding and final SiLU exactly while projections remain one batched GEMM.
+__global__ __launch_bounds__(kConvThreads) void SglangCausalConvPrefill(
+    const __nv_bfloat16* input, __nv_bfloat16* state,
+    const __nv_bfloat16* weight, const int32_t* state_indices,
+    __nv_bfloat16* output, int tokens) {
+  const int channel =
+      static_cast<int>(blockIdx.x) * kConvThreads + threadIdx.x;
+  if (channel >= kConvWidth) return;
+  const int slot = state_indices[0];
+  if (slot < 0) return;
+
+  __nv_bfloat16* channel_state =
+      state + (static_cast<int64_t>(slot) * kConvWidth + channel) * kConvState;
+  __nv_bfloat16 s0 = channel_state[0];
+  __nv_bfloat16 s1 = channel_state[1];
+  __nv_bfloat16 s2 = channel_state[2];
+  const __nv_bfloat16* channel_weight = weight + channel * kConvKernel;
+  for (int token = 0; token < tokens; ++token) {
+    const __nv_bfloat16 x = input[token * kConvWidth + channel];
+    const __nv_bfloat16 values[kConvKernel] = {s0, s1, s2, x};
+    float result = 0.0F;
+#pragma unroll
+    for (int index = 0; index < kConvKernel; ++index) {
+      const __nv_bfloat16 product = __float2bfloat16_rn(
+          __bfloat162float(channel_weight[index]) *
+          __bfloat162float(values[index]));
+      result += __bfloat162float(product);
+    }
+    result = result / (1.0F + __expf(-result));
+    // The projection is token-major [T,Q|K|V], while FlashInfer's AOT ABI
+    // consumes three individually contiguous [T,H,D] tensors. Pack the
+    // recurrent input into Q-major, K-major, V-major planes as the state-safe
+    // convolution advances. T=1 has the identical byte layout.
+    int64_t output_index = 0;
+    if (channel < kQkWidth) {
+      output_index = static_cast<int64_t>(token) * kQkWidth + channel;
+    } else if (channel < 2 * kQkWidth) {
+      output_index = static_cast<int64_t>(tokens) * kQkWidth +
+                     static_cast<int64_t>(token) * kQkWidth +
+                     channel - kQkWidth;
+    } else {
+      output_index = static_cast<int64_t>(2) * tokens * kQkWidth +
+                     static_cast<int64_t>(token) * kValueWidth +
+                     channel - 2 * kQkWidth;
+    }
+    output[output_index] = __float2bfloat16_rn(result);
+    s0 = s1;
+    s1 = s2;
+    s2 = x;
+  }
+  channel_state[0] = s0;
+  channel_state[1] = s1;
+  channel_state[2] = s2;
+}
+
 __device__ float WarpReduceSum(float value) {
 #pragma unroll
   for (int offset = 16; offset != 0; offset /= 2) {
@@ -208,13 +267,23 @@ SparkServeStatus sparkserve_sglang_cublas_gdn_prepare_cuda_launch(
       return CublasError(projection.error, status);
   }
 
-  const dim3 grid(tokens, (kConvWidth + kConvThreads - 1) / kConvThreads);
-  SglangCausalConvUpdate<<<grid, kConvThreads, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(args->projected_qkv),
-      static_cast<__nv_bfloat16*>(args->conv_state_pool),
-      static_cast<const __nv_bfloat16*>(args->conv_weight),
-      args->state_indices,
-      static_cast<__nv_bfloat16*>(args->convolved_qkv));
+  if (tokens == 1) {
+    const dim3 grid(1, (kConvWidth + kConvThreads - 1) / kConvThreads);
+    SglangCausalConvUpdate<<<grid, kConvThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(args->projected_qkv),
+        static_cast<__nv_bfloat16*>(args->conv_state_pool),
+        static_cast<const __nv_bfloat16*>(args->conv_weight),
+        args->state_indices,
+        static_cast<__nv_bfloat16*>(args->convolved_qkv));
+  } else {
+    SglangCausalConvPrefill<<<(kConvWidth + kConvThreads - 1) / kConvThreads,
+                               kConvThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(args->projected_qkv),
+        static_cast<__nv_bfloat16*>(args->conv_state_pool),
+        static_cast<const __nv_bfloat16*>(args->conv_weight),
+        args->state_indices,
+        static_cast<__nv_bfloat16*>(args->convolved_qkv), tokens);
+  }
   const cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess)
     return CudaError("SGLang causal convolution failed: ", error);

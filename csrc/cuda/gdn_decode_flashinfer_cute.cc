@@ -20,6 +20,19 @@ __tvm_ffi_sparkserve_gdn_bf16_t1_h16_hv48_k128_v128_sm121(
     void* handle, const TVMFFIAny* args, int32_t num_args,
     TVMFFIAny* result);
 
+#ifdef SPARKSERVE_WITH_FLASHINFER_GDN_PREFILL_AOT
+#define SPARKSERVE_DECLARE_GDN_PREFILL(TOKENS)                              \
+  extern "C" int                                                         \
+      __tvm_ffi_sparkserve_gdn_bf16_t##TOKENS##_h16_hv48_k128_v128_sm121( \
+          void* handle, const TVMFFIAny* args, int32_t num_args,           \
+          TVMFFIAny* result)
+SPARKSERVE_DECLARE_GDN_PREFILL(2);
+SPARKSERVE_DECLARE_GDN_PREFILL(4);
+SPARKSERVE_DECLARE_GDN_PREFILL(8);
+SPARKSERVE_DECLARE_GDN_PREFILL(16);
+#undef SPARKSERVE_DECLARE_GDN_PREFILL
+#endif
+
 namespace {
 
 constexpr int64_t kQkHeads = 16;
@@ -79,6 +92,31 @@ TVMFFIAny StreamArgument(void* stream) {
   return value;
 }
 
+int CallArtifact(uint32_t tokens, const TVMFFIAny* args, int32_t num_args,
+                 TVMFFIAny* result) {
+  switch (tokens) {
+    case 1:
+      return __tvm_ffi_sparkserve_gdn_bf16_t1_h16_hv48_k128_v128_sm121(
+          nullptr, args, num_args, result);
+#ifdef SPARKSERVE_WITH_FLASHINFER_GDN_PREFILL_AOT
+    case 2:
+      return __tvm_ffi_sparkserve_gdn_bf16_t2_h16_hv48_k128_v128_sm121(
+          nullptr, args, num_args, result);
+    case 4:
+      return __tvm_ffi_sparkserve_gdn_bf16_t4_h16_hv48_k128_v128_sm121(
+          nullptr, args, num_args, result);
+    case 8:
+      return __tvm_ffi_sparkserve_gdn_bf16_t8_h16_hv48_k128_v128_sm121(
+          nullptr, args, num_args, result);
+    case 16:
+      return __tvm_ffi_sparkserve_gdn_bf16_t16_h16_hv48_k128_v128_sm121(
+          nullptr, args, num_args, result);
+#endif
+    default:
+      return -1;
+  }
+}
+
 class StreamScope {
  public:
   StreamScope(int device_id, void* stream) : device_id_(device_id) {
@@ -121,6 +159,7 @@ SparkServeStatus sparkserve_gdn_decode_flashinfer_aot_launch(
   }
 
   const int64_t batch = args->plan.batch_size;
+  const int64_t tokens = args->sequence_length;
   const int64_t slots = args->plan.state_slots;
   int64_t state_shape[4] = {slots, kValueHeads, kDim, kDim};
   int64_t state_strides[4] = {kStatePerSlot, kDim * kDim, kDim, 1};
@@ -128,16 +167,16 @@ SparkServeStatus sparkserve_gdn_decode_flashinfer_aot_launch(
   int64_t dummy_strides[4] = {kStatePerSlot, kDim * kDim, kDim, 1};
   int64_t vector_shape[1] = {kValueHeads};
   int64_t vector_strides[1] = {1};
-  int64_t gate_shape[3] = {batch, 1, kValueHeads};
-  int64_t gate_strides[3] = {kValueHeads, kValueHeads, 1};
-  int64_t qk_shape[4] = {batch, 1, kQkHeads, kDim};
-  int64_t qk_strides[4] = {kQkHeads * kDim, kQkHeads * kDim, kDim, 1};
-  int64_t value_shape[4] = {batch, 1, kValueHeads, kDim};
-  int64_t value_strides[4] = {kValueHeads * kDim, kValueHeads * kDim, kDim, 1};
+  int64_t gate_shape[3] = {batch, tokens, kValueHeads};
+  int64_t gate_strides[3] = {tokens * kValueHeads, kValueHeads, 1};
+  int64_t qk_shape[4] = {batch, tokens, kQkHeads, kDim};
+  int64_t qk_strides[4] = {tokens * kQkHeads * kDim, kQkHeads * kDim, kDim, 1};
+  int64_t value_shape[4] = {batch, tokens, kValueHeads, kDim};
+  int64_t value_strides[4] = {tokens * kValueHeads * kDim, kValueHeads * kDim, kDim, 1};
   int64_t index_shape[1] = {batch};
   int64_t index_strides[1] = {1};
-  int64_t unused_scatter_shape[2] = {batch, 1};
-  int64_t unused_scatter_strides[2] = {1, 1};
+  int64_t unused_scatter_shape[2] = {batch, tokens};
+  int64_t unused_scatter_strides[2] = {tokens, 1};
 
   const DLDevice device = {kDLCUDA, device_id};
   const DLDataType bf16 = {kDLBfloat, 16, 1};
@@ -182,9 +221,7 @@ SparkServeStatus sparkserve_gdn_decode_flashinfer_aot_launch(
   };
   TVMFFIAny result = {};
   result.type_index = kTVMFFINone;
-  const int status =
-      __tvm_ffi_sparkserve_gdn_bf16_t1_h16_hv48_k128_v128_sm121(
-          nullptr, call_args, 15, &result);
+  const int status = CallArtifact(args->sequence_length, call_args, 15, &result);
   if (status != 0) return RaisedError("FlashInfer CuTe BF16-state GDN: ");
   error = cudaGetLastError();
   if (error != cudaSuccess)

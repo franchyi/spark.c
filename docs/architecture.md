@@ -39,6 +39,42 @@ The Rust binary is statically specialized by model family. It does not implement
 a dynamic operator graph or a plugin system in milestone one. Every abstraction
 must either remove duplicated format/model code or disappear from the decode path.
 
+The control-plane boundary also follows the reuse rule. Hugging Face
+`tokenizers` 0.23.1 supplies the checkpoint's byte-level BPE, added-token, and
+Oniguruma semantics, while a pinned native Rust renderer owns the text-only Qwen
+chat contract. Three real Transformers fixtures currently match rendered bytes
+and all 63/16/63 token ids exactly. `tiny_http` supplies only HTTP parsing and
+chunked transfer; SparkServe owns request validation, live token callbacks, SSE
+objects, cancellation, usage, and the backend handoff. The actual socket test
+covers role/content chunks, usage, finish reason, and `[DONE]` without Python.
+
+### GLM-5.3 route decision (2026-08-29)
+
+The first released GLM path no longer rebuilds the graph operator by operator.
+It statically compiles the MIT-licensed ds4 `glm-5.3-flash` source at immutable
+revision `a60a2a0d25137a849a101e04e86ea830a346073a` behind
+`ds4_glm53_api.h`. The complete selected source set is SHA-256 checked before
+each build. Rust owns admission, one-session leases, request scheduling,
+cancellation, Chat Completions/Responses validation, and both SSE protocols;
+the pinned C/CUDA source owns the GLM graph, tokenizer, KDA, sparse DSA/MLA,
+mHC, MoE, MTP, and MMQ arithmetic.
+
+This is a source-level integration, not a ds4 subprocess or installed runtime
+dependency. The resulting ARM64 executable dynamically needs only system/CUDA
+libraries. The initial artifact is the single 96,505,816,384-byte
+`GLM-5.3-Flash-Q2.gguf` at HF revision `d0d6394...`, whose LFS SHA-256 is
+`e81fd624...9705b32`. The earlier Unsloth `UD-IQ3_XXS` native paging work stays
+as an experimental second profile; it is no longer on the critical path for a
+correct, benchmarkable GLM service.
+
+The real GB10 load establishes a host-level constraint that the scheduler
+cannot infer from `MemAvailable` alone. The 2K/4K profiles plan 94.50/96.67 GiB,
+and NVIDIA UMA allocation failed with `NV_ERR_NO_MEMORY` while the host had no
+swap and `vm.overcommit_memory=0`. A temporary 32-GiB NVMe swap plus overcommit
+mode 1 made the same allocation succeed without stopping the resident data
+services. Deployment preflight must therefore validate reclaimable swap and
+commit policy in addition to RSS and cgroup limits.
+
 ## 3. Spark Weight Fabric
 
 Generic unified-memory page faults are too coarse and unpredictable for serving.
@@ -87,6 +123,29 @@ The 4 MiB PLE slab has also passed simultaneous CUDA host registration and
 directly into offsets subsequently addressable through the matching CUDA device
 pointer. This is the concrete one-copy boundary; no CPU-to-GPU staging buffer is
 introduced.
+Rust exposes both anonymous slabs and original-file read-only mappings through
+the same unique owner; the file constructor passes the source offset and length
+to the native `mmap`/registration boundary without allocating or copying weight
+payloads.
+
+### Hard unified-memory admission
+
+An `mmap` reserves virtual address space but does not prove that the model fits.
+SparkServe therefore charges the complete fixed fabric plan before any lazy
+file page is touched. At each request it also samples Linux
+`/proc/self/smaps_rollup`, `MemAvailable`, and cgroup-v2 `memory.current/max`.
+Admission uses the larger of planned fixed residency and measured process RSS,
+then adds all live request-transient reservations. File and anonymous PSS remain
+separate telemetry so mapped weights are visible rather than hidden inside one
+RSS number.
+
+Sequence-slot and memory admission are one Rust transaction. The scheduler
+first reserves the fixed KV/recurrent-state arena; if the unified-memory guard
+rejects the request, that arena is returned before the error is published.
+Conversely, a full sequence lane never creates a memory reservation. The
+request owns both leases through RAII, so normal completion, kernel failure, and
+HTTP disconnect return both. This policy has no allocation or eviction logic in
+the borrowed kernels.
 
 ### Transactional expert residency
 
@@ -205,6 +264,16 @@ disjoint, 256-byte-aligned coherent snapshot ranges before either state pool is
 mutated. A failed stateful stage poisons the token lease until both ranges are
 restored; borrowed kernels cannot publish or select retry policy.
 
+The layer scheduler composes these borrowed blocks with two fixed 20-KiB
+coherent hidden-state slabs. Attention reads the published slab and writes the
+scratch slab; the MoE/MLP reads that exact device pointer and writes the next
+published state back into the first slab. The addresses never move and no
+attention-to-MLP or layer-to-layer hidden copy exists. Rust validates the
+checkpoint's three-GDN/one-QSA pattern, gates each child scheduler's
+publication, retries a failed MLP from intact attention scratch, and
+quarantines both slabs after a stateful attention failure until its GDN or QSA
+checkpoint is restored.
+
 The first resident target is Qwen3.8 27B because the existing SGLang service gives
 golden logits and a measured target of about 50 decode tokens/s.
 
@@ -269,9 +338,41 @@ buckets without a host/device shadow allocation.
 
 GGUF is a storage contract, not a second execution engine. The loader maps GGUF
 metadata and tensor blocks into the same Model IR. The initial reference kernel
-is Q8_0, followed by the production GLM formats IQ3_XXS and Q3_K. Quantized
+is Q8_0, followed by the locked GLM artifact's Q2_K, Q3_K, Q6_K, IQ2_S, IQ3_S,
+and IQ4_XS mix. Quantized
 blocks remain encoded in memory and are consumed directly by CUDA MMQ kernels;
 the runtime never expands a whole GGUF model to BF16.
+
+The native v3 index is now implemented from the pinned llama.cpp/ggml
+`5c0e946` invariants. It rejects wrong endianness/version, duplicate keys or
+tensors, invalid types/dimensions/alignment, non-sequential tensor offsets,
+quant rows that do not divide their block size, truncation, inconsistent shard
+metadata, and duplicate cross-shard names. It records absolute source offsets
+and byte lengths without reading tensor payloads. A fixture emitted by the
+pinned upstream writer exposed and locked two split details: the total tensor
+count is signed `INT32`, and only shard zero carries the architecture. The same
+fixture validates IQ3_XXS as 256 elements per 98-byte block. A scalar Q8_0 CPU
+matvec now freezes its 32-element/34-byte block and FP16 scale semantics before
+CUDA MMQ promotion.
+
+The first CUDA promotion borrows the exact pinned llama.cpp mixed-quant
+`vecdotq`/MMVQ and canonical Q8_1 quantizer, plus ds4's small patch that exposes
+the upstream raw type switch. It does not borrow either framework's allocator,
+tensor graph, model loader, expert cache, or scheduler. SparkServe's ABI accepts
+caller-owned input/output storage, a fixed-address Q8_1 scratch region, the
+exact GGUF type tag, and a caller-owned expert-slot stride. Rust validates the
+donor's batch/K/block limits and calculates fixed workspace and conservative
+cold-expert read budgets before admission. Its structure-of-arrays cache uses a
+per-component stride divisible by every quant block size present across layers,
+so mixed types keep stable addresses without repacking. Dense and routed
+adapters are prepared, source-hashed, and still require GB10 oracle parity.
+
+Locked header prefixes for the four real GLM shards now validate all 1,412
+tensors and 120,358,051,192 payload bytes. The model label `UD-IQ3_XXS` is not a
+uniform tensor type: routed gate/up tensors are predominantly IQ2_S while down
+tensors are predominantly IQ3_S, with Q2_K, Q3_K, IQ3_S, and IQ4_XS outlier
+layers. For 16 physical slots, the exact mixed-type common-stride arena is
+460,697,600 bytes and a cold expert reads at most 11,665,408 useful bytes.
 
 Dense models larger than resident memory require every layer to cross NVMe each
 token and will be I/O-bound. Large MoE models are viable only when the resident
@@ -279,9 +380,11 @@ expert set plus routing locality keeps misses low. SparkServe reports predicted
 and measured bytes/token instead of promising that every oversized GGUF is fast.
 
 The first oversized target is `GLM-5.3-Flash-GGUF:UD-IQ3_XXS`: 321B total and
-18B active parameters in a roughly 120-GB file. On a single Spark, the weights
-alone consume about 111.8 GiB of a roughly 121.7-GiB usable-memory machine. The
-runtime therefore uses this placement policy:
+18B active parameters in a roughly 120-GB file. The locked index separates
+112,491,233,280 bytes (104.77 GiB) of routed-expert payload from only
+7,866,817,912 bytes (7.33 GiB) of resident non-expert payload. The full file
+must never become committed memory merely because its address range is mapped.
+The runtime therefore uses this placement policy:
 
 1. keep the dense trunk, routers, KDA/DSA parameters and state, mHC parameters,
    embeddings, and output head resident when the measured plan permits it;
@@ -300,7 +403,64 @@ the source artifact and the repack is revision- and checksum-bound.
 GLM5Next adds model semantics rather than a third storage path: a 46-block graph
 (45 trunk blocks plus MTP), hybrid KDA and DSA/MLA attention, no text-tower RoPE,
 a pooled top-k sparse indexer, mHC, and 288 routed plus one shared expert with
-top-8 routing. Each invariant is frozen in oracle fixtures before optimization.
+top-8 routing. The real tensor inventory identifies 34 KDA blocks and DSA/MLA
+blocks `[3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 45]`; block 45 is MTP.
+The borrowed KDA block keeps a transposed FP32 `[64,128,128]` recurrence state
+plus three FP32 `[8192,3]` width-4 convolution histories: 4 MiB plus 288 KiB per
+layer, or 152,633,344 bytes for all 34 KDA blocks at batch one. Both state ABIs
+permit input/output aliasing, so decode mutates Rust-owned fixed slabs without a
+shadow copy. The surrounding raw kernels preserve llama.cpp's width-4 SiLU
+convolution, L2 normalization, softplus decay, beta sigmoid, and sigmoid-gated
+RMSNorm arithmetic. A locked 256-byte range read of real `blk.0.ssm_a` confirms
+GGUF stores the converter output `-exp(A_log)`; the runtime multiplies it by
+`softplus(dt + dt_bias)` directly. Each invariant is frozen in oracle fixtures
+before optimization.
+
+The DSA/MLA path is likewise fixed from GGUF metadata and the pinned SGLang
+branch rather than guessed from a model family. It has 64 heads, 1536/512 Q/KV
+LoRA ranks, 256-wide NoPE QK/V, and a 32-head x 128-wide indexer. KPool groups
+four history tokens, selects a 2048-token budget, always appends its three-token
+unpooled output tail, and divides the 64-token page size exactly. Decode state
+retains a full four-slot BF16 key/score ring so the fourth token can complete a
+group before overwriting its physical slot. At batch one and 32K context, the
+12 DSA layers charge 270,950,400 persistent bytes for the FP8 MLA cache, FP8
+pooled keys/scales, and BF16 pool ring, plus 2,569,116 bytes of fixed decode
+workspace. The MLA cache uses FlashInfer GLM_NSA's 656-byte physical token:
+512 FP8 E4M3 values, four arbitrary FP32 scales, and 64 zero BF16 compatibility
+lanes because the locked GGUF metadata declares no RoPE. The strict header pass
+checks every DSA/indexer tensor name, shape,
+and quant type before reserving those addresses. The same pass now builds every
+direct projection launch from immutable `(shard, offset, bytes)` slices. Dense
+Q6_K/Q8_0 projections use the pinned GGML MMVQ adapter; GGUF's
+`attn_k_b.weight` and `attn_v_b.weight` remain as 64 contiguous 139,264-byte
+Q8_0 head slices and execute as eight 8-head routed-MMVQ calls. One reusable
+83,968-byte arena covers the maximum 18,432-byte Q8_1 scratch and 65,536-byte
+FP32 output. This avoids materializing 402,653,184 bytes (384 MiB) of derived
+BF16 K/V matrices across the 12 DSA layers. Its 512-group radix selection
+and 4x expansion reuse the already extracted SGLang QSA CUDA kernels because
+the geometries are identical. KPool write compression is a second raw adapter
+that preserves SGLang's four-slot softmax, BF16 boundaries, normalized
+Hadamard-128 rotation, and FP8 E4M3 scale/page layout. Its decode form updates
+the full four-slot ring and writes a pooled entry into the fixed page table only
+when slot three completes a group. Rust adds two 1,024-byte checkpoint halves;
+with alignment the physical decode arena is 2,572,032 bytes. Ten ordered stages
+cover checkpoint, projections, KPool update, index scoring/selection, MLA cache
+write, history/tail segmentation, sparse decode, and output projection.
+FlashInfer's pinned GLM_NSA top-k 2048 and 128 templates provide TMA gather,
+online softmax, XV, and split merge. GB10 lacks their SM120 block-scale QK
+instruction, so the adapter applies the same UE8M0 factors around ordinary
+SM121 FP8 MMA in FP32. A GB10 4-history + 1-tail fixture returns all 64x512
+expected BF16 values exactly. Persistent lengths publish only
+after the final CUDA event. A partial KPool mutation quarantines the operation
+until both ring halves are restored; append-only MLA/pooled slots remain outside
+the visible lengths and are deterministically overwritten on retry.
+
+The indexer query boundary is also allocation-free. It restores the BF16
+linear-output boundary, applies the pinned SGLang/Tri Dao Hadamard-128 ordering,
+the pinned 16-lane FP8 E4M3 quantizer with a power-of-two FP32 scale, and the
+32-head/128-wide logit scaling. The same ABI emits the FP32-affine LayerNorm key
+as BF16 for KPool. Rust supplies all fixed buffers and the stream; the adapter
+does not import Torch, Triton, SGLang dispatch, or a JIT.
 
 ## 5. Scheduler
 
@@ -323,7 +483,9 @@ configured safety reserve.
   measurements from SGLang and llama.cpp/DS4.
 - The standalone Rust bootstrap validates the exact Flash-Next/ModelOpt-NVFP4
   contract and classifies all 296,475 safetensors entries from headers without
-  loading tensor payloads. GGUF metadata remains pending.
+  loading tensor payloads. The strict GGUF v3 index likewise validates all four
+  locked GLM headers, 1,412 tensors, and their mixed quant layouts without
+  loading tensor payloads.
 - Make the memory planner match observed peak allocation within 5%.
 
 ### M1 — resident Qwen3.8 27B NVFP4
@@ -372,21 +534,22 @@ configured safety reserve.
 
 ### M4 — native GGUF and GLM-5.3-Flash
 
-- Implement a strict GGUF metadata/tensor index and a CPU Q8_0 reference path
-  before importing optimized quantized kernels.
-- Establish a pinned GLM5Next oracle only after its CUDA and quantized outputs
-  are reproducible on Spark. Freeze graph, routing, state, logits, and greedy
-  continuations, not merely final text.
-- Add IQ3_XXS dense and routed-MoE MMQ first; add Q3_K after correctness and
-  storage telemetry are stable.
-- Run `UD-IQ3_XXS` with an explicit resident plan and expert-block cache. Never
-  rely on implicit whole-file mmap residency.
-- Gate: exact discrete routing/index results, accepted numerical tolerances per
-  operator, peak committed memory below 105 GiB, no OOM under cold cache, and
-  reported cache hit rate/read amplification/NVMe bytes per generated token.
-- The performance gate is conditional: set a tokens/s target only after a trace
-  proves the cache working set can achieve it. A slow but bounded baseline is
-  preferable to an unverifiable speed claim.
+- Fetch and hash-check ds4 revision `a60a2a0...`; build its source into
+  `libsparkserve-ds4-glm53.a` for `sm_121a` and link the narrow Rust owner.
+- Hash-check the dedicated Q2 GGUF, reproduce one greedy continuation with both
+  the pinned ds4 executable and SparkServe, then compare token ids and text.
+- Reproduce the exact `promessi_sposi.txt` 2K/128-token benchmark row. Report
+  prefill, first-token latency, total/steady generation, memory, and thermal
+  state against the published 825.76/18.05 tok/s reference.
+- Exercise SparkServe `/v1/chat/completions` in non-streaming and SSE modes,
+  including usage, finish reason, `[DONE]`, tokenizer identity, and session
+  prefix reuse.
+- Exercise `/v1/responses` with string and text-message inputs in non-streaming
+  and SSE modes, including the official created/item/content/delta/completed
+  event sequence, usage, incomplete status, and monotonic sequence numbers.
+- Keep the four-shard `UD-IQ3_XXS` reader/pager as a second quant profile only
+  after the Q2 service passes. IQ3 promotion additionally requires bounded
+  expert paging, cache telemetry, and no implicit whole-file residency.
 
 ## 7. Non-goals for the first release
 
