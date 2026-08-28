@@ -78,9 +78,15 @@ Rust smoke owns the cuBLAS handle and CUDA completion event, consumes ids throug
 the coherent CPU alias, and writes the expert-contiguous route map back into the
 same CUDA-visible allocation without a transfer. The BF16 shared branch has
 passed real layer-0 bit parity at every intermediate and final output, using the
-merged resident gate/up layout and 30.69 microseconds for eight tokens; only the
-joined routed-plus-shared boundary remains incomplete. The
-Rust control plane also has transactional fixed-slot expert residency, and GB10
+merged resident gate/up layout and 30.69 microseconds for eight tokens. The
+deployed SGLang fused gate/sigmoid/shared-multiply/routed-add epilogue is now
+borrowed behind the raw ABI as well. A real one-token fixture selects ten experts
+spanning all four layer-0 shards and passes byte parity through router, physical
+slot dispatch, both NVFP4 GEMMs, ungated shared expert, and final join. Its
+sequential hot-cache arithmetic time is 306.668 microseconds. The Rust control
+plane overlaps the shared branch with transactional expert fills, publishes
+fixed slots atomically, and blocks final join until both CUDA events complete.
+GB10
 has passed CUDA reads from both the registered cache slab and a protected
 file-backed mapping. PLE now adds bit-exact scaled-BF16 gather parity on 16 real
 boundary rows plus simultaneous CUDA and `io_uring` registration of the same
@@ -110,4 +116,5 @@ within 0.015625 maximum BF16 absolute error. This document remains a completion
 checklist: PLE storage-thread/CUDA-event overlap, the complete Qwen layer and
 full-token graph, tokenizer/server, GGUF, GLM
 graph, and end-to-end continuation gates are not implied to be finished by this
-graph fragment.
+graph fragment. The next Qwen arithmetic boundary is mHC plus the surrounding
+norm/projection path needed to turn this exact MoE into one complete layer.

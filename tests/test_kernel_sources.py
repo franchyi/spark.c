@@ -226,6 +226,34 @@ def test_sglang_shared_expert_donors_are_pinned_hashed_and_bit_exact() -> None:
     ]
 
 
+def test_sglang_fused_moe_join_is_pinned_hashed_and_bit_exact() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qwen-moe-join"
+    )
+    assert donor["revision"] == "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["mode"] == "source-adaptation"
+    assert donor["status"] == (
+        "linked-raw-cuda-sm121-real-joined-moe-bit-parity-passed"
+    )
+    assert donor["entrypoint"] == (
+        "python/sglang/kernels/ops/elementwise/elementwise.py"
+    )
+    vendor = ROOT / "third_party" / "sglang-moe-join"
+    assert (vendor / "VENDOR.md").is_file()
+    assert (vendor / "source-files.sha256").read_text(
+        encoding="utf-8"
+    ).splitlines() == [
+        "2592f87a688dc86f217e5e35bc88ba4c49639d5e3b52b3a4132126329f079ced  "
+        "python/sglang/kernels/ops/elementwise/elementwise.py"
+    ]
+
+
 def test_sglang_qsa_index_prep_donor_is_pinned_and_hashed() -> None:
     payload = tomllib.loads(
         (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")

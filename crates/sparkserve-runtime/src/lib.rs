@@ -11,6 +11,7 @@ pub mod model_lock;
 pub mod ple_pipeline;
 pub mod qsa;
 pub mod qsa_pipeline;
+pub mod qwen_moe_pipeline;
 pub mod routing;
 pub mod scheduler;
 pub mod storage;

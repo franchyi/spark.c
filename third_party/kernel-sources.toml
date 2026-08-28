@@ -122,6 +122,16 @@ entrypoint = "python/sglang/kernels/jit/csrc/elementwise/activation.cuh"
 notes = "cuBLAS owns the BF16 merged gate/up and down projections; adapted SGLang vector SiLU and sigmoid broadcast preserve precise Blackwell expf and BF16 rounding. Every real layer-0 intermediate/output byte matches at 30.69 us for eight tokens."
 
 [[source]]
+id = "sglang-qwen-moe-join"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-real-joined-moe-bit-parity-passed"
+entrypoint = "python/sglang/kernels/ops/elementwise/elementwise.py"
+notes = "Raw CUDA preserves SGLang's deployed 4096-wide FP32 gate reduction, sigmoid, shared multiply, routed add, and BF16 store. The full real one-token router -> ten fixed-slot NVFP4 experts plus ungated BF16 shared expert -> join chain is byte-exact at every boundary and averages 306.668 us sequential hot-cache on GB10."
+
+[[source]]
 id = "sglang-qsa-block-expand"
 repository = "https://github.com/sgl-project/sglang"
 revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"

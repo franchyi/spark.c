@@ -104,6 +104,14 @@ ids rather than logical model-expert ids. Grouped GEMM therefore reads weights
 directly from slot `g` for group `g`; it never gathers or repacks resident expert
 weights. The original logical route is retained for telemetry and parity.
 
+The Qwen MoE pipeline makes overlap explicit. As soon as the coherent gate
+event completes, Rust starts the resident BF16 shared branch while the storage
+thread fills missing NVFP4 experts. Routed compute remains blocked until all
+reserved slots publish atomically. The fused join remains blocked until both the
+shared and routed CUDA events complete. Failed storage drops the pending cache
+transaction; failed CUDA stages retry from the same fixed addresses without a
+second weight or route tensor.
+
 Dropping a failed read plan changes neither residency nor telemetry. A cache
 version rejects stale publication, while a unique pending-step lease prevents
 two NVMe fills from targeting the same fixed slots concurrently. Hits, misses,
@@ -164,6 +172,15 @@ fixed-address graph buckets, workspace reuse, and which expert bytes are
 resident. The native ABI never asks a donor kernel to allocate memory or choose
 an eviction policy. This is also the boundary used for GGUF: borrow arithmetic,
 own scheduling and placement.
+
+The joined Qwen MoE gate is now concrete rather than a collection of isolated
+operators. A real one-token layer-0 fixture selects ten logical experts across
+four checkpoint shards, loads them in fixed cache-slot order, and passes exact
+parity through router/top-k, dispatch, input quantization, grouped gate/up,
+fused activation quantization, grouped down, weighted finalize, ungated shared
+expert, and SGLang's deployed FP32 gate/sigmoid/multiply/add epilogue. Sequential
+hot-cache arithmetic is 306.668 microseconds on GB10; storage and Rust scheduling
+are measured separately and the next optimization is dual-stream overlap.
 
 The first resident target is Qwen3.8 27B because the existing SGLang service gives
 golden logits and a measured target of about 50 decode tokens/s.
@@ -294,10 +311,12 @@ configured safety reserve.
   weighted finalize. The preceding real layer-0 cuBLAS router plus borrowed
   SGLang normalized top-10 now has zero logit/id/weight error, and its Rust
   event handoff writes the expert-contiguous map into the same coherent arena.
-  The BF16 shared expert now also has complete real layer-0 bit parity through
-  merged gate/up, SiLU, down, scalar gate, and sigmoid broadcast at 30.69 us for
-  eight tokens. The joined routed-plus-shared MoE output and full-layer state
-  remain before the first native token.
+  The BF16 shared expert also has complete real layer-0 bit parity through its
+  merged gate/up, SiLU, and down path. The deployed fused gate/join is exact as
+  well: one real token selects ten physical-slot experts and matches every
+  routed/shared intermediate and final byte at 306.668 us sequential hot-cache.
+  mHC, surrounding norms/projections, and full-layer state remain before the
+  first native token.
 - OpenAI-compatible streaming after the offline path is stable.
 - Gate: exact greedy token match and at least 45 tokens/s; target 50+ tokens/s.
 

@@ -142,10 +142,15 @@ Rust owns the persistent cuBLAS handle, stream/event, and one coherent allocatio
 for logits, outputs, and the route map; it reads completed ids through the CPU
 alias and transactionally reserves fixed expert slots without a copy. The shared
 expert now also runs framework-free: cuBLAS projections plus SGLang-derived
-vector SiLU and sigmoid broadcast match every real layer-0 BF16 byte at 30.69
-microseconds for eight tokens. Gate/up is loaded once into the oracle's merged
-resident layout. The joined gate-to-routed-plus-shared output remains before a
-complete MoE layer token.
+vector SiLU match every real layer-0 BF16 byte at 30.69 microseconds for eight
+tokens. Gate/up is loaded once into the oracle's merged resident layout. The
+deployed SGLang fused FP32 gate/sigmoid/multiply/add epilogue is borrowed as raw
+CUDA. One real token now traverses the exact router, ten experts stored in
+physical cache-slot order, both NVFP4 grouped GEMMs, the ungated BF16 shared
+expert, and final join with zero mismatches at every boundary. The sequential
+hot-cache chain averages 306.668 microseconds on GB10. Rust owns the overlap
+state machine: shared compute may run during expert reads, slot publication is
+transactional, and join cannot begin until both branch events complete.
 
 The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
 a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real
