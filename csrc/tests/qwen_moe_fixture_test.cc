@@ -428,6 +428,45 @@ int main(int argc, char** argv) {
     CudaOk(cudaDeviceSynchronize());
     ExpectBytes(final_output, joined_expected, "joined routed plus shared");
 
+    // Hot-cache arithmetic timing. The fixed physical route map is already
+    // resident, as it is after Rust completes its coherent top-k handoff.
+    // This deliberately excludes CPU scheduling and NVMe miss service.
+    route.route_weights = static_cast<const float*>(gate_weights);
+    cudaEvent_t begin;
+    cudaEvent_t end;
+    CudaOk(cudaEventCreate(&begin));
+    CudaOk(cudaEventCreate(&end));
+    constexpr int kIterations = 100;
+    CudaOk(cudaEventRecord(begin));
+    for (int iteration = 0; iteration < kIterations; ++iteration) {
+      assert(sparkserve_moe_gate_launch(&caps, &gate).code ==
+             SPARKSERVE_STATUS_OK);
+      assert(sparkserve_moe_route_dispatch(&caps, &route).code ==
+             SPARKSERVE_STATUS_OK);
+      assert(sparkserve_segmented_nvfp4_quantize_launch(&caps, &quantize).code ==
+             SPARKSERVE_STATUS_OK);
+      assert(sparkserve_grouped_nvfp4_launch(&caps, &gateup_args).code ==
+             SPARKSERVE_STATUS_OK);
+      assert(sparkserve_segmented_silu_nvfp4_launch(&caps, &activation).code ==
+             SPARKSERVE_STATUS_OK);
+      assert(sparkserve_grouped_nvfp4_launch(&caps, &down_args).code ==
+             SPARKSERVE_STATUS_OK);
+      assert(sparkserve_moe_route_finalize(&caps, &route).code ==
+             SPARKSERVE_STATUS_OK);
+      assert(sparkserve_shared_expert_launch(&caps, &shared).code ==
+             SPARKSERVE_STATUS_OK);
+      assert(sparkserve_moe_join_launch(&caps, &join).code ==
+             SPARKSERVE_STATUS_OK);
+    }
+    CudaOk(cudaEventRecord(end));
+    CudaOk(cudaEventSynchronize(end));
+    float elapsed_ms = 0.0F;
+    CudaOk(cudaEventElapsedTime(&elapsed_ms, begin, end));
+    std::cout << "joined one-token hot-cache MoE mean: "
+              << elapsed_ms * 1000.0F / kIterations << " us\n";
+    CudaOk(cudaEventDestroy(end));
+    CudaOk(cudaEventDestroy(begin));
+
     CudaOk(cudaFree(shared_ungated));
     CudaOk(cudaFree(shared_activated));
     CudaOk(cudaFree(shared_gate_up));
