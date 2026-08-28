@@ -120,14 +120,12 @@ prefill changes FP32 reduction order relative to dequantize-plus-cuBLAS, causing
 ULP-scale logit drift. It validates continuation and top-logprob fixtures while
 retaining a switch back to the legacy dispatch.
 
-For GLM-5.3 specifically, the later `a60a2a0...` branch is adopted more
-directly. Its selected MIT source set is hash-checked and statically linked
-behind `ds4_glm53_api.h`; its allocator/graph remain inside the native engine,
-while Rust owns engine/session lifetimes, request admission, serialization,
-OpenAI/SSE, and cancellation. This deliberately replaces the unfinished
-operator-by-operator GLM critical path. It is still a standalone SparkServe
-binary: no ds4 executable, shared library, Python module, or framework process
-is loaded at serving time.
+For GLM-5.3 specifically, the later `a60a2a0...` branch is adopted directly as
+the first Q2 service. Its selected MIT source set is hash-checked and compiled
+into the model-specific `ds4-server`; no Python module or general framework
+process is loaded at serving time. This deliberately replaces the unfinished
+operator-by-operator GLM critical path while the Rust-native scheduler stays
+focused on Qwen and later out-of-core GGUF work.
 
 ## Adoption matrix
 
@@ -146,7 +144,7 @@ is loaded at serving time.
 | RMSNorm/RoPE/top-k/sampling | SGLang, FlashInfer, ds4 | smallest fastest proven candidate | benchmark and adopt independently | exact discrete ids; numerical parity for continuous outputs |
 | MTP/speculative commit | SGLang Qwen4-exp | local scheduler using shared forward kernels | reimplement state machine | target-only greedy identity; verifier logit and committed-state parity |
 | GGUF mixed quant | llama.cpp and ds4 | strict native v3 index plus selected `ggml-cuda` MMVQ files | index/Q8 CPU reference plus a pinned, allocation-free mixed-quant dense/routed C ABI; Rust supplies fixed Q8 scratch, per-layer type/stride, paging, and scheduling | all four real header prefixes index 1,412 tensors; 164 Rust tests pass; GB10 CUDA dense/MoE parity and continuations remain |
-| Complete GLM-5.3 Q2 path | ds4 `glm-5.3-flash` at `a60a2a0` | statically linked ds4 engine/session/tokenizer plus CUDA/MMQ source | source-hashed narrow C ABI; Rust owns lifetime, session lease, Chat Completions, Responses/SSE, and cancellation | SM121 upstream/static builds, locked model load/continuation, both OpenAI APIs, both SSE protocols, and 170 Rust tests pass; corrected 2K/128 SparkServe result is 363.54 prefill, 71.602 ms first decode, 14.41 total and 14.42 steady generation tok/s versus the pinned 825.76/71.721/18.05/18.20 row |
+| Complete GLM-5.3 Q2 path | ds4 `glm-5.3-flash` at `a60a2a0` | pristine ds4 server/tokenizer/CUDA/MMQ source | source-hashed isolated checkout; ds4 owns Chat Completions, Responses/SSE, session state, and cancellation | SM121 build, locked model, Models/Chat/Responses/Chat-SSE smoke pass; exact 2K/128 result is 523.02 prefill, 70.861 ms first decode, and 14.52 generation tok/s versus the pinned 825.76/71.721/18.05 row |
 | GLM KDA block | pinned llama.cpp `gated_delta_net.cu`, `ssm-conv.cu`, `norm.cu`, and `unary.cu` at `5c0e946`; pinned SGLang GLM5Next branch `9a26e74` | allocation-free width-4 Q/K/V convolution, L2/decay/beta preparation, KDA=true recurrence, and sigmoid-gated RMSNorm behind four raw ABIs | preserve donor arithmetic/state layout; `ssm_a` is already `-exp(A_log)` in GGUF; strip graphs, tensors, pools, and dispatch | exact 4 MiB recurrent plus 288 KiB convolution state per layer (152,633,344 bytes across 34 layers at batch one) is planned in Rust; a 197,376-byte aligned decode arena and transactional convolution/recurrence rollback prevent partial publication; CPU-reference CUDA fixture covers every leaf, while multi-token GB10 parity remains |
 | GLM DSA/MLA and sparse indexer | pinned SGLang GLM5Next branch `9a26e74`, SGLang DeepGEMM `fa3a5ca`, FlashInfer `906181e`, and all four locked GGUF headers | strict Rust tensor/metadata/direct-MMVQ plan; reuse the extracted SGLang radix-512/4x expansion, KPool compression/update, Hadamard-128, FP8 group-quant arithmetic, DeepGEMM paged-MQA score, and FlashInfer GLM_NSA sparse MLA | Rust owns the 656-byte NoPE-compatible MLA cache, 64-token pages, full 4-token key/score state ring, 2048+3 selection buffer, immutable GGUF slices, graph addresses, ring checkpoint/rollback, and cache-length publication; SM120 block-scale QK is expressed as ordinary GB10 FP8 MMA plus identical FP32 scales | all 12 real DSA layers validate; direct Q6_K/Q8_0 projections use an 83,968-byte arena and avoid 384 MiB of BF16 K/V copies; batch-one 32K charges 270,950,400 persistent plus a 2,572,032-byte decode/checkpoint arena; 164 Rust, 31 Python, C ABI, exact-SM121 compilation, and the standalone 4+1 sparse-MLA GB10 fixture pass with zero observed BF16 output error; full GGUF-model parity remains |
 | GLM mHC and routing | pinned GLM5Next oracle | local small kernels plus common MoE dispatcher | reimplement; share Qwen hyperconnection/top-k primitives where contracts match | exact 288-expert top-8 ids/order/weights and stream coefficients |

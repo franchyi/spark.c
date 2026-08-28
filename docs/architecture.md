@@ -51,29 +51,26 @@ covers role/content chunks, usage, finish reason, and `[DONE]` without Python.
 ### GLM-5.3 route decision (2026-08-29)
 
 The first released GLM path no longer rebuilds the graph operator by operator.
-It statically compiles the MIT-licensed ds4 `glm-5.3-flash` source at immutable
-revision `a60a2a0d25137a849a101e04e86ea830a346073a` behind
-`ds4_glm53_api.h`. The complete selected source set is SHA-256 checked before
-each build. Rust owns admission, one-session leases, request scheduling,
-cancellation, Chat Completions/Responses validation, and both SSE protocols;
-the pinned C/CUDA source owns the GLM graph, tokenizer, KDA, sparse DSA/MLA,
-mHC, MoE, MTP, and MMQ arithmetic.
+It source-builds the MIT-licensed ds4 `glm-5.3-flash` server at immutable
+revision `a60a2a0d25137a849a101e04e86ea830a346073a` in an isolated, pristine Q2
+checkout. ds4 owns the complete GLM graph, tokenizer, KDA, sparse DSA/MLA, mHC,
+MoE, MTP, MMQ arithmetic, OpenAI endpoints, and SSE. This is a narrow shipping
+decision to complete GLM service first; the Rust-native GLM control plane is not
+on the Q2 acceptance path.
 
-This is a source-level integration, not a ds4 subprocess or installed runtime
-dependency. The resulting ARM64 executable dynamically needs only system/CUDA
-libraries. The initial artifact is the single 96,505,816,384-byte
+The resulting ARM64 executable dynamically needs only system/CUDA libraries.
+The initial artifact is the single 96,505,816,384-byte
 `GLM-5.3-Flash-Q2.gguf` at HF revision `d0d6394...`, whose LFS SHA-256 is
 `e81fd624...9705b32`. The earlier Unsloth `UD-IQ3_XXS` native paging work stays
-as an experimental second profile; it is no longer on the critical path for a
-correct, benchmarkable GLM service.
+as an independent second profile. No IQ3 patch is applied to the Q2 checkout,
+so it cannot delay a correct, benchmarkable GLM service.
 
-The real GB10 load establishes a host-level constraint that the scheduler
-cannot infer from `MemAvailable` alone. The 2K/4K profiles plan 94.50/96.67 GiB,
-and NVIDIA UMA allocation failed with `NV_ERR_NO_MEMORY` while the host had no
-swap and `vm.overcommit_memory=0`. A temporary 32-GiB NVMe swap plus overcommit
-mode 1 made the same allocation succeed without stopping the resident data
-services. Deployment preflight must therefore validate reclaimable swap and
-commit policy in addition to RSS and cgroup limits.
+The real GB10 load establishes a host-level constraint: resident Q2 needs about
+110 GiB `MemAvailable` before startup. The 2K service succeeded from 114 GiB and
+left about 9.8 GiB free after load, but the high-priority process was killed
+when startup began with 106 GiB available. The launcher enforces that measured
+floor unless explicitly bypassed. On the tested host this meant pausing RAGFlow
+and Elasticsearch while leaving Redis, MySQL, and MinIO running.
 
 ## 3. Spark Weight Fabric
 
@@ -534,14 +531,14 @@ configured safety reserve.
 
 ### M4 — native GGUF and GLM-5.3-Flash
 
-- Fetch and hash-check ds4 revision `a60a2a0...`; build its source into
-  `libsparkserve-ds4-glm53.a` for `sm_121a` and link the narrow Rust owner.
-- Hash-check the dedicated Q2 GGUF, reproduce one greedy continuation with both
-  the pinned ds4 executable and SparkServe, then compare token ids and text.
+- Fetch and hash-check ds4 revision `a60a2a0...` into the isolated Q2 checkout;
+  build `ds4-server` and `ds4-bench` for `sm_121a`.
+- Hash-check the dedicated Q2 GGUF and reproduce deterministic continuations
+  through the deployed server.
 - Reproduce the exact `promessi_sposi.txt` 2K/128-token benchmark row. Report
   prefill, first-token latency, total/steady generation, memory, and thermal
   state against the published 825.76/18.05 tok/s reference.
-- Exercise SparkServe `/v1/chat/completions` in non-streaming and SSE modes,
+- Exercise `/v1/chat/completions` in non-streaming and SSE modes,
   including usage, finish reason, `[DONE]`, tokenizer identity, and session
   prefix reuse.
 - Exercise `/v1/responses` with string and text-message inputs in non-streaming

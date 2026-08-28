@@ -1,12 +1,11 @@
 # SparkServe
 
-SparkServe is a lightweight GB10-native inference runtime for DGX Spark. The
-shipping server is one Rust binary calling a narrow C ABI implemented by
-C++/CUDA kernels. Python is tooling only and is never in the serving hot path.
-It is deliberately not an SGLang fork. SGLang and llama.cpp are correctness and
-performance oracles. SparkServe owns the memory hierarchy, request scheduler,
-and service boundary; model arithmetic is either linked through narrow borrowed
-kernels or, for the first GLM release, a pinned source engine behind one C ABI.
+SparkServe is a lightweight GB10-native inference project for DGX Spark. The
+Qwen path is a Rust scheduler calling narrow C/CUDA ABIs. The first complete GLM
+release deliberately ships the pinned, model-specific ds4 Q2 server while the
+native scheduler continues independently. Python is tooling only and is never
+in either serving hot path. The project is deliberately not an SGLang fork;
+SGLang and llama.cpp remain correctness and performance oracles.
 
 The ordered model targets are:
 
@@ -36,11 +35,11 @@ inside the same runtime, not separate serving stacks.
 - **Borrow kernels, not frameworks:** CUTLASS, selected FlashInfer/SGLang kernels,
   and ggml CUDA kernels sit behind our small C ABI; their Python schedulers,
   allocators, and servers are not runtime dependencies.
-- **Source-adopt the complete GLM path:** ds4 revision `a60a2a0...` is
-  hash-checked and statically linked; Rust keeps request/session scheduling and
-  OpenAI/SSE while no ds4 subprocess or installed runtime library is needed.
-- **Two formats, one execution core:** NVFP4 and GGUF tensors feed the same model
-  IR, scheduler, state manager, and OpenAI-compatible server.
+- **Ship the complete GLM path first:** pristine ds4 revision `a60a2a0...` is
+  hash-checked and source-built for SM121; its Q2 server supplies the complete
+  tokenizer, graph, OpenAI APIs, and SSE without Python or SGLang at runtime.
+- **Isolate format risk:** Q2 service acceptance is independent from the later
+  IQ3 paging work, while reusable GGUF scheduling remains in SparkServe.
 
 ## The key bet
 
@@ -111,14 +110,11 @@ and will be replaced by measurements from the target machine.
 
 ## Build and run GLM-5.3 Q2 on Spark
 
-Fetch the immutable MIT source through the configured GitHub proxy and build the
-SM121 static engine:
+The GLM mainline now uses an isolated pristine ds4 checkout. Fetch the immutable
+MIT source through `ghfast.top` and build its SM121 server and benchmark:
 
 ```bash
-./scripts/fetch-ds4-glm53-sources.sh
-make glm53-ds4-static CUDA_ARCH=sm_121
-cargo build --release -p sparkserve-runtime \
-  --bin sparkserve-glm53 --features native-ds4-glm53
+./scripts/build-glm53-q2.sh
 ```
 
 The locked model is one 89.88-GiB file. Download through the HF mirror at the
@@ -132,39 +128,27 @@ curl -fL -C - \
 echo 'e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32  /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf' | sha256sum -c -
 ```
 
-On the tested 128-GB Spark, the 2K profile plans 94.50 GiB and the 4K server
-plans 96.67 GiB of unified memory. A host with no swap and the default
-`vm.overcommit_memory=0` fails inside the NVIDIA driver with
-`NV_ERR_NO_MEMORY`, even when `free` reports more than 100 GiB available. The
-validated run used a temporary 32-GiB NVMe swap file and
-`vm.overcommit_memory=1`, then restored both settings after the process exited.
-Check `free -h`, `swapon --show`, and `sysctl vm.overcommit_memory` before
-starting; production deployments should provision swap through the host's
-normal system configuration rather than hiding this prerequisite in the
-server.
+Resident Q2 is close to the 128-GB unified-memory limit. The validated 2K launch
+requires about 110 GiB `MemAvailable` before startup; its preflight refuses a
+lower value unless explicitly bypassed. On the measured Spark, pausing RAGFlow
+and Elasticsearch while retaining Redis, MySQL, and MinIO left enough memory.
 
-Start the standalone service, discover its model id at `/v1/models`, and send
-OpenAI-compatible Chat Completions or Responses requests to port 8010:
+Start the service on `127.0.0.1:8010` and run its API smoke:
 
 ```bash
-./target/release/sparkserve-glm53 \
-  /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf \
-  --bind 0.0.0.0:8010 --context 16384
+GLM53_Q2_VERIFY_SHA=1 ./scripts/run-glm53-q2.sh \
+  /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf
+./scripts/smoke-glm53-q2-api.sh
 ```
 
-`sparkserve-glm53` is one Rust/ARM64 binary statically containing the pinned
-GLM C/CUDA graph. Its external runtime dependencies are the system C/C++
-libraries, CUDA runtime, and cuBLAS only. The exact 2K/128-token comparison is
-available as the `glm53_ds4_bench` example using
-`third_party/_deps/ds4-glm53/speed-bench/promessi_sposi.txt`.
+The 2026-08-29 pristine run passed `/v1/models`, non-streaming Chat
+Completions, the Responses API, and Chat SSE. The exact ds4
+`promessi_sposi.txt` 2K/128 benchmark measured **523.02 prefill and 14.52
+generation tok/s**, versus the repository's **825.76/18.05** GB10 row. Run the
+same workload with `scripts/bench-glm53-q2.sh MODEL`.
 
-The 2026-08-29 Spark run verified both non-streaming and SSE forms of
-`/v1/chat/completions` and `/v1/responses`. The corrected same-shape
-SparkServe benchmark measured 363.54 prefill tok/s, 71.602 ms first decode,
-14.41 total generation tok/s, and 14.42 steady generation tok/s. The pinned
-repository GB10 row is 825.76, 71.721 ms, 18.05, and 18.20 respectively, so
-the local prefill environment remains below the performance target even though
-the standalone path is functionally complete.
+See [docs/glm53-q2.md](docs/glm53-q2.md) for deployment, memory, API, and
+benchmark details. IQ3 is explicitly deferred and cannot block Q2 serving.
 
 See [docs/architecture.md](docs/architecture.md) for the runtime design and gates.
 See [docs/acceptance.md](docs/acceptance.md) for the exact definition of done for

@@ -1,9 +1,9 @@
 # Standalone acceptance contract
 
-SparkServe is complete only when both locked model IDs in `models.lock.json`
-serve through one Rust binary plus linked CUDA code. Python, Torch, SGLang,
-llama.cpp, Triton, and TVM-FFI may generate fixtures or supply build-time source,
-but none may be loaded by the serving process.
+The Qwen native runtime remains a Rust binary plus linked CUDA code. The first
+complete GLM release is the separately pinned ds4 Q2 service described below.
+Python, Torch, SGLang, llama.cpp, Triton, and TVM-FFI may generate fixtures or
+supply build-time source, but none may be loaded by either serving process.
 
 ## Shared gates
 
@@ -53,22 +53,20 @@ Locked input: `antirez/glm-5.3-flash-gguf` at revision
 - The engine source is ds4 revision
   `a60a2a0d25137a849a101e04e86ea830a346073a`; every selected source/MMQ file
   passes the checked-in SHA-256 manifest before compilation.
-- The source is statically linked through `ds4_glm53_api.h`. Serving never
-  starts a ds4 process or loads a ds4/SGLang/Python/Torch runtime library.
-- Rust owns engine/session lifetimes, one-session serialization, request
-  validation, Chat Completions, Responses API, SSE, usage accounting, and
-  cancellation. The pinned native source owns the GLM tokenizer and complete
-  CUDA model graph.
-- Greedy prompt token ids and continuation must match the pinned ds4 executable.
-  Non-streaming and SSE chat responses must match text, finish reason, usage,
-  and `[DONE]` framing. Responses SSE must terminate with a
-  `response.completed` or `response.failed` event and use monotonically
-  increasing sequence numbers.
+- `scripts/build-glm53-q2.sh` creates an isolated pristine checkout, builds
+  `ds4-server` and `ds4-bench` for GB10, and applies no IQ3 patch.
+- The pinned server owns the tokenizer, complete CUDA model graph, session
+  state, request validation, Chat Completions, Responses API, SSE, usage, and
+  cancellation. It loads no Python, Torch, SGLang, or llama.cpp runtime.
+- `/v1/models`, non-streaming Chat Completions, the Responses API, and Chat SSE
+  must pass `scripts/smoke-glm53-q2-api.sh`, including finish reason, usage, and
+  `[DONE]` framing.
 - The exact 2K `promessi_sposi.txt`/128-token benchmark is reported against the
   upstream GB10 row: 825.76 prefill and 18.05 generation tok/s, including its
   71.721 ms first generation token and 18.20 steady tok/s.
-- Peak committed unified memory must leave a measured OS safety reserve; no
-  second decoded/BF16 model copy is allowed.
+- Startup requires approximately 110 GiB `MemAvailable` for the resident 2K
+  profile. Peak committed unified memory must leave a measured OS safety
+  reserve; no second decoded/BF16 model copy is allowed.
 
 The four-shard Unsloth `UD-IQ3_XXS` artifact remains a later paging profile,
 not the first-release GLM gate. Its existing strict index, topology, and cache
@@ -76,19 +74,16 @@ planner stay covered by tests, but it is not allowed to delay Q2 serving.
 
 ## Current position
 
-The pinned ds4 GLM-5.3 revision now builds both upstream `cuda-spark` binaries
-and SparkServe's 62 MiB static archive on GB10. The release Rust first-token and
-OpenAI server examples link successfully into 22 MiB ARM64 executables; `ldd`
-shows only system libraries, CUDA runtime, and cuBLAS. The shared OpenAI
-tokenizer abstraction retains the Qwen path, and all 170 Spark Rust tests pass.
-The locked 89.88 GiB model matches its byte count and SHA-256. Native first-token,
-Chat Completions, Responses, chat SSE, and Responses SSE all execute on GB10.
-The corrected SparkServe 2K/128 run measured 363.54 prefill tok/s, 71.602 ms
-first decode, 14.41 total generation tok/s, and 14.42 steady generation tok/s.
-The upstream row remains 825.76/71.721 ms/18.05/18.20, so functional acceptance
-passes while the prefill performance target remains open. The tested host needed
-32 GiB of temporary NVMe swap plus `vm.overcommit_memory=1`; with no swap and
-the default overcommit mode, NVRM rejected the 94--97 GiB allocation.
+The pinned ds4 revision now builds in a clean, IQ3-independent checkout on GB10.
+The locked 89.88 GiB Q2 model matches its byte count and SHA-256. The deployed
+resident service passes Models, Chat Completions, Responses, and Chat SSE on
+`127.0.0.1:8010`. The exact pristine 2K/128 benchmark measured 523.02 prefill
+tok/s, 70.861 ms first decode, and 14.52 generation tok/s. The upstream row is
+825.76/71.721 ms/18.05, so functional acceptance passes while the performance
+gap remains measured rather than hidden. With RAGFlow and Elasticsearch paused,
+the service started from 114 GiB available and left about 9.8 GiB free; it was
+killed under pressure when only 106 GiB was available. A 3.003 GHz clock lock
+did not improve throughput and was restored.
 
 Artifact locks, strict Qwen checkpoint scanning, exact-FP8 PLE indexing, the
 native GDN correctness kernel, and the borrowed NVFP4 expert chain now exist.
