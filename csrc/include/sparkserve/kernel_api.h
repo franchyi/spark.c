@@ -73,6 +73,9 @@ typedef enum SparkServeKernelBackend {
   // Qwen BF16 shared expert: cuBLAS projections plus SGLang-compatible
   // SiLU/multiply and sigmoid broadcast kernels.
   SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT = 15,
+  // SGLang's deployed Qwen CUDA epilogue: FP32 gate dot/sigmoid, shared
+  // multiply, and in-place add into the routed BF16 output.
+  SPARKSERVE_BACKEND_SGLANG_FUSED_MOE_JOIN = 16,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -410,6 +413,31 @@ typedef struct SparkServeSharedExpertArgs {
   void* cublas_handle;
   void* cuda_stream;
 } SparkServeSharedExpertArgs;
+
+typedef struct SparkServeMoeJoinPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_tokens;
+  uint32_t hidden_size;
+  uint32_t input_dtype;
+  uint32_t output_dtype;
+  uint32_t requested_backend;
+  uint32_t reserved;
+} SparkServeMoeJoinPlan;
+
+typedef struct SparkServeMoeJoinArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeMoeJoinPlan plan;
+  // BF16 [tokens,hidden], BF16 [hidden], and BF16 [tokens,hidden].
+  const void* hidden_states;
+  const void* shared_gate_weight;
+  const void* shared_output;
+  // BF16 [tokens,hidden], updated in place with
+  // routed + sigmoid(dot(hidden, gate_weight)) * shared.
+  void* routed_output;
+  void* cuda_stream;
+} SparkServeMoeJoinArgs;
 
 // One logical FP8 PLE row may cross two fixed cache pages. Rust uploads these
 // compact descriptors into preallocated device scratch; both offsets are
@@ -824,6 +852,18 @@ SparkServeStatus sparkserve_shared_expert_query(
 SparkServeStatus sparkserve_shared_expert_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeSharedExpertArgs* args);
+
+SparkServeStatus sparkserve_moe_join_validate(
+    const SparkServeMoeJoinPlan* plan);
+
+SparkServeStatus sparkserve_moe_join_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeMoeJoinPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_moe_join_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeMoeJoinArgs* args);
 
 SparkServeStatus sparkserve_ple_gather_validate(
     const SparkServePleGatherPlan* plan);

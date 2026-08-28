@@ -44,6 +44,7 @@ pub enum KernelBackend {
     TilelangQsaScore = 13,
     SglangCublasMoeGate = 14,
     SglangCublasSharedExpert = 15,
+    SglangFusedMoeJoin = 16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

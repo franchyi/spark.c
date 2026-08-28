@@ -582,6 +582,41 @@ int main() {
   assert(sparkserve_qsa_decode_validate(&qsa_decode).code ==
          SPARKSERVE_STATUS_UNSUPPORTED);
 
+  SparkServeMoeJoinPlan moe_join = {
+      sizeof(SparkServeMoeJoinPlan),
+      SPARKSERVE_KERNEL_ABI_VERSION,
+      1,
+      2560,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_DTYPE_BF16,
+      SPARKSERVE_BACKEND_AUTO,
+      0,
+  };
+  assert(sparkserve_moe_join_validate(&moe_join).code ==
+         SPARKSERVE_STATUS_OK);
+  SparkServeKernelInfo moe_join_info = {
+      sizeof(SparkServeKernelInfo), SPARKSERVE_KERNEL_ABI_VERSION,
+      0,                             0,
+      0,                             nullptr,
+      nullptr};
+  assert(sparkserve_moe_join_query(&caps, &moe_join, &moe_join_info).code ==
+         SPARKSERVE_STATUS_OK);
+  assert(moe_join_info.backend == SPARKSERVE_BACKEND_SGLANG_FUSED_MOE_JOIN);
+  assert(moe_join_info.available == 0);
+  SparkServeMoeJoinArgs moe_join_args = {};
+  moe_join_args.struct_size = sizeof(moe_join_args);
+  moe_join_args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+  moe_join_args.plan = moe_join;
+  moe_join_args.hidden_states = &output;
+  moe_join_args.shared_gate_weight = &output;
+  moe_join_args.shared_output = &output;
+  moe_join_args.routed_output = &output;
+  assert(sparkserve_moe_join_launch(&caps, &moe_join_args).code ==
+         SPARKSERVE_STATUS_UNAVAILABLE);
+  moe_join.hidden_size = 4096;
+  assert(sparkserve_moe_join_validate(&moe_join).code ==
+         SPARKSERVE_STATUS_UNSUPPORTED);
+
   SparkServeGdnDecodePlan gdn = {
       sizeof(SparkServeGdnDecodePlan), SPARKSERVE_KERNEL_ABI_VERSION,
       1,                                16,

@@ -580,6 +580,47 @@ pub struct SharedExpertArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoeJoinPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_tokens: u32,
+    pub hidden_size: u32,
+    pub input_dtype: u32,
+    pub output_dtype: u32,
+    pub requested_backend: u32,
+    pub reserved: u32,
+}
+
+impl MoeJoinPlan {
+    pub fn qwen38_flash(num_tokens: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_tokens,
+            hidden_size: 2560,
+            input_dtype: DataType::BFloat16 as u32,
+            output_dtype: DataType::BFloat16 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangFusedMoeJoin as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MoeJoinArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: MoeJoinPlan,
+    pub hidden_states: *const c_void,
+    pub shared_gate_weight: *const c_void,
+    pub shared_output: *const c_void,
+    pub routed_output: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PleRowFragment {
     pub first_offset_bytes: u64,
     pub second_offset_bytes: u64,
@@ -1191,6 +1232,13 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const SharedExpertArgs,
     ) -> Status;
+    pub fn sparkserve_moe_join_validate(plan: *const MoeJoinPlan) -> Status;
+    pub fn sparkserve_moe_join_query(
+        caps: *const DeviceCaps,
+        plan: *const MoeJoinPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_moe_join_launch(caps: *const DeviceCaps, args: *const MoeJoinArgs) -> Status;
     pub fn sparkserve_ple_gather_validate(plan: *const PleGatherPlan) -> Status;
     pub fn sparkserve_ple_gather_query(
         caps: *const DeviceCaps,
@@ -1302,6 +1350,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<MoeGateArgs>(), 112);
         assert_eq!(std::mem::size_of::<SharedExpertPlan>(), 48);
         assert_eq!(std::mem::size_of::<SharedExpertArgs>(), 136);
+        assert_eq!(std::mem::size_of::<MoeJoinPlan>(), 32);
+        assert_eq!(std::mem::size_of::<MoeJoinArgs>(), 80);
         assert_eq!(std::mem::size_of::<PleRowFragment>(), 24);
         assert_eq!(std::mem::size_of::<PleGatherPlan>(), 32);
         assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);
@@ -1367,6 +1417,18 @@ mod tests {
         assert_eq!(
             plan.requested_backend,
             KernelBackend::SglangCublasSharedExpert as u32
+        );
+    }
+
+    #[test]
+    fn qwen_moe_join_plan_freezes_deployed_fused_epilogue() {
+        let plan = MoeJoinPlan::qwen38_flash(8);
+        assert_eq!(plan.hidden_size, 2560);
+        assert_eq!(plan.input_dtype, DataType::BFloat16 as u32);
+        assert_eq!(plan.output_dtype, DataType::BFloat16 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangFusedMoeJoin as u32
         );
     }
 

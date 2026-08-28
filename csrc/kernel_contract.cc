@@ -27,6 +27,9 @@
 #ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_SHARED_EXPERT
 #include "internal/shared_expert_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_SGLANG_FUSED_MOE_JOIN
+#include "internal/moe_join_backend.h"
+#endif
 #ifdef SPARKSERVE_WITH_SGLANG_PLE_GATHER
 #include "internal/ple_gather_backend.h"
 #endif
@@ -241,6 +244,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("MoE gate backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT:
       return Invalid("shared expert backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_FUSED_MOE_JOIN:
+      return Invalid("MoE join backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1066,6 +1071,84 @@ extern "C" SparkServeStatus sparkserve_shared_expert_launch(
   return sparkserve_sglang_cublas_shared_expert_cuda_launch(args);
 #else
   return Unavailable("cuBLAS/SGLang shared expert donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_moe_join_validate(
+    const SparkServeMoeJoinPlan* plan) {
+  if (plan == nullptr) return Invalid("MoE join plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_tokens == 0 || plan->num_tokens > 1U << 20) {
+    return Invalid("MoE join token count is invalid");
+  }
+  if (plan->hidden_size != 2560) {
+    return Unsupported("Qwen3.8 Flash-Next MoE join requires hidden=2560");
+  }
+  if (plan->input_dtype != SPARKSERVE_DTYPE_BF16 ||
+      plan->output_dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("Qwen MoE join requires BF16 tensors");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_SGLANG_FUSED_MOE_JOIN) {
+    return Invalid("unknown MoE join backend");
+  }
+  if (!CanMultiply(plan->num_tokens, plan->hidden_size)) {
+    return Invalid("MoE join buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_moe_join_query(
+    const SparkServeDeviceCaps* caps, const SparkServeMoeJoinPlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first MoE join is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_moe_join_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_SGLANG_FUSED_MOE_JOIN;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "sglang-fused-gate-sigmoid-mul-add";
+  info->source_revision =
+      "sglang@d91c3682b0b429e4c70df63cd57f819588ce29b0";
+#ifdef SPARKSERVE_WITH_SGLANG_FUSED_MOE_JOIN
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_moe_join_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeMoeJoinArgs* args) {
+  if (args == nullptr) return Invalid("MoE join arguments are required");
+  SparkServeStatus header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query = sparkserve_moe_join_query(caps, &args->plan, &info);
+  if (query.code != SPARKSERVE_STATUS_OK) return query;
+  if (args->hidden_states == nullptr || args->shared_gate_weight == nullptr ||
+      args->shared_output == nullptr || args->routed_output == nullptr) {
+    return Invalid("MoE join pointers cannot be null");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_FUSED_MOE_JOIN
+  return sparkserve_sglang_fused_moe_join_cuda_launch(args);
+#else
+  return Unavailable("SGLang fused MoE join donor is not linked");
 #endif
 }
 
