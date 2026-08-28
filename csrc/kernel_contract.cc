@@ -1010,6 +1010,10 @@ extern "C" SparkServeStatus sparkserve_shared_expert_validate(
           SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT) {
     return Invalid("unknown shared expert backend");
   }
+  if (plan->output_mode != SPARKSERVE_SHARED_EXPERT_OUTPUT_GATED &&
+      plan->output_mode != SPARKSERVE_SHARED_EXPERT_OUTPUT_UNGATED) {
+    return Invalid("unknown shared expert output mode");
+  }
   if (!CanMultiply(plan->num_tokens, plan->hidden_size) ||
       !CanMultiply(plan->num_tokens, plan->intermediate_size) ||
       !CanMultiply(plan->hidden_size, plan->intermediate_size)) {
@@ -1061,11 +1065,14 @@ extern "C" SparkServeStatus sparkserve_shared_expert_launch(
       sparkserve_shared_expert_query(caps, &args->plan, &info);
   if (query.code != SPARKSERVE_STATUS_OK) return query;
   if (args->hidden_states == nullptr || args->gate_up_weight == nullptr ||
-      args->down_weight == nullptr ||
-      args->shared_gate_weight == nullptr || args->gate_up == nullptr ||
-      args->activated == nullptr || args->shared_gate == nullptr ||
+      args->down_weight == nullptr || args->gate_up == nullptr ||
+      args->activated == nullptr ||
       args->output == nullptr || args->cublas_handle == nullptr) {
     return Invalid("shared expert pointers and cuBLAS handle cannot be null");
+  }
+  if (args->plan.output_mode == SPARKSERVE_SHARED_EXPERT_OUTPUT_GATED &&
+      (args->shared_gate_weight == nullptr || args->shared_gate == nullptr)) {
+    return Invalid("gated shared expert requires gate weight and scratch");
   }
 #ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_SHARED_EXPERT
   return sparkserve_sglang_cublas_shared_expert_cuda_launch(args);

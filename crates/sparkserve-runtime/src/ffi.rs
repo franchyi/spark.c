@@ -536,7 +536,7 @@ pub struct SharedExpertPlan {
     pub weight_dtype: u32,
     pub output_dtype: u32,
     pub requested_backend: u32,
-    pub reserved0: u32,
+    pub output_mode: u32,
     pub reserved1: u32,
     pub reserved2: u32,
 }
@@ -553,7 +553,7 @@ impl SharedExpertPlan {
             weight_dtype: DataType::BFloat16 as u32,
             output_dtype: DataType::BFloat16 as u32,
             requested_backend: crate::kernel::KernelBackend::SglangCublasSharedExpert as u32,
-            reserved0: 0,
+            output_mode: 1,
             reserved1: 0,
             reserved2: 0,
         }
@@ -1414,6 +1414,7 @@ mod tests {
         assert_eq!(plan.hidden_size, 2560);
         assert_eq!(plan.intermediate_size, 640);
         assert_eq!(plan.output_dtype, DataType::BFloat16 as u32);
+        assert_eq!(plan.output_mode, 1);
         assert_eq!(
             plan.requested_backend,
             KernelBackend::SglangCublasSharedExpert as u32

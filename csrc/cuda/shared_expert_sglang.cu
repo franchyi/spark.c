@@ -153,11 +153,13 @@ SparkServeStatus sparkserve_sglang_cublas_shared_expert_cuda_launch(
     return CublasError("cuBLAS shared merged gate/up projection failed: ",
                        status);
   }
-  status = RowMajorBf16Linear(handle, tokens, 1, kHidden,
-                              args->hidden_states, args->shared_gate_weight,
-                              args->shared_gate, 1);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return CublasError("cuBLAS shared scalar gate failed: ", status);
+  if (args->plan.output_mode == SPARKSERVE_SHARED_EXPERT_OUTPUT_GATED) {
+    status = RowMajorBf16Linear(handle, tokens, 1, kHidden,
+                                args->hidden_states, args->shared_gate_weight,
+                                args->shared_gate, 1);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      return CublasError("cuBLAS shared scalar gate failed: ", status);
+    }
   }
 
   const int activation_vectors = tokens * (kIntermediate / kVectorElements);
@@ -175,6 +177,9 @@ SparkServeStatus sparkserve_sglang_cublas_shared_expert_cuda_launch(
                               kHidden);
   if (status != CUBLAS_STATUS_SUCCESS) {
     return CublasError("cuBLAS shared down projection failed: ", status);
+  }
+  if (args->plan.output_mode == SPARKSERVE_SHARED_EXPERT_OUTPUT_UNGATED) {
+    return Ok();
   }
   const int output_vectors = tokens * (kHidden / kVectorElements);
   SglangSigmoidGateBroadcast<<<(output_vectors + kThreads - 1) / kThreads,

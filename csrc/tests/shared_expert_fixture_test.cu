@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
       SPARKSERVE_DTYPE_BF16,
       SPARKSERVE_DTYPE_BF16,
       SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT,
-      0,
+      SPARKSERVE_SHARED_EXPERT_OUTPUT_GATED,
       0,
       0,
   };

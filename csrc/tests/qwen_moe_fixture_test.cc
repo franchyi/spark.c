@@ -1,5 +1,6 @@
 #include "sparkserve/kernel_api.h"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <cassert>
@@ -11,14 +12,12 @@
 
 namespace {
 
-constexpr uint32_t kExperts = 2;
-constexpr uint64_t kRows = 8;
-constexpr uint64_t kScaleRows = 256;
 constexpr uint64_t kHidden = 2560;
 constexpr uint64_t kMoe = 640;
 constexpr size_t kWorkspaceBytes = 32ULL * 1024ULL * 1024ULL;
 
 void CudaOk(cudaError_t error) { assert(error == cudaSuccess); }
+void CublasOk(cublasStatus_t status) { assert(status == CUBLAS_STATUS_SUCCESS); }
 
 std::vector<uint8_t> Read(const std::filesystem::path& path,
                           size_t expected_bytes) {
@@ -60,7 +59,8 @@ void ExpectBytes(void* device, const std::vector<uint8_t>& expected,
 }
 
 SparkServeGroupedNvfp4Args GroupedArgs(
-    uint64_t n, uint64_t k, const void* input, const void* input_scales,
+    uint32_t experts, uint64_t rows, uint64_t scale_rows, uint64_t n,
+    uint64_t k, const void* input, const void* input_scales,
     const void* weights, const void* weight_scales, const int32_t* m_indptr,
     const float* alpha, void* output, void* int_workspace,
     void* float_workspace) {
@@ -70,10 +70,10 @@ SparkServeGroupedNvfp4Args GroupedArgs(
   args.plan = {
       sizeof(SparkServeGroupedNvfp4Plan),
       SPARKSERVE_KERNEL_ABI_VERSION,
-      kExperts,
+      experts,
       16,
-      kRows,
-      kScaleRows,
+      rows,
+      scale_rows,
       n,
       k,
       128,
@@ -103,45 +103,57 @@ SparkServeGroupedNvfp4Args GroupedArgs(
 int main(int argc, char** argv) {
   assert(argc == 2);
   const std::filesystem::path fixture(argv[1]);
-  const auto token_input_host =
-      Read(fixture / "token_input_bf16.bin", 2 * kHidden * 2);
+  const bool joined = std::filesystem::exists(fixture / "joined_output_bf16.bin");
+  const uint32_t num_tokens = joined ? 1 : 2;
+  const uint32_t top_k = joined ? 10 : 2;
+  const uint32_t experts = joined ? 10 : 2;
+  const uint64_t rows = static_cast<uint64_t>(experts) * 4;
+  const uint64_t scale_rows = static_cast<uint64_t>(experts) * 128;
+  const auto token_input_host = Read(
+      fixture / (joined ? "hidden_bf16.bin" : "token_input_bf16.bin"),
+      num_tokens * kHidden * 2);
   const auto route_map_host =
-      Read(fixture / "route_to_packed_u32.bin", 4 * sizeof(uint32_t));
+      Read(fixture / "route_to_packed_u32.bin",
+           num_tokens * top_k * sizeof(uint32_t));
   const auto route_weights_host =
-      Read(fixture / "route_weights_f32.bin", 4 * sizeof(float));
+      Read(fixture / "route_weights_f32.bin",
+           num_tokens * top_k * sizeof(float));
   const auto packed_input_expected =
-      Read(fixture / "packed_input_bf16.bin", kRows * kHidden * 2);
-  const auto input_host = Read(fixture / "input_fp4.bin", kRows * kHidden / 2);
+      Read(fixture / "packed_input_bf16.bin", rows * kHidden * 2);
+  const auto input_host = Read(fixture / "input_fp4.bin", rows * kHidden / 2);
   const auto input_scales_host =
-      Read(fixture / "input_scales.bin", kScaleRows * kHidden / 16);
+      Read(fixture / "input_scales.bin", scale_rows * kHidden / 16);
   const auto w13_global_host =
-      Read(fixture / "w13_global_scales_f32.bin", kExperts * sizeof(float));
+      Read(fixture / "w13_global_scales_f32.bin", experts * sizeof(float));
   const auto w13_host =
-      Read(fixture / "w13_fp4.bin", kExperts * 2 * kMoe * kHidden / 2);
+      Read(fixture / "w13_fp4.bin", experts * 2 * kMoe * kHidden / 2);
   const auto w13_scales_host = Read(
-      fixture / "w13_scales.bin", kExperts * 2 * kMoe * kHidden / 16);
+      fixture / "w13_scales.bin", experts * 2 * kMoe * kHidden / 16);
   const auto w13_alpha_host =
-      Read(fixture / "w13_alpha_f32.bin", kExperts * sizeof(float));
+      Read(fixture / "w13_alpha_f32.bin", experts * sizeof(float));
   const auto m_indptr_host =
-      Read(fixture / "m_indptr_i32.bin", (kExperts + 1) * sizeof(int32_t));
-  const auto gateup_expected =
-      Read(fixture / "gateup_bf16.bin", kRows * 2 * kMoe * 2);
+      Read(fixture / "m_indptr_i32.bin", (experts + 1) * sizeof(int32_t));
+  const auto gateup_expected = Read(
+      fixture / (joined ? "gate_up_bf16.bin" : "gateup_bf16.bin"),
+      rows * 2 * kMoe * 2);
   const auto down_global_host = Read(fixture / "down_global_scales_f32.bin",
-                                     kExperts * sizeof(float));
+                                     experts * sizeof(float));
   const auto down_input_expected =
-      Read(fixture / "down_input_fp4.bin", kRows * kMoe / 2);
+      Read(fixture / "down_input_fp4.bin", rows * kMoe / 2);
   const auto down_scales_expected =
-      Read(fixture / "down_input_scales.bin", kScaleRows * kMoe / 16);
+      Read(fixture / "down_input_scales.bin", scale_rows * kMoe / 16);
   const auto w2_host =
-      Read(fixture / "w2_fp4.bin", kExperts * kHidden * kMoe / 2);
+      Read(fixture / "w2_fp4.bin", experts * kHidden * kMoe / 2);
   const auto w2_scales_host =
-      Read(fixture / "w2_scales.bin", kExperts * kHidden * kMoe / 16);
+      Read(fixture / "w2_scales.bin", experts * kHidden * kMoe / 16);
   const auto w2_alpha_host =
-      Read(fixture / "w2_alpha_f32.bin", kExperts * sizeof(float));
-  const auto output_expected =
-      Read(fixture / "output_bf16.bin", kRows * kHidden * 2);
-  const auto final_output_expected =
-      Read(fixture / "final_output_bf16.bin", 2 * kHidden * 2);
+      Read(fixture / "w2_alpha_f32.bin", experts * sizeof(float));
+  const auto output_expected = Read(
+      fixture / (joined ? "expert_output_bf16.bin" : "output_bf16.bin"),
+      rows * kHidden * 2);
+  const auto final_output_expected = Read(
+      fixture / (joined ? "routed_output_bf16.bin" : "final_output_bf16.bin"),
+      num_tokens * kHidden * 2);
 
   void* token_input = Upload(token_input_host);
   void* route_map = Upload(route_map_host);
@@ -173,9 +185,9 @@ int main(int argc, char** argv) {
   route.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
   route.plan = {
       sizeof(SparkServeMoeRoutePlan), SPARKSERVE_KERNEL_ABI_VERSION,
-      2,                               2,
-      kExperts,                        0,
-      kHidden,                         kRows,
+      num_tokens,                      top_k,
+      experts,                         0,
+      kHidden,                         rows,
   };
   route.token_input = token_input;
   route.route_to_packed_row = static_cast<const uint32_t*>(route_map);
@@ -188,19 +200,24 @@ int main(int argc, char** argv) {
   CudaOk(cudaDeviceSynchronize());
   ExpectBytes(packed_input_bf16, packed_input_expected, "route dispatch");
 
-  const int32_t active_rows[] = {2, 2};
-  const int32_t m_indptr_cpu[] = {0, 4, 8};
-  const uint64_t scale_offsets[] = {0, 128};
+  std::vector<int32_t> active_rows(experts, joined ? 1 : 2);
+  std::vector<int32_t> m_indptr_cpu(experts + 1);
+  std::vector<uint64_t> scale_offsets(experts);
+  for (uint32_t expert = 0; expert < experts; ++expert) {
+    m_indptr_cpu[expert] = static_cast<int32_t>(expert * 4);
+    scale_offsets[expert] = static_cast<uint64_t>(expert) * 128;
+  }
+  m_indptr_cpu[experts] = static_cast<int32_t>(rows);
   SparkServeSegmentedNvfp4QuantizeArgs quantize = {};
   quantize.struct_size = sizeof(quantize);
   quantize.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
   quantize.plan = {
       sizeof(SparkServeSegmentedNvfp4QuantizePlan),
       SPARKSERVE_KERNEL_ABI_VERSION,
-      kExperts,
+      experts,
       16,
-      kRows,
-      kScaleRows,
+      rows,
+      scale_rows,
       kHidden,
       SPARKSERVE_DTYPE_BF16,
       SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4,
@@ -209,9 +226,9 @@ int main(int argc, char** argv) {
   };
   quantize.input = packed_input_bf16;
   quantize.input_global_scales = static_cast<const float*>(w13_global);
-  quantize.active_rows_host = active_rows;
-  quantize.m_indptr_host = m_indptr_cpu;
-  quantize.scale_row_offsets_host = scale_offsets;
+  quantize.active_rows_host = active_rows.data();
+  quantize.m_indptr_host = m_indptr_cpu.data();
+  quantize.scale_row_offsets_host = scale_offsets.data();
   quantize.packed_output = input;
   quantize.output_scales = input_scales;
   quantize.input_row_stride_bytes = kHidden * 2;
@@ -225,7 +242,8 @@ int main(int argc, char** argv) {
   ExpectBytes(input_scales, input_scales_host, "routed input scales");
 
   auto gateup_args = GroupedArgs(
-      2 * kMoe, kHidden, input, input_scales, w13, w13_scales,
+      experts, rows, scale_rows, 2 * kMoe, kHidden, input, input_scales, w13,
+      w13_scales,
       static_cast<const int32_t*>(m_indptr), static_cast<const float*>(w13_alpha),
       gateup, int_workspace, float_workspace);
   status = sparkserve_grouped_nvfp4_launch(&caps, &gateup_args);
@@ -240,10 +258,10 @@ int main(int argc, char** argv) {
   activation.plan = {
       sizeof(SparkServeSegmentedSiluNvfp4Plan),
       SPARKSERVE_KERNEL_ABI_VERSION,
-      kExperts,
+      experts,
       16,
-      kRows,
-      kScaleRows,
+      rows,
+      scale_rows,
       kMoe,
       SPARKSERVE_DTYPE_BF16,
       SPARKSERVE_SCALE_LAYOUT_CUTLASS_128X4,
@@ -252,9 +270,9 @@ int main(int argc, char** argv) {
   };
   activation.input = gateup;
   activation.input_global_scales = static_cast<const float*>(down_global);
-  activation.active_rows_host = active_rows;
-  activation.m_indptr_host = m_indptr_cpu;
-  activation.scale_row_offsets_host = scale_offsets;
+  activation.active_rows_host = active_rows.data();
+  activation.m_indptr_host = m_indptr_cpu.data();
+  activation.scale_row_offsets_host = scale_offsets.data();
   activation.packed_output = down_input;
   activation.output_scales = down_scales;
   activation.input_row_stride_bytes = kMoe * 4;
@@ -268,7 +286,8 @@ int main(int argc, char** argv) {
   ExpectBytes(down_scales, down_scales_expected, "fused activation scales");
 
   auto down_args = GroupedArgs(
-      kHidden, kMoe, down_input, down_scales, w2, w2_scales,
+      experts, rows, scale_rows, kHidden, kMoe, down_input, down_scales, w2,
+      w2_scales,
       static_cast<const int32_t*>(m_indptr), static_cast<const float*>(w2_alpha),
       output, int_workspace, float_workspace);
   status = sparkserve_grouped_nvfp4_launch(&caps, &down_args);
@@ -286,6 +305,141 @@ int main(int argc, char** argv) {
   assert(status.code == SPARKSERVE_STATUS_OK);
   CudaOk(cudaDeviceSynchronize());
   ExpectBytes(final_output, final_output_expected, "weighted route finalize");
+
+  if (joined) {
+    const auto router_weight_host =
+        Read(fixture / "router_weight_bf16.bin", 512 * kHidden * 2);
+    const auto router_logits_expected =
+        Read(fixture / "router_logits_bf16.bin", num_tokens * 512 * 2);
+    const auto route_ids_expected =
+        Read(fixture / "route_experts_i32.bin",
+             num_tokens * top_k * sizeof(int32_t));
+    const auto gate_weights_expected =
+        Read(fixture / "route_weights_f32.bin",
+             num_tokens * top_k * sizeof(float));
+    void* router_weight = Upload(router_weight_host);
+    void* router_logits = Allocate(router_logits_expected.size());
+    void* gate_weights = Allocate(gate_weights_expected.size());
+    void* route_ids = Allocate(route_ids_expected.size());
+    cublasHandle_t blas = nullptr;
+    CublasOk(cublasCreate(&blas));
+
+    SparkServeMoeGateArgs gate = {};
+    gate.struct_size = sizeof(gate);
+    gate.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+    gate.plan = {sizeof(SparkServeMoeGatePlan),
+                 SPARKSERVE_KERNEL_ABI_VERSION,
+                 num_tokens,
+                 kHidden,
+                 512,
+                 top_k,
+                 SPARKSERVE_DTYPE_BF16,
+                 SPARKSERVE_DTYPE_BF16,
+                 SPARKSERVE_DTYPE_BF16,
+                 SPARKSERVE_BACKEND_SGLANG_CUBLAS_MOE_GATE,
+                 1,
+                 0};
+    gate.hidden_states = token_input;
+    gate.router_weight = router_weight;
+    gate.router_logits = router_logits;
+    gate.topk_weights = static_cast<float*>(gate_weights);
+    gate.topk_ids = static_cast<int32_t*>(route_ids);
+    gate.cublas_handle = blas;
+    status = sparkserve_moe_gate_launch(&caps, &gate);
+    if (status.code != SPARKSERVE_STATUS_OK) std::cerr << status.message << '\n';
+    assert(status.code == SPARKSERVE_STATUS_OK);
+    CudaOk(cudaDeviceSynchronize());
+    ExpectBytes(router_logits, router_logits_expected, "joined router logits");
+    ExpectBytes(route_ids, route_ids_expected, "joined router ids");
+    ExpectBytes(gate_weights, gate_weights_expected, "joined router weights");
+
+    const auto shared_gate_up_weight_host = Read(
+        fixture / "shared_gate_up_weight_bf16.bin", 2 * kMoe * kHidden * 2);
+    const auto shared_down_weight_host = Read(
+        fixture / "shared_down_weight_bf16.bin", kHidden * kMoe * 2);
+    const auto shared_gate_weight_host =
+        Read(fixture / "shared_gate_weight_bf16.bin", kHidden * 2);
+    const auto shared_gate_up_expected = Read(
+        fixture / "shared_gate_up_bf16.bin", num_tokens * 2 * kMoe * 2);
+    const auto shared_activated_expected = Read(
+        fixture / "shared_activated_bf16.bin", num_tokens * kMoe * 2);
+    const auto shared_ungated_expected = Read(
+        fixture / "shared_ungated_bf16.bin", num_tokens * kHidden * 2);
+    const auto joined_expected =
+        Read(fixture / "joined_output_bf16.bin", num_tokens * kHidden * 2);
+    void* shared_gate_up_weight = Upload(shared_gate_up_weight_host);
+    void* shared_down_weight = Upload(shared_down_weight_host);
+    void* shared_gate_weight = Upload(shared_gate_weight_host);
+    void* shared_gate_up = Allocate(shared_gate_up_expected.size());
+    void* shared_activated = Allocate(shared_activated_expected.size());
+    void* shared_ungated = Allocate(shared_ungated_expected.size());
+
+    SparkServeSharedExpertArgs shared = {};
+    shared.struct_size = sizeof(shared);
+    shared.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+    shared.plan = {sizeof(SparkServeSharedExpertPlan),
+                   SPARKSERVE_KERNEL_ABI_VERSION,
+                   num_tokens,
+                   kHidden,
+                   kMoe,
+                   SPARKSERVE_DTYPE_BF16,
+                   SPARKSERVE_DTYPE_BF16,
+                   SPARKSERVE_DTYPE_BF16,
+                   SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT,
+                   SPARKSERVE_SHARED_EXPERT_OUTPUT_UNGATED,
+                   0,
+                   0};
+    shared.hidden_states = token_input;
+    shared.gate_up_weight = shared_gate_up_weight;
+    shared.down_weight = shared_down_weight;
+    shared.gate_up = shared_gate_up;
+    shared.activated = shared_activated;
+    shared.output = shared_ungated;
+    shared.cublas_handle = blas;
+    status = sparkserve_shared_expert_launch(&caps, &shared);
+    if (status.code != SPARKSERVE_STATUS_OK) std::cerr << status.message << '\n';
+    assert(status.code == SPARKSERVE_STATUS_OK);
+    CudaOk(cudaDeviceSynchronize());
+    ExpectBytes(shared_gate_up, shared_gate_up_expected,
+                "joined shared gate/up");
+    ExpectBytes(shared_activated, shared_activated_expected,
+                "joined shared activation");
+    ExpectBytes(shared_ungated, shared_ungated_expected,
+                "joined shared ungated down");
+
+    SparkServeMoeJoinArgs join = {};
+    join.struct_size = sizeof(join);
+    join.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+    join.plan = {sizeof(SparkServeMoeJoinPlan),
+                 SPARKSERVE_KERNEL_ABI_VERSION,
+                 num_tokens,
+                 kHidden,
+                 SPARKSERVE_DTYPE_BF16,
+                 SPARKSERVE_DTYPE_BF16,
+                 SPARKSERVE_BACKEND_SGLANG_FUSED_MOE_JOIN,
+                 0};
+    join.hidden_states = token_input;
+    join.shared_gate_weight = shared_gate_weight;
+    join.shared_output = shared_ungated;
+    join.routed_output = final_output;
+    status = sparkserve_moe_join_launch(&caps, &join);
+    if (status.code != SPARKSERVE_STATUS_OK) std::cerr << status.message << '\n';
+    assert(status.code == SPARKSERVE_STATUS_OK);
+    CudaOk(cudaDeviceSynchronize());
+    ExpectBytes(final_output, joined_expected, "joined routed plus shared");
+
+    CudaOk(cudaFree(shared_ungated));
+    CudaOk(cudaFree(shared_activated));
+    CudaOk(cudaFree(shared_gate_up));
+    CudaOk(cudaFree(shared_gate_weight));
+    CudaOk(cudaFree(shared_down_weight));
+    CudaOk(cudaFree(shared_gate_up_weight));
+    CublasOk(cublasDestroy(blas));
+    CudaOk(cudaFree(route_ids));
+    CudaOk(cudaFree(gate_weights));
+    CudaOk(cudaFree(router_logits));
+    CudaOk(cudaFree(router_weight));
+  }
 
   CudaOk(cudaFree(float_workspace));
   CudaOk(cudaFree(int_workspace));

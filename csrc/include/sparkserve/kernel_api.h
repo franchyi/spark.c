@@ -88,6 +88,14 @@ typedef enum SparkServeGdnBackend {
   SPARKSERVE_GDN_BACKEND_FLASHINFER = 2,
 } SparkServeGdnBackend;
 
+typedef enum SparkServeSharedExpertOutputMode {
+  // Legacy isolated branch: materialize sigmoid(shared_gate) * shared output.
+  SPARKSERVE_SHARED_EXPERT_OUTPUT_GATED = 0,
+  // Production path: leave the down projection ungated for the borrowed
+  // fused gate/sigmoid/multiply/add epilogue.
+  SPARKSERVE_SHARED_EXPERT_OUTPUT_UNGATED = 1,
+} SparkServeSharedExpertOutputMode;
+
 typedef struct SparkServeStatus {
   int32_t code;
   const char* message;
@@ -388,7 +396,7 @@ typedef struct SparkServeSharedExpertPlan {
   uint32_t weight_dtype;
   uint32_t output_dtype;
   uint32_t requested_backend;
-  uint32_t reserved0;
+  uint32_t output_mode;
   uint32_t reserved1;
   uint32_t reserved2;
 } SparkServeSharedExpertPlan;
@@ -408,7 +416,8 @@ typedef struct SparkServeSharedExpertArgs {
   void* gate_up;
   void* activated;
   void* shared_gate;
-  // BF16 [tokens,hidden], already multiplied by sigmoid(shared_gate).
+  // BF16 [tokens,hidden]. GATED mode applies sigmoid(shared_gate); UNGATED
+  // mode leaves the down projection ready for sparkserve_moe_join_launch.
   void* output;
   void* cublas_handle;
   void* cuda_stream;
