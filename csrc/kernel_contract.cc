@@ -1055,8 +1055,8 @@ extern "C" SparkServeStatus sparkserve_shared_expert_launch(
   SparkServeStatus query =
       sparkserve_shared_expert_query(caps, &args->plan, &info);
   if (query.code != SPARKSERVE_STATUS_OK) return query;
-  if (args->hidden_states == nullptr || args->gate_weight == nullptr ||
-      args->up_weight == nullptr || args->down_weight == nullptr ||
+  if (args->hidden_states == nullptr || args->gate_up_weight == nullptr ||
+      args->down_weight == nullptr ||
       args->shared_gate_weight == nullptr || args->gate_up == nullptr ||
       args->activated == nullptr || args->shared_gate == nullptr ||
       args->output == nullptr || args->cublas_handle == nullptr) {

@@ -60,6 +60,7 @@ def main() -> None:
     write_tensor(args.output / "hidden_bf16.bin", hidden)
     for name, tensor in tensors.items():
         write_tensor(args.output / f"{name}_bf16.bin", tensor)
+    write_tensor(args.output / "gate_up_weight_bf16.bin", merged_weight)
     write_tensor(args.output / "gate_up_bf16.bin", gate_up)
     write_tensor(args.output / "activated_bf16.bin", activated)
     write_tensor(args.output / "down_output_bf16.bin", down_output)

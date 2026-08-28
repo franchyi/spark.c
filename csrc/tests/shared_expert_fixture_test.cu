@@ -63,10 +63,8 @@ int main(int argc, char** argv) {
   assert(argc == 2);
   const std::filesystem::path fixture(argv[1]);
   const auto hidden = Read(fixture / "hidden_bf16.bin", kTokens * kHidden * 2);
-  const auto gate_weight = Read(fixture / "gate_weight_bf16.bin",
-                                kIntermediate * kHidden * 2);
-  const auto up_weight = Read(fixture / "up_weight_bf16.bin",
-                              kIntermediate * kHidden * 2);
+  const auto gate_up_weight = Read(fixture / "gate_up_weight_bf16.bin",
+                                   2 * kIntermediate * kHidden * 2);
   const auto down_weight = Read(fixture / "down_weight_bf16.bin",
                                 kHidden * kIntermediate * 2);
   const auto shared_gate_weight =
@@ -83,8 +81,7 @@ int main(int argc, char** argv) {
       Read(fixture / "output_bf16.bin", kTokens * kHidden * 2);
 
   void* hidden_device = Upload(hidden);
-  void* gate_weight_device = Upload(gate_weight);
-  void* up_weight_device = Upload(up_weight);
+  void* gate_up_weight_device = Upload(gate_up_weight);
   void* down_weight_device = Upload(down_weight);
   void* shared_gate_weight_device = Upload(shared_gate_weight);
   void* gate_up_device = Allocate(expected_gate_up.size());
@@ -115,8 +112,7 @@ int main(int argc, char** argv) {
   args.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
   args.plan = plan;
   args.hidden_states = hidden_device;
-  args.gate_weight = gate_weight_device;
-  args.up_weight = up_weight_device;
+  args.gate_up_weight = gate_up_weight_device;
   args.down_weight = down_weight_device;
   args.shared_gate_weight = shared_gate_weight_device;
   args.gate_up = gate_up_device;
@@ -165,8 +161,7 @@ int main(int argc, char** argv) {
   CudaOk(cudaFree(gate_up_device));
   CudaOk(cudaFree(shared_gate_weight_device));
   CudaOk(cudaFree(down_weight_device));
-  CudaOk(cudaFree(up_weight_device));
-  CudaOk(cudaFree(gate_weight_device));
+  CudaOk(cudaFree(gate_up_weight_device));
   CudaOk(cudaFree(hidden_device));
   return 0;
 }

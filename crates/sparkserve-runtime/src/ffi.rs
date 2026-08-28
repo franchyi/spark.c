@@ -567,8 +567,7 @@ pub struct SharedExpertArgs {
     pub abi_version: u32,
     pub plan: SharedExpertPlan,
     pub hidden_states: *const c_void,
-    pub gate_weight: *const c_void,
-    pub up_weight: *const c_void,
+    pub gate_up_weight: *const c_void,
     pub down_weight: *const c_void,
     pub shared_gate_weight: *const c_void,
     pub gate_up: *mut c_void,
@@ -1302,7 +1301,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<MoeGatePlan>(), 48);
         assert_eq!(std::mem::size_of::<MoeGateArgs>(), 112);
         assert_eq!(std::mem::size_of::<SharedExpertPlan>(), 48);
-        assert_eq!(std::mem::size_of::<SharedExpertArgs>(), 144);
+        assert_eq!(std::mem::size_of::<SharedExpertArgs>(), 136);
         assert_eq!(std::mem::size_of::<PleRowFragment>(), 24);
         assert_eq!(std::mem::size_of::<PleGatherPlan>(), 32);
         assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);

@@ -34,7 +34,7 @@ _Static_assert(sizeof(SparkServeMoeGateArgs) == 112u,
                "C MoE gate arguments layout drifted");
 _Static_assert(sizeof(SparkServeSharedExpertPlan) == 48u,
                "C shared expert plan layout drifted");
-_Static_assert(sizeof(SparkServeSharedExpertArgs) == 144u,
+_Static_assert(sizeof(SparkServeSharedExpertArgs) == 136u,
                "C shared expert arguments layout drifted");
 _Static_assert(sizeof(SparkServeQsaExpandPlan) == 40u,
                "C QSA expansion plan layout drifted");

@@ -146,18 +146,12 @@ SparkServeStatus sparkserve_sglang_cublas_shared_expert_cuda_launch(
                        status);
   }
 
-  status = RowMajorBf16Linear(handle, tokens, kIntermediate, kHidden,
-                              args->hidden_states, args->gate_weight,
+  status = RowMajorBf16Linear(handle, tokens, kGateUp, kHidden,
+                              args->hidden_states, args->gate_up_weight,
                               args->gate_up, kGateUp);
   if (status != CUBLAS_STATUS_SUCCESS) {
-    return CublasError("cuBLAS shared gate projection failed: ", status);
-  }
-  auto* up_output = static_cast<__nv_bfloat16*>(args->gate_up) + kIntermediate;
-  status = RowMajorBf16Linear(handle, tokens, kIntermediate, kHidden,
-                              args->hidden_states, args->up_weight, up_output,
-                              kGateUp);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return CublasError("cuBLAS shared up projection failed: ", status);
+    return CublasError("cuBLAS shared merged gate/up projection failed: ",
+                       status);
   }
   status = RowMajorBf16Linear(handle, tokens, 1, kHidden,
                               args->hidden_states, args->shared_gate_weight,

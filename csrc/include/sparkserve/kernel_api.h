@@ -395,8 +395,9 @@ typedef struct SparkServeSharedExpertArgs {
   uint32_t abi_version;
   SparkServeSharedExpertPlan plan;
   const void* hidden_states;
-  const void* gate_weight;
-  const void* up_weight;
+  // BF16 [2*intermediate,hidden] in SGLang merged gate/up order. The loader
+  // reads the two checkpoint slices directly into this final resident region.
+  const void* gate_up_weight;
   const void* down_weight;
   const void* shared_gate_weight;
   // Fixed BF16 scratch: [tokens,2*intermediate], [tokens,intermediate],
