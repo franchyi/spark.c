@@ -1,6 +1,7 @@
 #include "sparkserve/fabric_api.h"
 
 #include <cuda_runtime_api.h>
+#include <cublas_v2.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,10 @@ struct SparkServeCudaStream {
 
 struct SparkServeCudaEvent {
   cudaEvent_t event = nullptr;
+};
+
+struct SparkServeCudaBlas {
+  cublasHandle_t handle = nullptr;
 };
 
 namespace {
@@ -28,6 +33,12 @@ SparkServeStatus Invalid(const char* message) {
 SparkServeStatus CudaStatus(const char* prefix, cudaError_t error) {
   g_cuda_runtime_error.assign(prefix);
   g_cuda_runtime_error.append(cudaGetErrorString(error));
+  return {SPARKSERVE_STATUS_INTERNAL, g_cuda_runtime_error.c_str()};
+}
+
+SparkServeStatus CublasStatus(const char* prefix, cublasStatus_t status) {
+  g_cuda_runtime_error.assign(prefix);
+  g_cuda_runtime_error.append(std::to_string(static_cast<int>(status)));
   return {SPARKSERVE_STATUS_INTERNAL, g_cuda_runtime_error.c_str()};
 }
 
@@ -177,6 +188,43 @@ extern "C" SparkServeStatus sparkserve_cuda_event_destroy(
   delete owner;
   if (error != cudaSuccess) {
     return CudaStatus("CUDA event destroy failed: ", error);
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_cuda_blas_create(
+    SparkServeCudaBlas** output) {
+  if (output == nullptr) return Invalid("cuBLAS owner output is required");
+  *output = nullptr;
+  auto* owner = new (std::nothrow) SparkServeCudaBlas;
+  if (owner == nullptr) {
+    return {SPARKSERVE_STATUS_INTERNAL, "cannot allocate cuBLAS owner"};
+  }
+  const cublasStatus_t status = cublasCreate(&owner->handle);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    delete owner;
+    return CublasStatus("cuBLAS handle creation failed with status ", status);
+  }
+  *output = owner;
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_cuda_blas_raw(
+    const SparkServeCudaBlas* owner, void** raw_blas) {
+  if (owner == nullptr || raw_blas == nullptr) {
+    return Invalid("cuBLAS owner and raw output are required");
+  }
+  *raw_blas = owner->handle;
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_cuda_blas_destroy(
+    SparkServeCudaBlas* owner) {
+  if (owner == nullptr) return Ok();
+  const cublasStatus_t status = cublasDestroy(owner->handle);
+  delete owner;
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return CublasStatus("cuBLAS handle destroy failed with status ", status);
   }
   return Ok();
 }

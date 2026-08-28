@@ -42,6 +42,7 @@ pub enum KernelBackend {
     FlashInferXqaDecode = 11,
     SglangQsaExpand = 12,
     TilelangQsaScore = 13,
+    SglangCublasMoeGate = 14,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

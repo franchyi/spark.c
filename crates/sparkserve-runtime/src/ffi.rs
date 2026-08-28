@@ -107,6 +107,11 @@ pub struct CudaEvent {
 }
 
 #[repr(C)]
+pub struct CudaBlas {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCaps {
     pub struct_size: u32,
@@ -465,6 +470,57 @@ pub struct MoeRouteArgs {
     pub token_input_row_stride_bytes: u64,
     pub packed_row_stride_bytes: u64,
     pub expert_output_row_stride_bytes: u64,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoeGatePlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_tokens: u32,
+    pub hidden_size: u32,
+    pub num_experts: u32,
+    pub top_k: u32,
+    pub input_dtype: u32,
+    pub weight_dtype: u32,
+    pub logits_dtype: u32,
+    pub requested_backend: u32,
+    pub renormalize: u32,
+    pub reserved: u32,
+}
+
+impl MoeGatePlan {
+    pub fn qwen38_flash(num_tokens: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_tokens,
+            hidden_size: 2560,
+            num_experts: 512,
+            top_k: 10,
+            input_dtype: DataType::BFloat16 as u32,
+            weight_dtype: DataType::BFloat16 as u32,
+            logits_dtype: DataType::BFloat16 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangCublasMoeGate as u32,
+            renormalize: 1,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MoeGateArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: MoeGatePlan,
+    pub hidden_states: *const c_void,
+    pub router_weight: *const c_void,
+    pub router_logits: *mut c_void,
+    pub topk_weights: *mut f32,
+    pub topk_ids: *mut i32,
+    pub cublas_handle: *mut c_void,
     pub cuda_stream: *mut c_void,
 }
 
@@ -994,6 +1050,9 @@ unsafe extern "C" {
     pub fn sparkserve_cuda_event_query(event: *const CudaEvent, complete: *mut u32) -> Status;
     pub fn sparkserve_cuda_event_synchronize(event: *mut CudaEvent) -> Status;
     pub fn sparkserve_cuda_event_destroy(event: *mut CudaEvent) -> Status;
+    pub fn sparkserve_cuda_blas_create(blas: *mut *mut CudaBlas) -> Status;
+    pub fn sparkserve_cuda_blas_raw(blas: *const CudaBlas, raw_blas: *mut *mut c_void) -> Status;
+    pub fn sparkserve_cuda_blas_destroy(blas: *mut CudaBlas) -> Status;
     pub fn sparkserve_kernel_abi_version() -> u32;
     pub fn sparkserve_dense_nvfp4_validate(plan: *const DenseNvfp4Plan) -> Status;
     pub fn sparkserve_dense_nvfp4_query(
@@ -1061,6 +1120,13 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const MoeRouteArgs,
     ) -> Status;
+    pub fn sparkserve_moe_gate_validate(plan: *const MoeGatePlan) -> Status;
+    pub fn sparkserve_moe_gate_query(
+        caps: *const DeviceCaps,
+        plan: *const MoeGatePlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_moe_gate_launch(caps: *const DeviceCaps, args: *const MoeGateArgs) -> Status;
     pub fn sparkserve_ple_gather_validate(plan: *const PleGatherPlan) -> Status;
     pub fn sparkserve_ple_gather_query(
         caps: *const DeviceCaps,
@@ -1168,6 +1234,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<SegmentedNvfp4QuantizeArgs>(), 152);
         assert_eq!(std::mem::size_of::<MoeRoutePlan>(), 40);
         assert_eq!(std::mem::size_of::<MoeRouteArgs>(), 128);
+        assert_eq!(std::mem::size_of::<MoeGatePlan>(), 48);
+        assert_eq!(std::mem::size_of::<MoeGateArgs>(), 112);
         assert_eq!(std::mem::size_of::<PleRowFragment>(), 24);
         assert_eq!(std::mem::size_of::<PleGatherPlan>(), 32);
         assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);
@@ -1208,6 +1276,20 @@ mod tests {
         assert_eq!(plan.value_dim, 128);
         assert_eq!(plan.state_dtype, DataType::BFloat16 as u32);
         assert_eq!(plan.requested_backend, GdnBackend::Auto as u32);
+    }
+
+    #[test]
+    fn qwen_moe_gate_plan_freezes_router_geometry() {
+        let plan = MoeGatePlan::qwen38_flash(8);
+        assert_eq!(plan.hidden_size, 2560);
+        assert_eq!(plan.num_experts, 512);
+        assert_eq!(plan.top_k, 10);
+        assert_eq!(plan.logits_dtype, DataType::BFloat16 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangCublasMoeGate as u32
+        );
+        assert_eq!(plan.renormalize, 1);
     }
 
     #[test]

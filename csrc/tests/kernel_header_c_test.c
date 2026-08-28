@@ -28,6 +28,10 @@ _Static_assert(sizeof(SparkServeMoeRoutePlan) == 40u,
                "C MoE route plan layout drifted");
 _Static_assert(sizeof(SparkServeMoeRouteArgs) == 128u,
                "C MoE route arguments layout drifted");
+_Static_assert(sizeof(SparkServeMoeGatePlan) == 48u,
+               "C MoE gate plan layout drifted");
+_Static_assert(sizeof(SparkServeMoeGateArgs) == 112u,
+               "C MoE gate arguments layout drifted");
 _Static_assert(sizeof(SparkServeQsaExpandPlan) == 40u,
                "C QSA expansion plan layout drifted");
 _Static_assert(sizeof(SparkServeQsaExpandArgs) == 88u,

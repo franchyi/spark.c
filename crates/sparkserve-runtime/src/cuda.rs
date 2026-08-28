@@ -10,12 +10,74 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::ffi::{
-    CudaEvent, CudaStream, Status, sparkserve_cuda_event_create, sparkserve_cuda_event_destroy,
-    sparkserve_cuda_event_query, sparkserve_cuda_event_record, sparkserve_cuda_event_synchronize,
-    sparkserve_cuda_stream_create, sparkserve_cuda_stream_destroy,
-    sparkserve_cuda_stream_memset_async, sparkserve_cuda_stream_raw,
-    sparkserve_cuda_stream_synchronize, sparkserve_cuda_stream_wait_event,
+    CudaBlas, CudaEvent, CudaStream, Status, sparkserve_cuda_blas_create,
+    sparkserve_cuda_blas_destroy, sparkserve_cuda_blas_raw, sparkserve_cuda_event_create,
+    sparkserve_cuda_event_destroy, sparkserve_cuda_event_query, sparkserve_cuda_event_record,
+    sparkserve_cuda_event_synchronize, sparkserve_cuda_stream_create,
+    sparkserve_cuda_stream_destroy, sparkserve_cuda_stream_memset_async,
+    sparkserve_cuda_stream_raw, sparkserve_cuda_stream_synchronize,
+    sparkserve_cuda_stream_wait_event,
 };
+
+/// Unique owner of one long-lived cuBLAS handle. The scheduler reuses it for
+/// every router projection on an execution lane; no handle or workspace is
+/// allocated on the token path.
+pub struct CudaBlasOwner {
+    handle: Option<NonNull<CudaBlas>>,
+    raw_blas: NonNull<c_void>,
+    not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl CudaBlasOwner {
+    pub fn create() -> Result<Self, CudaRuntimeError> {
+        let mut raw_owner = std::ptr::null_mut();
+        // SAFETY: output storage is valid and unique.
+        status_result(unsafe { sparkserve_cuda_blas_create(&mut raw_owner) })?;
+        let handle =
+            NonNull::new(raw_owner).ok_or_else(|| CudaRuntimeError::null_handle("cuBLAS owner"))?;
+        let mut raw_blas = std::ptr::null_mut();
+        // SAFETY: the newly created owner remains live for this query.
+        if let Err(error) =
+            status_result(unsafe { sparkserve_cuda_blas_raw(handle.as_ptr(), &mut raw_blas) })
+        {
+            // SAFETY: this function still uniquely owns the handle.
+            let _ = unsafe { sparkserve_cuda_blas_destroy(handle.as_ptr()) };
+            return Err(error);
+        }
+        let Some(raw_blas) = NonNull::new(raw_blas) else {
+            // SAFETY: this function still uniquely owns the handle.
+            let _ = unsafe { sparkserve_cuda_blas_destroy(handle.as_ptr()) };
+            return Err(CudaRuntimeError::null_handle("raw cuBLAS handle"));
+        };
+        Ok(Self {
+            handle: Some(handle),
+            raw_blas,
+            not_send_or_sync: PhantomData,
+        })
+    }
+
+    pub fn raw(&self) -> *mut c_void {
+        self.raw_blas.as_ptr()
+    }
+
+    pub fn close(mut self) -> Result<(), CudaRuntimeError> {
+        self.destroy()
+    }
+
+    fn destroy(&mut self) -> Result<(), CudaRuntimeError> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        // SAFETY: taking the option transfers unique ownership exactly once.
+        status_result(unsafe { sparkserve_cuda_blas_destroy(handle.as_ptr()) })
+    }
+}
+
+impl Drop for CudaBlasOwner {
+    fn drop(&mut self) {
+        let _ = self.destroy();
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaRuntimeError {

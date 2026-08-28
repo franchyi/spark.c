@@ -52,6 +52,7 @@ typedef struct SparkServeCoherentRegionView {
 typedef struct SparkServeCoherentRegion SparkServeCoherentRegion;
 typedef struct SparkServeCudaStream SparkServeCudaStream;
 typedef struct SparkServeCudaEvent SparkServeCudaEvent;
+typedef struct SparkServeCudaBlas SparkServeCudaBlas;
 
 SparkServeStatus sparkserve_coherent_region_validate(
     const SparkServeCoherentRegionConfig* config);
@@ -98,6 +99,15 @@ SparkServeStatus sparkserve_cuda_event_query(
 SparkServeStatus sparkserve_cuda_event_synchronize(SparkServeCudaEvent* event);
 
 SparkServeStatus sparkserve_cuda_event_destroy(SparkServeCudaEvent* event);
+
+// Long-lived cuBLAS ownership. Rust creates one handle per execution lane and
+// passes only the raw handle to borrowed arithmetic adapters.
+SparkServeStatus sparkserve_cuda_blas_create(SparkServeCudaBlas** blas);
+
+SparkServeStatus sparkserve_cuda_blas_raw(
+    const SparkServeCudaBlas* blas, void** raw_blas);
+
+SparkServeStatus sparkserve_cuda_blas_destroy(SparkServeCudaBlas* blas);
 
 #ifdef __cplusplus
 }
