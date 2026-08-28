@@ -70,6 +70,9 @@ typedef enum SparkServeKernelBackend {
   // 512-expert softmax/top-k kernel. Rust owns the handle, stream, buffers,
   // route-map construction, and expert scheduling.
   SPARKSERVE_BACKEND_SGLANG_CUBLAS_MOE_GATE = 14,
+  // Qwen BF16 shared expert: cuBLAS projections plus SGLang-compatible
+  // SiLU/multiply and sigmoid broadcast kernels.
+  SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT = 15,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -371,6 +374,41 @@ typedef struct SparkServeMoeGateArgs {
   void* cublas_handle;
   void* cuda_stream;
 } SparkServeMoeGateArgs;
+
+typedef struct SparkServeSharedExpertPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_tokens;
+  uint32_t hidden_size;
+  uint32_t intermediate_size;
+  uint32_t input_dtype;
+  uint32_t weight_dtype;
+  uint32_t output_dtype;
+  uint32_t requested_backend;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint32_t reserved2;
+} SparkServeSharedExpertPlan;
+
+typedef struct SparkServeSharedExpertArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeSharedExpertPlan plan;
+  const void* hidden_states;
+  const void* gate_weight;
+  const void* up_weight;
+  const void* down_weight;
+  const void* shared_gate_weight;
+  // Fixed BF16 scratch: [tokens,2*intermediate], [tokens,intermediate],
+  // and [tokens,1].
+  void* gate_up;
+  void* activated;
+  void* shared_gate;
+  // BF16 [tokens,hidden], already multiplied by sigmoid(shared_gate).
+  void* output;
+  void* cublas_handle;
+  void* cuda_stream;
+} SparkServeSharedExpertArgs;
 
 // One logical FP8 PLE row may cross two fixed cache pages. Rust uploads these
 // compact descriptors into preallocated device scratch; both offsets are
@@ -773,6 +811,18 @@ SparkServeStatus sparkserve_moe_gate_query(
 SparkServeStatus sparkserve_moe_gate_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeMoeGateArgs* args);
+
+SparkServeStatus sparkserve_shared_expert_validate(
+    const SparkServeSharedExpertPlan* plan);
+
+SparkServeStatus sparkserve_shared_expert_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSharedExpertPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_shared_expert_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeSharedExpertArgs* args);
 
 SparkServeStatus sparkserve_ple_gather_validate(
     const SparkServePleGatherPlan* plan);

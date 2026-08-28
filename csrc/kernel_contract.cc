@@ -24,6 +24,9 @@
 #ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_MOE_GATE
 #include "internal/moe_gate_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_SHARED_EXPERT
+#include "internal/shared_expert_backend.h"
+#endif
 #ifdef SPARKSERVE_WITH_SGLANG_PLE_GATHER
 #include "internal/ple_gather_backend.h"
 #endif
@@ -236,6 +239,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("QSA score backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_CUBLAS_MOE_GATE:
       return Invalid("MoE gate backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT:
+      return Invalid("shared expert backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -974,6 +979,93 @@ extern "C" SparkServeStatus sparkserve_moe_gate_launch(
   return sparkserve_sglang_cublas_moe_gate_cuda_launch(args);
 #else
   return Unavailable("cuBLAS/SGLang MoE gate donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_shared_expert_validate(
+    const SparkServeSharedExpertPlan* plan) {
+  if (plan == nullptr) return Invalid("shared expert plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_tokens == 0 || plan->num_tokens > 1U << 20) {
+    return Invalid("shared expert token count is invalid");
+  }
+  if (plan->hidden_size != 2560 || plan->intermediate_size != 640) {
+    return Unsupported(
+        "Qwen3.8 Flash-Next shared expert requires hidden=2560, intermediate=640");
+  }
+  if (plan->input_dtype != SPARKSERVE_DTYPE_BF16 ||
+      plan->weight_dtype != SPARKSERVE_DTYPE_BF16 ||
+      plan->output_dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("Qwen shared expert requires BF16 tensors");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend !=
+          SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT) {
+    return Invalid("unknown shared expert backend");
+  }
+  if (!CanMultiply(plan->num_tokens, plan->hidden_size) ||
+      !CanMultiply(plan->num_tokens, plan->intermediate_size) ||
+      !CanMultiply(plan->hidden_size, plan->intermediate_size)) {
+    return Invalid("shared expert buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_shared_expert_query(
+    const SparkServeDeviceCaps* caps, const SparkServeSharedExpertPlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first shared expert is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_shared_expert_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_SGLANG_CUBLAS_SHARED_EXPERT;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "cublas-bf16+sglang-shared-expert";
+  info->source_revision =
+      "sglang@d91c3682b0b429e4c70df63cd57f819588ce29b0";
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_SHARED_EXPERT
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_shared_expert_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeSharedExpertArgs* args) {
+  if (args == nullptr) return Invalid("shared expert arguments are required");
+  SparkServeStatus header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query =
+      sparkserve_shared_expert_query(caps, &args->plan, &info);
+  if (query.code != SPARKSERVE_STATUS_OK) return query;
+  if (args->hidden_states == nullptr || args->gate_weight == nullptr ||
+      args->up_weight == nullptr || args->down_weight == nullptr ||
+      args->shared_gate_weight == nullptr || args->gate_up == nullptr ||
+      args->activated == nullptr || args->shared_gate == nullptr ||
+      args->output == nullptr || args->cublas_handle == nullptr) {
+    return Invalid("shared expert pointers and cuBLAS handle cannot be null");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_SHARED_EXPERT
+  return sparkserve_sglang_cublas_shared_expert_cuda_launch(args);
+#else
+  return Unavailable("cuBLAS/SGLang shared expert donor is not linked");
 #endif
 }
 

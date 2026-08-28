@@ -16,6 +16,7 @@ CUDA_QWEN_MOE_FIXTURE_TEST := $(BUILD_DIR)/qwen-moe-fixture-test
 CUDA_MOE_ROUTE_TEST := $(BUILD_DIR)/moe-route-cuda-test
 CUDA_MOE_GATE_FIXTURE_TEST := $(BUILD_DIR)/moe-gate-fixture-test
 CUDA_MOE_GATE_SHARED := $(BUILD_DIR)/libsparkserve-moe-gate.so
+CUDA_SHARED_EXPERT_FIXTURE_TEST := $(BUILD_DIR)/shared-expert-fixture-test
 CUDA_COHERENT_REGION_TEST := $(BUILD_DIR)/coherent-region-cuda-test
 CUDA_PLE_GATHER_FIXTURE_TEST := $(BUILD_DIR)/ple-gather-fixture-test
 CUDA_QSA_TOPK_FIXTURE_TEST := $(BUILD_DIR)/qsa-topk-fixture-test
@@ -55,7 +56,7 @@ CUTE_NVFP4_QUANTIZE_OBJECT ?=
 TVM_FFI_ROOT ?=
 CUTE_DSL_ROOT ?=
 
-.PHONY: test test-cpp test-cuda fabric-shared qsa-shared moe-gate-shared test-cuda-fabric test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-moe-gate-fixture test-cuda-ple-gather-fixture test-cuda-qsa-topk-fixture test-cuda-qsa-expand-fixture test-cuda-qsa-score-fixture test-cuda-qsa-index-prep-fixture test-cuda-qsa-kv-pack-fixture test-cuda-qsa-decode-xqa-fixture test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda fabric-shared qsa-shared moe-gate-shared test-cuda-fabric test-cuda-gdn test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-moe-gate-fixture test-cuda-shared-expert-fixture test-cuda-ple-gather-fixture test-cuda-qsa-topk-fixture test-cuda-qsa-expand-fixture test-cuda-qsa-score-fixture test-cuda-qsa-index-prep-fixture test-cuda-qsa-kv-pack-fixture test-cuda-qsa-decode-xqa-fixture test-cuda-qwen-moe-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -104,6 +105,10 @@ test-cuda-moe-route: $(CUDA_MOE_ROUTE_TEST)
 test-cuda-moe-gate-fixture: $(CUDA_MOE_GATE_FIXTURE_TEST)
 	test -n "$(QWEN_ROUTER_FIXTURE)"
 	$(CUDA_MOE_GATE_FIXTURE_TEST) "$(QWEN_ROUTER_FIXTURE)"
+
+test-cuda-shared-expert-fixture: $(CUDA_SHARED_EXPERT_FIXTURE_TEST)
+	test -n "$(QWEN_SHARED_EXPERT_FIXTURE)"
+	$(CUDA_SHARED_EXPERT_FIXTURE_TEST) "$(QWEN_SHARED_EXPERT_FIXTURE)"
 
 test-cuda-ple-gather-fixture: $(CUDA_PLE_GATHER_FIXTURE_TEST)
 	test -n "$(PLE_GATHER_FIXTURE)"
@@ -234,6 +239,14 @@ $(CUDA_MOE_GATE_SHARED): csrc/kernel_contract.cc csrc/cuda/moe_gate_sglang.cu cs
 		-DSPARKSERVE_WITH_SGLANG_CUBLAS_MOE_GATE -Icsrc/include -Icsrc \
 		csrc/kernel_contract.cc csrc/cuda/moe_gate_sglang.cu -lcublas \
 		-o $(CUDA_MOE_GATE_SHARED)
+
+$(CUDA_SHARED_EXPERT_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/shared_expert_sglang.cu csrc/internal/shared_expert_backend.h csrc/tests/shared_expert_fixture_test.cu csrc/include/sparkserve/kernel_api.h
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) \
+		-DSPARKSERVE_WITH_SGLANG_CUBLAS_SHARED_EXPERT -Icsrc/include -Icsrc \
+		csrc/kernel_contract.cc csrc/cuda/shared_expert_sglang.cu \
+		csrc/tests/shared_expert_fixture_test.cu -lcublas \
+		-o $(CUDA_SHARED_EXPERT_FIXTURE_TEST)
 
 $(CUDA_PLE_GATHER_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/ple_gather.cu csrc/fabric/coherent_region.cc csrc/internal/ple_gather_backend.h csrc/tests/ple_gather_fixture_test.cu csrc/include/sparkserve/kernel_api.h csrc/include/sparkserve/fabric_api.h
 	mkdir -p $(BUILD_DIR)

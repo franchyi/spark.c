@@ -526,6 +526,61 @@ pub struct MoeGateArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedExpertPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_tokens: u32,
+    pub hidden_size: u32,
+    pub intermediate_size: u32,
+    pub input_dtype: u32,
+    pub weight_dtype: u32,
+    pub output_dtype: u32,
+    pub requested_backend: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+}
+
+impl SharedExpertPlan {
+    pub fn qwen38_flash(num_tokens: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_tokens,
+            hidden_size: 2560,
+            intermediate_size: 640,
+            input_dtype: DataType::BFloat16 as u32,
+            weight_dtype: DataType::BFloat16 as u32,
+            output_dtype: DataType::BFloat16 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangCublasSharedExpert as u32,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SharedExpertArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: SharedExpertPlan,
+    pub hidden_states: *const c_void,
+    pub gate_weight: *const c_void,
+    pub up_weight: *const c_void,
+    pub down_weight: *const c_void,
+    pub shared_gate_weight: *const c_void,
+    pub gate_up: *mut c_void,
+    pub activated: *mut c_void,
+    pub shared_gate: *mut c_void,
+    pub output: *mut c_void,
+    pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PleRowFragment {
     pub first_offset_bytes: u64,
     pub second_offset_bytes: u64,
@@ -1127,6 +1182,16 @@ unsafe extern "C" {
         info: *mut KernelInfo,
     ) -> Status;
     pub fn sparkserve_moe_gate_launch(caps: *const DeviceCaps, args: *const MoeGateArgs) -> Status;
+    pub fn sparkserve_shared_expert_validate(plan: *const SharedExpertPlan) -> Status;
+    pub fn sparkserve_shared_expert_query(
+        caps: *const DeviceCaps,
+        plan: *const SharedExpertPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_shared_expert_launch(
+        caps: *const DeviceCaps,
+        args: *const SharedExpertArgs,
+    ) -> Status;
     pub fn sparkserve_ple_gather_validate(plan: *const PleGatherPlan) -> Status;
     pub fn sparkserve_ple_gather_query(
         caps: *const DeviceCaps,
@@ -1236,6 +1301,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<MoeRouteArgs>(), 128);
         assert_eq!(std::mem::size_of::<MoeGatePlan>(), 48);
         assert_eq!(std::mem::size_of::<MoeGateArgs>(), 112);
+        assert_eq!(std::mem::size_of::<SharedExpertPlan>(), 48);
+        assert_eq!(std::mem::size_of::<SharedExpertArgs>(), 144);
         assert_eq!(std::mem::size_of::<PleRowFragment>(), 24);
         assert_eq!(std::mem::size_of::<PleGatherPlan>(), 32);
         assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);
@@ -1290,6 +1357,18 @@ mod tests {
             KernelBackend::SglangCublasMoeGate as u32
         );
         assert_eq!(plan.renormalize, 1);
+    }
+
+    #[test]
+    fn qwen_shared_expert_plan_freezes_resident_bf16_geometry() {
+        let plan = SharedExpertPlan::qwen38_flash(8);
+        assert_eq!(plan.hidden_size, 2560);
+        assert_eq!(plan.intermediate_size, 640);
+        assert_eq!(plan.output_dtype, DataType::BFloat16 as u32);
+        assert_eq!(
+            plan.requested_backend,
+            KernelBackend::SglangCublasSharedExpert as u32
+        );
     }
 
     #[test]
