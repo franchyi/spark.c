@@ -141,7 +141,11 @@ layer-0 eight-token fixture has zero logit/id/weight error at 16.86 microseconds
 Rust owns the persistent cuBLAS handle, stream/event, and one coherent allocation
 for logits, outputs, and the route map; it reads completed ids through the CPU
 alias and transactionally reserves fixed expert slots without a copy. The shared
-expert and joined gate-to-routed output remain before a complete MoE layer token.
+expert now also runs framework-free: cuBLAS projections plus SGLang-derived
+vector SiLU and sigmoid broadcast match every real layer-0 BF16 byte at 30.69
+microseconds for eight tokens. Gate/up is loaded once into the oracle's merged
+resident layout. The joined gate-to-routed-plus-shared output remains before a
+complete MoE layer token.
 
 The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
 a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real

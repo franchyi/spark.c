@@ -99,6 +99,11 @@ The Rust control plane now treats one routed layer as a two-phase transaction:
 4. atomically publish the new expert-to-slot map, then launch the borrowed MMQ
    or grouped-GEMM kernel with fixed addresses.
 
+Commit now derives a second physical route whose group ids are fixed cache-slot
+ids rather than logical model-expert ids. Grouped GEMM therefore reads weights
+directly from slot `g` for group `g`; it never gathers or repacks resident expert
+weights. The original logical route is retained for telemetry and parity.
+
 Dropping a failed read plan changes neither residency nor telemetry. A cache
 version rejects stale publication, while a unique pending-step lease prevents
 two NVMe fills from targeting the same fixed slots concurrently. Hits, misses,
@@ -289,8 +294,10 @@ configured safety reserve.
   weighted finalize. The preceding real layer-0 cuBLAS router plus borrowed
   SGLang normalized top-10 now has zero logit/id/weight error, and its Rust
   event handoff writes the expert-contiguous map into the same coherent arena.
-  The shared expert, joined MoE output, and full-layer state remain before the
-  first native token.
+  The BF16 shared expert now also has complete real layer-0 bit parity through
+  merged gate/up, SiLU, down, scalar gate, and sigmoid broadcast at 30.69 us for
+  eight tokens. The joined routed-plus-shared MoE output and full-layer state
+  remain before the first native token.
 - OpenAI-compatible streaming after the offline path is stable.
 - Gate: exact greedy token match and at least 45 tokens/s; target 50+ tokens/s.
 

@@ -76,8 +76,10 @@ preceding real layer-0 BF16 router plus SGLang normalized top-10 has zero logit,
 expert-id, and route-weight error for eight tokens at 16.86 microseconds. Its
 Rust smoke owns the cuBLAS handle and CUDA completion event, consumes ids through
 the coherent CPU alias, and writes the expert-contiguous route map back into the
-same CUDA-visible allocation without a transfer. The shared expert and joined
-gate-to-routed output remain incomplete. The
+same CUDA-visible allocation without a transfer. The BF16 shared branch has
+passed real layer-0 bit parity at every intermediate and final output, using the
+merged resident gate/up layout and 30.69 microseconds for eight tokens; only the
+joined routed-plus-shared boundary remains incomplete. The
 Rust control plane also has transactional fixed-slot expert residency, and GB10
 has passed CUDA reads from both the registered cache slab and a protected
 file-backed mapping. PLE now adds bit-exact scaled-BF16 gather parity on 16 real

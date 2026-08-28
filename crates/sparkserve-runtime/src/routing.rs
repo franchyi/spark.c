@@ -12,6 +12,9 @@ pub struct RoutePlan {
     pub num_tokens: u32,
     pub top_k: u32,
     pub num_experts: u32,
+    /// Expert id for every natural token-major route. This is the logical
+    /// model id before residency, or the fixed slot id after remapping.
+    pub route_experts: Vec<u32>,
     pub expert_rows: Vec<u32>,
     pub grouped: GroupedExpertLayout,
     /// Natural route index `(token * top_k + rank)` to padded packed row.
@@ -90,6 +93,7 @@ impl RoutePlan {
             num_tokens,
             top_k,
             num_experts,
+            route_experts: expert_ids.to_vec(),
             expert_rows,
             grouped,
             route_to_packed_row,

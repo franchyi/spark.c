@@ -215,7 +215,11 @@ impl Drop for PendingMoeStep {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadyMoeStep {
     pub layer: u16,
+    /// Logical model-expert route retained for telemetry and correctness.
     pub route: RoutePlan,
+    /// Physical cache-slot route consumed by dispatch/grouped-GEMM/finalize.
+    /// Group `g` addresses fixed expert slot `g`; no weight gather is needed.
+    pub execution_route: RoutePlan,
     pub experts: Vec<ResidentExpert>,
 }
 
@@ -350,14 +354,32 @@ impl RoutedMoeScheduler {
         if addresses.len() != pending.active_experts.len() {
             return Err(MoeScheduleError::ResidencyMismatch);
         }
-        let experts = std::mem::take(&mut pending.active_experts)
+        let experts: Vec<ResidentExpert> = std::mem::take(&mut pending.active_experts)
             .into_iter()
             .zip(addresses)
             .map(|(expert, address)| ResidentExpert { expert, address })
             .collect();
+        let route = pending.route.take().ok_or(MoeScheduleError::ForeignStep)?;
+        let mut slot_ids = Vec::with_capacity(route.route_experts.len());
+        for logical_expert in &route.route_experts {
+            let placement = experts
+                .binary_search_by_key(logical_expert, |placement| placement.expert)
+                .ok()
+                .and_then(|index| experts.get(index))
+                .ok_or(MoeScheduleError::ResidencyMismatch)?;
+            slot_ids.push(placement.address.slot);
+        }
+        let execution_route = RoutePlan::build(
+            route.num_tokens,
+            route.top_k,
+            self.config.expert_slots,
+            &slot_ids,
+        )?;
+        execution_route.kernel_spec(self.config.hidden_size)?;
         Ok(ReadyMoeStep {
             layer: pending.layer,
-            route: pending.route.take().ok_or(MoeScheduleError::ForeignStep)?,
+            route,
+            execution_route,
             experts,
         })
     }
@@ -755,6 +777,13 @@ mod tests {
             vec![1, 2, 4, 7, 9, 11]
         );
         assert_eq!(scheduler.cache_stats().misses, 6);
+        assert_eq!(ready.execution_route.num_experts, 8);
+        assert_eq!(
+            ready.execution_route.route_experts,
+            vec![4, 0, 3, 2, 3, 4, 5, 1]
+        );
+        assert_eq!(ready.execution_route.active_experts(), 6);
+        assert_eq!(ready.execution_route.grouped.total_rows, 24);
 
         let hot = scheduler
             .prepare_step(3, 1, &[11, 9, 7, 1])

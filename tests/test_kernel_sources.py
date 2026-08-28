@@ -202,6 +202,30 @@ def test_sglang_moe_topk_donor_is_pinned_hashed_and_passed_real_router_parity() 
     ]
 
 
+def test_sglang_shared_expert_donors_are_pinned_hashed_and_bit_exact() -> None:
+    payload = tomllib.loads(
+        (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
+    )
+    donor = next(
+        source
+        for source in payload["source"]
+        if source["id"] == "sglang-qwen-shared-expert"
+    )
+    assert donor["revision"] == "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+    assert donor["license"] == "Apache-2.0"
+    assert donor["status"] == (
+        "linked-raw-cuda-sm121-real-shared-expert-bit-parity-passed"
+    )
+    vendor = ROOT / "third_party" / "sglang-shared-expert"
+    assert (vendor / "VENDOR.md").is_file()
+    assert (vendor / "source-files.sha256").read_text(encoding="utf-8").splitlines() == [
+        "f1b56af7476695688d11bb004dc6cee144cd8922a56683a12c504c53aec26c47  "
+        "python/sglang/kernels/jit/csrc/elementwise/activation.cuh",
+        "7c357dfb96efb31a52e1895477a97f96d17c11e618d35cc0cb04ba4d051a6d89  "
+        "python/sglang/kernels/ops/moe/triton_sigmoid_gate_mul.py",
+    ]
+
+
 def test_sglang_qsa_index_prep_donor_is_pinned_and_hashed() -> None:
     payload = tomllib.loads(
         (ROOT / "third_party" / "kernel-sources.toml").read_text(encoding="utf-8")
