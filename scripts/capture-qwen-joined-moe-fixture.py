@@ -13,6 +13,10 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from sglang.kernels.ops.activation import silu_and_mul
 from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
+from sglang.kernels.ops.elementwise.hc_combine import hc_combine
+from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+    grouped_gemma_rmsnorm,
+)
 from sglang.kernels.ops.moe import topk_softmax
 from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
     sigmoid_gate_mul_broadcast,
@@ -110,6 +114,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, default=Path("/model"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--with-mhc", action="store_true")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("fixture capture requires the Spark CUDA device")
@@ -123,6 +128,16 @@ def main() -> None:
         "shared_up_proj": f"{PREFIX}.shared_expert.up_proj.weight",
         "shared_down_weight": f"{PREFIX}.shared_expert.down_proj.weight",
     }
+    if args.with_mhc:
+        mhc_prefix = "model.language_model.layers.0.mlp_hyper_connection"
+        shared_names.update(
+            {
+                "mhc_norm_weight": f"{mhc_prefix}.hc_norm.weight",
+                "mhc_down_weight": f"{mhc_prefix}.input_mix_weight_down.weight",
+                "mhc_up_weight": f"{mhc_prefix}.input_mix_weight_up.weight",
+                "mhc_inject_weight": f"{mhc_prefix}.block_inject_weight.weight",
+            }
+        )
     with safe_open(main_shard, framework="pt", device="cpu") as handle:
         resident = {
             name: handle.get_tensor(tensor_name).contiguous()
@@ -133,10 +148,37 @@ def main() -> None:
     ).contiguous()
 
     generator = torch.Generator(device="cpu").manual_seed(0x5A17)
-    hidden = torch.randn(TOKENS, HIDDEN, generator=generator, dtype=torch.float32).to(
-        torch.bfloat16
-    )
-    hidden_gpu = hidden.cuda()
+    mhc_payloads: dict[str, torch.Tensor] = {}
+    if args.with_mhc:
+        hyper_input = torch.randn(
+            TOKENS, 4 * HIDDEN, generator=generator, dtype=torch.float32
+        ).to(torch.bfloat16)
+        hyper_gpu = hyper_input.cuda()
+        mhc_normed = grouped_gemma_rmsnorm(
+            hyper_gpu, resident["mhc_norm_weight"].cuda(), HIDDEN, 1.0e-6
+        )
+        mhc_down = F.linear(mhc_normed, resident["mhc_down_weight"].cuda())
+        mhc_scaled = mhc_down / 4
+        mhc_activated = F.silu(mhc_scaled)
+        mhc_up = F.linear(mhc_activated, resident["mhc_up_weight"].cuda())
+        mhc_gate = torch.sigmoid(mhc_up)
+        mhc_weighted = mhc_gate.reshape(TOKENS, 4, HIDDEN) * mhc_normed.reshape(
+            TOKENS, 4, HIDDEN
+        )
+        hidden_gpu = mhc_weighted.mean(dim=1).to(torch.bfloat16)
+        hidden = hidden_gpu.cpu()
+        mhc_payloads = {
+            "mhc_hyper_input": hyper_input,
+            "mhc_normed": mhc_normed,
+            "mhc_down": mhc_down,
+            "mhc_activated": mhc_activated,
+            "mhc_up": mhc_up,
+        }
+    else:
+        hidden = torch.randn(
+            TOKENS, HIDDEN, generator=generator, dtype=torch.float32
+        ).to(torch.bfloat16)
+        hidden_gpu = hidden.cuda()
     router_weight_gpu = resident["router_weight"].cuda()
     router_logits = F.linear(hidden_gpu, router_weight_gpu)
     route_weights = torch.empty(TOKENS, TOP_K, dtype=torch.float32, device="cuda")
@@ -279,6 +321,16 @@ def main() -> None:
         shared_ungated,
         joined_output,
     )
+    if args.with_mhc:
+        mhc_combined = hc_combine(
+            joined_output,
+            hyper_gpu,
+            mhc_normed,
+            resident["mhc_inject_weight"].cuda(),
+            4,
+            HIDDEN,
+        )
+        mhc_payloads["mhc_combined"] = mhc_combined
     torch.cuda.synchronize()
 
     payloads = {
@@ -364,12 +416,25 @@ def main() -> None:
             args.output, "joined_output_bf16.bin", joined_output
         ),
     }
+    if args.with_mhc:
+        for name in (
+            "mhc_norm_weight",
+            "mhc_down_weight",
+            "mhc_up_weight",
+            "mhc_inject_weight",
+        ):
+            payloads[name] = write_tensor(
+                args.output, f"{name}_bf16.bin", resident[name]
+            )
+        for name, tensor in mhc_payloads.items():
+            payloads[name] = write_tensor(args.output, f"{name}_bf16.bin", tensor)
     split_diff = (split_joined.float() - joined_output.float()).abs()
     manifest = {
         "schema_version": 1,
         "model_revision": REVISION,
         "sglang_revision": SGLANG_REVISION,
         "layer": 0,
+        "with_mhc": args.with_mhc,
         "slot_experts": slot_experts,
         "shape": {
             "tokens": TOKENS,

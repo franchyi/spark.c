@@ -130,7 +130,7 @@ retaining a switch back to the legacy dispatch.
 | Flash-Next routed/shared join | SGLang `_fused_gate_sigmoid_mul_add_kernel` at `d91c368` | raw CUDA preserves the 4096-wide FP32 reduction, sigmoid, shared multiply, routed add, and BF16 store | one allocation-free ABI; Rust overlaps branches and gates publication by CUDA events | passed: 2,560/2,560 final BF16 values exact; complete sequential hot-cache MoE is 306.668 us |
 | GDN projection and recurrence | SGLang Qwen4-exp + FlashInfer GDN | local raw CUDA K=V=128 BF16-state decode; later fuse QKV extraction | correctness kernel implemented; optimize behind the same ABI | CPU-reference parity now; real SGLang tensor/state and multi-step parity next |
 | QSA indexer and sparse attention | SGLang QSA backend at `7c66045`/`d91c368`, TileLang `cd37ed5`, FlashInfer `906181e` | SGLang fused Q/K prep, TileLang-generated score MQA, radix top-k, block-to-token expansion, selected-K/V pack, and FlashInfer XQA BF16 paged decode | all six donors share one framework-free library; Rust owns coherent ranges, streams/events, fixed page tables/workspace, and graph scheduling | isolated fixtures pass exact parity; the joined coherent chain has exact selection/packing semantics and 0.015625 max BF16 attention error under legal top-k permutation; full Qwen-layer continuation next |
-| Hyperconnection mix/combine | SGLang grouped Gemma RMSNorm, `hc_combine.cuh`, and persistent mix at `d91c368` | raw RMSNorm/combine, cuBLAS low-rank projections, deterministic BF16 mix epilogue | pinned raw ABI; persistent atomic mix is performance-only oracle | passed: real layer-0 deterministic mix/combine byte-exact; persistent mix max BF16 error 0.015625; 41.217/8.213 us |
+| Hyperconnection mix/combine | SGLang grouped Gemma RMSNorm, `hc_combine.cuh`, and persistent mix at `d91c368` | raw RMSNorm/combine, cuBLAS low-rank projections, deterministic BF16 mix epilogue | pinned raw ABI; persistent atomic mix is performance-only oracle | passed: real layer-0 deterministic mix/combine byte-exact; persistent mix max BF16 error 0.015625; 41.217/8.213 us; composed mHC -> exact top-10 MoE -> combine half-layer exact at 418.123 us |
 | PLE lookup | SGLang Qwen4-exp at `7c66045` + checkpoint | raw CUDA adapter matching the SGLang FP8-E4M3 load, BF16 conversion, and BF16 scaling; Rust supplies NVMe row residency | linked framework-free adapter plus original one-copy storage policy | passed: 16 real boundary rows, 2,560/2,560 scaled BF16 values bit-exact; 2.06 us mean on SM121 |
 | RMSNorm/RoPE/top-k/sampling | SGLang, FlashInfer, ds4 | smallest fastest proven candidate | benchmark and adopt independently | exact discrete ids; numerical parity for continuous outputs |
 | MTP/speculative commit | SGLang Qwen4-exp | local scheduler using shared forward kernels | reimplement state machine | target-only greedy identity; verifier logit and committed-state parity |
@@ -202,9 +202,9 @@ kernels—without importing either framework's scheduler, allocator, or graph.
 
 ## Immediate implementation order
 
-1. Connect the router projection, borrowed top-k, and shared expert to the now
-   byte-exact routed expert pipeline; then capture full-layer logits and greedy
-   continuations from the live SGLang service.
+1. Connect the byte-exact mHC-wrapped MLP half-layer and completed six-stage QSA
+   chain to real Qwen layer state; then capture full-layer outputs, logits, and
+   greedy continuations from the live SGLang service.
 2. Double-buffer the completed PLE gather and fixed-slab reader, then connect its
    fixed descriptors to the token graph; keep routing/top-k separately tested.
 3. Connect the completed six-stage borrowed QSA chain to Qwen layer state,

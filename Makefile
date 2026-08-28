@@ -380,7 +380,7 @@ $(CUDA_QSA_DECODE_XQA_FIXTURE_TEST): $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) csrc/kern
 		$(CUDA_QSA_DECODE_XQA_MHA_OBJECT) -lcuda \
 		-o $(CUDA_QSA_DECODE_XQA_FIXTURE_TEST)
 
-$(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/cuda/moe_gate_sglang.cu csrc/cuda/shared_expert_sglang.cu csrc/cuda/moe_join_sglang.cu csrc/internal/nvfp4_grouped_backend.h csrc/internal/nvfp4_silu_backend.h csrc/internal/nvfp4_quantize_backend.h csrc/internal/moe_route_backend.h csrc/internal/moe_gate_backend.h csrc/internal/shared_expert_backend.h csrc/internal/moe_join_backend.h csrc/tests/qwen_moe_fixture_test.cc csrc/include/sparkserve/kernel_api.h
+$(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/cuda/moe_gate_sglang.cu csrc/cuda/shared_expert_sglang.cu csrc/cuda/moe_join_sglang.cu csrc/cuda/mhc_sglang.cu csrc/internal/nvfp4_grouped_backend.h csrc/internal/nvfp4_silu_backend.h csrc/internal/nvfp4_quantize_backend.h csrc/internal/moe_route_backend.h csrc/internal/moe_gate_backend.h csrc/internal/shared_expert_backend.h csrc/internal/moe_join_backend.h csrc/internal/mhc_backend.h csrc/tests/qwen_moe_fixture_test.cc csrc/include/sparkserve/kernel_api.h
 	test -n "$(CUTE_NVFP4_OBJECT)"
 	test -n "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
 	test -n "$(TVM_FFI_ROOT)"
@@ -396,11 +396,13 @@ $(CUDA_QWEN_MOE_FIXTURE_TEST): csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_f
 		-DSPARKSERVE_WITH_SGLANG_CUBLAS_MOE_GATE \
 		-DSPARKSERVE_WITH_SGLANG_CUBLAS_SHARED_EXPERT \
 		-DSPARKSERVE_WITH_SGLANG_FUSED_MOE_JOIN \
+		-DSPARKSERVE_WITH_SGLANG_CUBLAS_MHC \
 		-Icsrc/include -Icsrc $(FLASHINFER_INCLUDES) -I$(TVM_FFI_ROOT)/include \
 		csrc/kernel_contract.cc csrc/cuda/nvfp4_grouped_flashinfer.cu \
 		csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc \
 		csrc/cuda/moe_route_flashinfer.cu csrc/cuda/moe_gate_sglang.cu \
 		csrc/cuda/shared_expert_sglang.cu csrc/cuda/moe_join_sglang.cu \
+		csrc/cuda/mhc_sglang.cu \
 		csrc/tests/qwen_moe_fixture_test.cc \
 		"$(CUTE_NVFP4_OBJECT)" "$(CUTE_NVFP4_QUANTIZE_OBJECT)" \
 		$(CUTE_DSL_ROOT)/lib/libcuda_dialect_runtime_static.a \

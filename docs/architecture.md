@@ -188,7 +188,10 @@ low-rank projections. The deterministic reference is the correctness contract
 because SGLang's persistent Triton alternative uses device-scope atomics and
 explicitly disables itself for deterministic inference. The native mix/combine
 is byte-exact to that reference and stays within 0.015625 BF16 of the deployed
-persistent path.
+persistent path. A real layer-0 fixture now wraps the complete top-10 MoE with
+that mHC boundary. All mix, route, NVFP4 expert, shared-expert, join, and combine
+intermediates are byte-exact in one native process; the one-token hot-cache MLP
+half-layer takes 418.123 microseconds on GB10.
 
 The first resident target is Qwen3.8 27B because the existing SGLang service gives
 golden logits and a measured target of about 50 decode tokens/s.
@@ -324,7 +327,8 @@ configured safety reserve.
   well: one real token selects ten physical-slot experts and matches every
   routed/shared intermediate and final byte at 306.668 us sequential hot-cache.
   mHC deterministic mix/combine now also passes real layer-0 parity at 41.217
-  and 8.213 us. Surrounding projections and full-layer state remain before the
+  and 8.213 us. The composed mHC-wrapped MLP half-layer is exact at 418.123 us.
+  Attention projections/state and the complete residual layer remain before the
   first native token.
 - OpenAI-compatible streaming after the offline path is stable.
 - Gate: exact greedy token match and at least 45 tokens/s; target 50+ tokens/s.

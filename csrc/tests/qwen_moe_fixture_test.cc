@@ -104,6 +104,8 @@ int main(int argc, char** argv) {
   assert(argc == 2);
   const std::filesystem::path fixture(argv[1]);
   const bool joined = std::filesystem::exists(fixture / "joined_output_bf16.bin");
+  const bool with_mhc =
+      std::filesystem::exists(fixture / "mhc_hyper_input_bf16.bin");
   const uint32_t num_tokens = joined ? 1 : 2;
   const uint32_t top_k = joined ? 10 : 2;
   const uint32_t experts = joined ? 10 : 2;
@@ -155,7 +157,7 @@ int main(int argc, char** argv) {
       fixture / (joined ? "routed_output_bf16.bin" : "final_output_bf16.bin"),
       num_tokens * kHidden * 2);
 
-  void* token_input = Upload(token_input_host);
+  void* token_input = with_mhc ? nullptr : Upload(token_input_host);
   void* route_map = Upload(route_map_host);
   void* route_weights = Upload(route_weights_host);
   void* packed_input_bf16 = Allocate(packed_input_expected.size());
@@ -177,6 +179,93 @@ int main(int argc, char** argv) {
   void* final_output = Allocate(final_output_expected.size());
   void* int_workspace = Allocate(kWorkspaceBytes);
   void* float_workspace = Allocate(kWorkspaceBytes);
+  cublasHandle_t blas = nullptr;
+  if (joined) CublasOk(cublasCreate(&blas));
+
+  void* mhc_hyper_input = nullptr;
+  void* mhc_norm_weight = nullptr;
+  void* mhc_down_weight = nullptr;
+  void* mhc_up_weight = nullptr;
+  void* mhc_inject_weight = nullptr;
+  void* mhc_normed = nullptr;
+  void* mhc_down = nullptr;
+  void* mhc_activated = nullptr;
+  void* mhc_up = nullptr;
+  void* mhc_combined = nullptr;
+  SparkServeMhcArgs mhc = {};
+  std::vector<uint8_t> mhc_combined_expected;
+  if (with_mhc) {
+    const auto hyper_input_host =
+        Read(fixture / "mhc_hyper_input_bf16.bin", num_tokens * 4 * kHidden * 2);
+    const auto norm_weight_host =
+        Read(fixture / "mhc_norm_weight_bf16.bin", 4 * kHidden * 2);
+    const auto down_weight_host =
+        Read(fixture / "mhc_down_weight_bf16.bin", 320 * 4 * kHidden * 2);
+    const auto up_weight_host =
+        Read(fixture / "mhc_up_weight_bf16.bin", 4 * kHidden * 320 * 2);
+    const auto inject_weight_host =
+        Read(fixture / "mhc_inject_weight_bf16.bin", 4 * 4 * kHidden * 2);
+    const auto normed_expected =
+        Read(fixture / "mhc_normed_bf16.bin", num_tokens * 4 * kHidden * 2);
+    const auto down_expected =
+        Read(fixture / "mhc_down_bf16.bin", num_tokens * 320 * 2);
+    const auto activated_expected =
+        Read(fixture / "mhc_activated_bf16.bin", num_tokens * 320 * 2);
+    const auto up_expected =
+        Read(fixture / "mhc_up_bf16.bin", num_tokens * 4 * kHidden * 2);
+    mhc_combined_expected =
+        Read(fixture / "mhc_combined_bf16.bin", num_tokens * 4 * kHidden * 2);
+
+    mhc_hyper_input = Upload(hyper_input_host);
+    mhc_norm_weight = Upload(norm_weight_host);
+    mhc_down_weight = Upload(down_weight_host);
+    mhc_up_weight = Upload(up_weight_host);
+    mhc_inject_weight = Upload(inject_weight_host);
+    mhc_normed = Allocate(normed_expected.size());
+    mhc_down = Allocate(down_expected.size());
+    mhc_activated = Allocate(activated_expected.size());
+    mhc_up = Allocate(up_expected.size());
+    token_input = Allocate(token_input_host.size());
+    mhc_combined = Allocate(mhc_combined_expected.size());
+    mhc.struct_size = sizeof(mhc);
+    mhc.abi_version = SPARKSERVE_KERNEL_ABI_VERSION;
+    mhc.plan = {sizeof(SparkServeMhcPlan),
+                SPARKSERVE_KERNEL_ABI_VERSION,
+                num_tokens,
+                4,
+                kHidden,
+                320,
+                SPARKSERVE_DTYPE_BF16,
+                SPARKSERVE_BACKEND_SGLANG_CUBLAS_MHC,
+                1.0e-6F,
+                0,
+                0,
+                0};
+    mhc.hyper_input = mhc_hyper_input;
+    mhc.norm_weight = mhc_norm_weight;
+    mhc.mix_down_weight = mhc_down_weight;
+    mhc.mix_up_weight = mhc_up_weight;
+    mhc.inject_weight = mhc_inject_weight;
+    mhc.normed = mhc_normed;
+    mhc.mix_down = mhc_down;
+    mhc.mix_activated = mhc_activated;
+    mhc.mix_up = mhc_up;
+    mhc.mixed_output = token_input;
+    mhc.combined_output = mhc_combined;
+    mhc.cublas_handle = blas;
+    SparkServeDeviceCaps mhc_caps = {
+        sizeof(SparkServeDeviceCaps), SPARKSERVE_KERNEL_ABI_VERSION, 121, 1, 0};
+    SparkServeStatus mhc_status = sparkserve_mhc_mix_launch(&mhc_caps, &mhc);
+    if (mhc_status.code != SPARKSERVE_STATUS_OK)
+      std::cerr << mhc_status.message << '\n';
+    assert(mhc_status.code == SPARKSERVE_STATUS_OK);
+    CudaOk(cudaDeviceSynchronize());
+    ExpectBytes(mhc_normed, normed_expected, "MLP block mHC norm");
+    ExpectBytes(mhc_down, down_expected, "MLP block mHC down");
+    ExpectBytes(mhc_activated, activated_expected, "MLP block mHC activation");
+    ExpectBytes(mhc_up, up_expected, "MLP block mHC up");
+    ExpectBytes(token_input, token_input_host, "MLP block mHC mixed input");
+  }
 
   SparkServeDeviceCaps caps = {
       sizeof(SparkServeDeviceCaps), SPARKSERVE_KERNEL_ABI_VERSION, 121, 1, 0};
@@ -321,8 +410,6 @@ int main(int argc, char** argv) {
     void* router_logits = Allocate(router_logits_expected.size());
     void* gate_weights = Allocate(gate_weights_expected.size());
     void* route_ids = Allocate(route_ids_expected.size());
-    cublasHandle_t blas = nullptr;
-    CublasOk(cublasCreate(&blas));
 
     SparkServeMoeGateArgs gate = {};
     gate.struct_size = sizeof(gate);
@@ -428,6 +515,17 @@ int main(int argc, char** argv) {
     CudaOk(cudaDeviceSynchronize());
     ExpectBytes(final_output, joined_expected, "joined routed plus shared");
 
+    if (with_mhc) {
+      mhc.block_output = final_output;
+      status = sparkserve_mhc_combine_launch(&caps, &mhc);
+      if (status.code != SPARKSERVE_STATUS_OK)
+        std::cerr << status.message << '\n';
+      assert(status.code == SPARKSERVE_STATUS_OK);
+      CudaOk(cudaDeviceSynchronize());
+      ExpectBytes(mhc_combined, mhc_combined_expected,
+                  "MLP block mHC combine");
+    }
+
     // Hot-cache arithmetic timing. The fixed physical route map is already
     // resident, as it is after Rust completes its coherent top-k handoff.
     // This deliberately excludes CPU scheduling and NVMe miss service.
@@ -439,6 +537,9 @@ int main(int argc, char** argv) {
     constexpr int kIterations = 100;
     CudaOk(cudaEventRecord(begin));
     for (int iteration = 0; iteration < kIterations; ++iteration) {
+      if (with_mhc)
+        assert(sparkserve_mhc_mix_launch(&caps, &mhc).code ==
+               SPARKSERVE_STATUS_OK);
       assert(sparkserve_moe_gate_launch(&caps, &gate).code ==
              SPARKSERVE_STATUS_OK);
       assert(sparkserve_moe_route_dispatch(&caps, &route).code ==
@@ -457,12 +558,16 @@ int main(int argc, char** argv) {
              SPARKSERVE_STATUS_OK);
       assert(sparkserve_moe_join_launch(&caps, &join).code ==
              SPARKSERVE_STATUS_OK);
+      if (with_mhc)
+        assert(sparkserve_mhc_combine_launch(&caps, &mhc).code ==
+               SPARKSERVE_STATUS_OK);
     }
     CudaOk(cudaEventRecord(end));
     CudaOk(cudaEventSynchronize(end));
     float elapsed_ms = 0.0F;
     CudaOk(cudaEventElapsedTime(&elapsed_ms, begin, end));
-    std::cout << "joined one-token hot-cache MoE mean: "
+    std::cout << (with_mhc ? "one-token hot-cache MLP half-layer mean: "
+                           : "joined one-token hot-cache MoE mean: ")
               << elapsed_ms * 1000.0F / kIterations << " us\n";
     CudaOk(cudaEventDestroy(end));
     CudaOk(cudaEventDestroy(begin));
@@ -473,11 +578,24 @@ int main(int argc, char** argv) {
     CudaOk(cudaFree(shared_gate_weight));
     CudaOk(cudaFree(shared_down_weight));
     CudaOk(cudaFree(shared_gate_up_weight));
-    CublasOk(cublasDestroy(blas));
     CudaOk(cudaFree(route_ids));
     CudaOk(cudaFree(gate_weights));
     CudaOk(cudaFree(router_logits));
     CudaOk(cudaFree(router_weight));
+  }
+
+  if (joined) CublasOk(cublasDestroy(blas));
+  if (with_mhc) {
+    CudaOk(cudaFree(mhc_combined));
+    CudaOk(cudaFree(mhc_up));
+    CudaOk(cudaFree(mhc_activated));
+    CudaOk(cudaFree(mhc_down));
+    CudaOk(cudaFree(mhc_normed));
+    CudaOk(cudaFree(mhc_inject_weight));
+    CudaOk(cudaFree(mhc_up_weight));
+    CudaOk(cudaFree(mhc_down_weight));
+    CudaOk(cudaFree(mhc_norm_weight));
+    CudaOk(cudaFree(mhc_hyper_input));
   }
 
   CudaOk(cudaFree(float_workspace));

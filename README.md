@@ -157,7 +157,12 @@ Gemma RMSNorm and fused combine reductions, uses cuBLAS for the two low-rank
 projections, and preserves the deterministic BF16 mix rounding points. Real
 layer-0 deterministic mix/combine is byte-exact; output remains within 0.015625
 BF16 of SGLang's faster atomic persistent mix. One-token mix and combine take
-41.217 and 8.213 microseconds respectively on GB10.
+41.217 and 8.213 microseconds respectively on GB10. The same native executable
+now composes mHC mix -> router/top-10 -> routed and shared experts -> fused join
+-> mHC combine for one real layer-0 token. Every captured intermediate is
+byte-exact to SGLang, and the complete hot-cache MLP half-layer takes 418.123
+microseconds. This measures arithmetic with resident experts; NVMe miss service
+and Rust scheduling are intentionally measured separately.
 
 The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
 a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real
