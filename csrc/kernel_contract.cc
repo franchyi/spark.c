@@ -30,6 +30,9 @@
 #ifdef SPARKSERVE_WITH_SGLANG_FUSED_MOE_JOIN
 #include "internal/moe_join_backend.h"
 #endif
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_MHC
+#include "internal/mhc_backend.h"
+#endif
 #ifdef SPARKSERVE_WITH_SGLANG_PLE_GATHER
 #include "internal/ple_gather_backend.h"
 #endif
@@ -246,6 +249,8 @@ extern "C" SparkServeStatus sparkserve_dense_nvfp4_query(
       return Invalid("shared expert backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_SGLANG_FUSED_MOE_JOIN:
       return Invalid("MoE join backend cannot serve a dense plan");
+    case SPARKSERVE_BACKEND_SGLANG_CUBLAS_MHC:
+      return Invalid("mHC backend cannot serve a dense plan");
     case SPARKSERVE_BACKEND_AUTO:
       return Invalid("AUTO backend was not resolved");
   }
@@ -1156,6 +1161,118 @@ extern "C" SparkServeStatus sparkserve_moe_join_launch(
   return sparkserve_sglang_fused_moe_join_cuda_launch(args);
 #else
   return Unavailable("SGLang fused MoE join donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_mhc_validate(
+    const SparkServeMhcPlan* plan) {
+  if (plan == nullptr) return Invalid("mHC plan is required");
+  SparkServeStatus header =
+      ValidateHeader(plan->struct_size, sizeof(*plan), plan->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  if (plan->num_tokens == 0 || plan->num_tokens > 1U << 20) {
+    return Invalid("mHC token count is invalid");
+  }
+  if (plan->hc_count != 4 || plan->hidden_size != 2560 ||
+      plan->lowrank_size != 320) {
+    return Unsupported("Qwen3.8 Flash-Next mHC requires HC=4, H=2560, R=320");
+  }
+  if (plan->dtype != SPARKSERVE_DTYPE_BF16) {
+    return Unsupported("Qwen mHC requires BF16 tensors");
+  }
+  if (!(plan->rms_norm_eps > 0.0F) || !std::isfinite(plan->rms_norm_eps)) {
+    return Invalid("mHC RMSNorm epsilon must be finite and positive");
+  }
+  if (plan->requested_backend != SPARKSERVE_BACKEND_AUTO &&
+      plan->requested_backend != SPARKSERVE_BACKEND_SGLANG_CUBLAS_MHC) {
+    return Invalid("unknown mHC backend");
+  }
+  if (!CanMultiply(plan->num_tokens,
+                   static_cast<uint64_t>(plan->hc_count) * plan->hidden_size)) {
+    return Invalid("mHC buffer size overflow");
+  }
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_mhc_query(
+    const SparkServeDeviceCaps* caps, const SparkServeMhcPlan* plan,
+    SparkServeKernelInfo* info) {
+  SparkServeStatus caps_status = ValidateCudaCaps(caps);
+  if (caps_status.code != SPARKSERVE_STATUS_OK) return caps_status;
+  if (caps->sm != 121) {
+    return Unsupported("the first mHC backend is validated only on GB10/SM121");
+  }
+  SparkServeStatus plan_status = sparkserve_mhc_validate(plan);
+  if (plan_status.code != SPARKSERVE_STATUS_OK) return plan_status;
+  if (info == nullptr) return Invalid("kernel info output is required");
+  SparkServeStatus info_header =
+      ValidateHeader(info->struct_size, sizeof(*info), info->abi_version);
+  if (info_header.code != SPARKSERVE_STATUS_OK) return info_header;
+  info->backend = SPARKSERVE_BACKEND_SGLANG_CUBLAS_MHC;
+  info->workspace_bytes = 0;
+  info->available = 0;
+  info->name = "cublas+sglang-qwen-mhc";
+  info->source_revision =
+      "sglang@d91c3682b0b429e4c70df63cd57f819588ce29b0";
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_MHC
+  info->available = 1;
+#endif
+  return Ok();
+}
+
+extern "C" SparkServeStatus sparkserve_mhc_mix_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeMhcArgs* args) {
+  if (args == nullptr) return Invalid("mHC arguments are required");
+  SparkServeStatus header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query = sparkserve_mhc_query(caps, &args->plan, &info);
+  if (query.code != SPARKSERVE_STATUS_OK) return query;
+  if (args->hyper_input == nullptr || args->norm_weight == nullptr ||
+      args->mix_down_weight == nullptr || args->mix_up_weight == nullptr ||
+      args->normed == nullptr || args->mix_down == nullptr ||
+      args->mix_activated == nullptr || args->mix_up == nullptr ||
+      args->mixed_output == nullptr || args->cublas_handle == nullptr) {
+    return Invalid("mHC mix pointers and cuBLAS handle cannot be null");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_MHC
+  return sparkserve_sglang_cublas_mhc_mix_cuda_launch(args);
+#else
+  return Unavailable("SGLang/cuBLAS mHC donor is not linked");
+#endif
+}
+
+extern "C" SparkServeStatus sparkserve_mhc_combine_launch(
+    const SparkServeDeviceCaps* caps, const SparkServeMhcArgs* args) {
+  if (args == nullptr) return Invalid("mHC arguments are required");
+  SparkServeStatus header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (header.code != SPARKSERVE_STATUS_OK) return header;
+  SparkServeKernelInfo info = {sizeof(SparkServeKernelInfo),
+                               SPARKSERVE_KERNEL_ABI_VERSION,
+                               0,
+                               0,
+                               0,
+                               nullptr,
+                               nullptr};
+  SparkServeStatus query = sparkserve_mhc_query(caps, &args->plan, &info);
+  if (query.code != SPARKSERVE_STATUS_OK) return query;
+  if (args->hyper_input == nullptr || args->normed == nullptr ||
+      args->inject_weight == nullptr || args->block_output == nullptr ||
+      args->combined_output == nullptr) {
+    return Invalid("mHC combine pointers cannot be null");
+  }
+#ifdef SPARKSERVE_WITH_SGLANG_CUBLAS_MHC
+  return sparkserve_sglang_cublas_mhc_combine_cuda_launch(args);
+#else
+  return Unavailable("SGLang/cuBLAS mHC donor is not linked");
 #endif
 }
 

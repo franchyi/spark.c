@@ -620,6 +620,64 @@ pub struct MoeJoinArgs {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MhcPlan {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub num_tokens: u32,
+    pub hc_count: u32,
+    pub hidden_size: u32,
+    pub lowrank_size: u32,
+    pub dtype: u32,
+    pub requested_backend: u32,
+    pub rms_norm_eps: f32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+}
+
+impl MhcPlan {
+    pub fn qwen38_flash(num_tokens: u32) -> Self {
+        Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: KERNEL_ABI_VERSION,
+            num_tokens,
+            hc_count: 4,
+            hidden_size: 2560,
+            lowrank_size: 320,
+            dtype: DataType::BFloat16 as u32,
+            requested_backend: crate::kernel::KernelBackend::SglangCublasMhc as u32,
+            rms_norm_eps: 1.0e-6,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MhcArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub plan: MhcPlan,
+    pub hyper_input: *const c_void,
+    pub norm_weight: *const c_void,
+    pub mix_down_weight: *const c_void,
+    pub mix_up_weight: *const c_void,
+    pub inject_weight: *const c_void,
+    pub block_output: *const c_void,
+    pub normed: *mut c_void,
+    pub mix_down: *mut c_void,
+    pub mix_activated: *mut c_void,
+    pub mix_up: *mut c_void,
+    pub mixed_output: *mut c_void,
+    pub combined_output: *mut c_void,
+    pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PleRowFragment {
     pub first_offset_bytes: u64,
@@ -1239,6 +1297,14 @@ unsafe extern "C" {
         info: *mut KernelInfo,
     ) -> Status;
     pub fn sparkserve_moe_join_launch(caps: *const DeviceCaps, args: *const MoeJoinArgs) -> Status;
+    pub fn sparkserve_mhc_validate(plan: *const MhcPlan) -> Status;
+    pub fn sparkserve_mhc_query(
+        caps: *const DeviceCaps,
+        plan: *const MhcPlan,
+        info: *mut KernelInfo,
+    ) -> Status;
+    pub fn sparkserve_mhc_mix_launch(caps: *const DeviceCaps, args: *const MhcArgs) -> Status;
+    pub fn sparkserve_mhc_combine_launch(caps: *const DeviceCaps, args: *const MhcArgs) -> Status;
     pub fn sparkserve_ple_gather_validate(plan: *const PleGatherPlan) -> Status;
     pub fn sparkserve_ple_gather_query(
         caps: *const DeviceCaps,
@@ -1352,6 +1418,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<SharedExpertArgs>(), 136);
         assert_eq!(std::mem::size_of::<MoeJoinPlan>(), 32);
         assert_eq!(std::mem::size_of::<MoeJoinArgs>(), 80);
+        assert_eq!(std::mem::size_of::<MhcPlan>(), 48);
+        assert_eq!(std::mem::size_of::<MhcArgs>(), 168);
         assert_eq!(std::mem::size_of::<PleRowFragment>(), 24);
         assert_eq!(std::mem::size_of::<PleGatherPlan>(), 32);
         assert_eq!(std::mem::size_of::<PleGatherArgs>(), 88);
@@ -1431,6 +1499,16 @@ mod tests {
             plan.requested_backend,
             KernelBackend::SglangFusedMoeJoin as u32
         );
+    }
+
+    #[test]
+    fn qwen_mhc_plan_freezes_checkpoint_geometry() {
+        let plan = MhcPlan::qwen38_flash(1);
+        assert_eq!(plan.hc_count, 4);
+        assert_eq!(plan.hidden_size, 2560);
+        assert_eq!(plan.lowrank_size, 320);
+        assert_eq!(plan.rms_norm_eps, 1.0e-6);
+        assert_eq!(plan.requested_backend, KernelBackend::SglangCublasMhc as u32);
     }
 
     #[test]

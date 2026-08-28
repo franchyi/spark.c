@@ -76,6 +76,9 @@ typedef enum SparkServeKernelBackend {
   // SGLang's deployed Qwen CUDA epilogue: FP32 gate dot/sigmoid, shared
   // multiply, and in-place add into the routed BF16 output.
   SPARKSERVE_BACKEND_SGLANG_FUSED_MOE_JOIN = 16,
+  // Qwen mHC: SGLang grouped Gemma RMSNorm/combine arithmetic with cuBLAS
+  // low-rank projections and a deterministic fused mix epilogue.
+  SPARKSERVE_BACKEND_SGLANG_CUBLAS_MHC = 17,
 } SparkServeKernelBackend;
 
 typedef enum SparkServeGdnBackend {
@@ -447,6 +450,43 @@ typedef struct SparkServeMoeJoinArgs {
   void* routed_output;
   void* cuda_stream;
 } SparkServeMoeJoinArgs;
+
+typedef struct SparkServeMhcPlan {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t num_tokens;
+  uint32_t hc_count;
+  uint32_t hidden_size;
+  uint32_t lowrank_size;
+  uint32_t dtype;
+  uint32_t requested_backend;
+  float rms_norm_eps;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint32_t reserved2;
+} SparkServeMhcPlan;
+
+typedef struct SparkServeMhcArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  SparkServeMhcPlan plan;
+  // BF16 resident input/weights.
+  const void* hyper_input;
+  const void* norm_weight;
+  const void* mix_down_weight;
+  const void* mix_up_weight;
+  const void* inject_weight;
+  const void* block_output;
+  // Fixed BF16 scratch and outputs.
+  void* normed;
+  void* mix_down;
+  void* mix_activated;
+  void* mix_up;
+  void* mixed_output;
+  void* combined_output;
+  void* cublas_handle;
+  void* cuda_stream;
+} SparkServeMhcArgs;
 
 // One logical FP8 PLE row may cross two fixed cache pages. Rust uploads these
 // compact descriptors into preallocated device scratch; both offsets are
@@ -873,6 +913,22 @@ SparkServeStatus sparkserve_moe_join_query(
 SparkServeStatus sparkserve_moe_join_launch(
     const SparkServeDeviceCaps* caps,
     const SparkServeMoeJoinArgs* args);
+
+SparkServeStatus sparkserve_mhc_validate(
+    const SparkServeMhcPlan* plan);
+
+SparkServeStatus sparkserve_mhc_query(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeMhcPlan* plan,
+    SparkServeKernelInfo* info);
+
+SparkServeStatus sparkserve_mhc_mix_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeMhcArgs* args);
+
+SparkServeStatus sparkserve_mhc_combine_launch(
+    const SparkServeDeviceCaps* caps,
+    const SparkServeMhcArgs* args);
 
 SparkServeStatus sparkserve_ple_gather_validate(
     const SparkServePleGatherPlan* plan);
