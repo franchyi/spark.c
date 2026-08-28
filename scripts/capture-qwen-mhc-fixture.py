@@ -95,10 +95,11 @@ def main() -> None:
     scaled = down / HC
     activated = F.silu(scaled)
     up = F.linear(activated, weights["up_weight"])
-    reference_mix = (
-        torch.sigmoid(up).reshape(TOKENS, HC, HIDDEN)
-        * normed.reshape(TOKENS, HC, HIDDEN)
-    ).mean(dim=1).to(torch.bfloat16)
+    mix_gate = torch.sigmoid(up)
+    mix_weighted = mix_gate.reshape(TOKENS, HC, HIDDEN) * normed.reshape(
+        TOKENS, HC, HIDDEN
+    )
+    reference_mix = mix_weighted.mean(dim=1).to(torch.bfloat16)
     fused_mix_first = fused_hc_mix(
         normed, weights["down_weight"], weights["up_weight"], HC, HIDDEN
     )
@@ -129,6 +130,10 @@ def main() -> None:
         "scaled": write_tensor(args.output, "scaled_bf16.bin", scaled),
         "activated": write_tensor(args.output, "activated_bf16.bin", activated),
         "up": write_tensor(args.output, "up_bf16.bin", up),
+        "mix_gate": write_tensor(args.output, "mix_gate_bf16.bin", mix_gate),
+        "mix_weighted": write_tensor(
+            args.output, "mix_weighted_bf16.bin", mix_weighted
+        ),
         "reference_mix": write_tensor(
             args.output, "reference_mix_bf16.bin", reference_mix
         ),

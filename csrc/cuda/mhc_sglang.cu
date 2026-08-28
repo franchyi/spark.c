@@ -150,8 +150,11 @@ __global__ void DeterministicMixMean(const __nv_bfloat16* normed,
   for (int branch = 0; branch < kHc; ++branch) {
     const int index = token * kWidth + branch * kHidden + column;
     const float gate_value = __bfloat162float(gates[index]);
-    const float gate = 1.0F / (1.0F + expf(-gate_value));
-    sum += gate * __bfloat162float(normed[index]);
+    const __nv_bfloat16 gate =
+        __float2bfloat16_rn(1.0F / (1.0F + expf(-gate_value)));
+    const __nv_bfloat16 weighted = __float2bfloat16_rn(
+        __bfloat162float(gate) * __bfloat162float(normed[index]));
+    sum += __bfloat162float(weighted);
   }
   output[item] = __float2bfloat16_rn(sum * 0.25F);
 }
