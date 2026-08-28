@@ -145,7 +145,9 @@ fn main() -> io::Result<()> {
     event.record(&mut stream).map_err(io::Error::other)?;
     event.synchronize().map_err(io::Error::other)?;
 
-    let payload = region.host_payload().map_err(io::Error::other)?;
+    // SAFETY: the recorded completion event has finished, so CUDA no longer
+    // reads or writes this coherent mapping during the host comparison.
+    let payload = unsafe { region.host_payload_mut() }.map_err(io::Error::other)?;
     let actual_logits = &payload[layout.logits..layout.logits + expected_logits.len()];
     let actual_weights =
         &payload[layout.topk_weights..layout.topk_weights + expected_weights.len()];
