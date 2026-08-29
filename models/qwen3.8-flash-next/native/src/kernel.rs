@@ -332,6 +332,97 @@ pub struct GroupedNvfp4Buffers {
     pub float_workspace_bytes: u64,
 }
 
+/// Physical expert-bank contract for the indexed grouped NVFP4 capsule.
+///
+/// The grouped problem remains compact (`num_groups == logical_group_ids.len()`),
+/// while each compact group selects one record from a larger source bank. The
+/// packed weights and scales may therefore share an enclosing record stride.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IndexedGroupedNvfp4Spec {
+    pub grouped: GroupedNvfp4Spec,
+    pub source_group_count: u32,
+    pub packed_group_stride_bytes: u64,
+    pub scale_group_stride_bytes: u64,
+}
+
+impl IndexedGroupedNvfp4Spec {
+    pub fn new(
+        grouped: GroupedNvfp4Spec,
+        source_group_count: u32,
+        packed_group_stride_bytes: u64,
+        scale_group_stride_bytes: u64,
+    ) -> Result<Self, KernelContractError> {
+        let spec = Self {
+            grouped,
+            source_group_count,
+            packed_group_stride_bytes,
+            scale_group_stride_bytes,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn validate(self) -> Result<(), KernelContractError> {
+        self.grouped.validate()?;
+        if self.source_group_count == 0
+            || self.source_group_count > 512
+            || self.grouped.num_groups > self.source_group_count
+        {
+            return Err(KernelContractError::InvalidSourceGroupCount(
+                self.source_group_count,
+            ));
+        }
+        let packed_group_bytes = checked_product(&[self.grouped.n, self.grouped.k / 2])?;
+        let scale_group_bytes = checked_product(&[
+            self.grouped.n,
+            self.grouped.k / u64::from(self.grouped.group_size),
+        ])?;
+        if self.packed_group_stride_bytes < packed_group_bytes
+            || self.scale_group_stride_bytes < scale_group_bytes
+            || self.packed_group_stride_bytes % 16 != 0
+            || self.scale_group_stride_bytes % 16 != 0
+        {
+            return Err(KernelContractError::InvalidIndexedGroupStride);
+        }
+        let last_source = u64::from(self.source_group_count - 1);
+        last_source
+            .checked_mul(self.packed_group_stride_bytes)
+            .and_then(|offset| offset.checked_add(packed_group_bytes))
+            .ok_or(KernelContractError::DimensionOverflow)?;
+        last_source
+            .checked_mul(self.scale_group_stride_bytes)
+            .and_then(|offset| offset.checked_add(scale_group_bytes))
+            .ok_or(KernelContractError::DimensionOverflow)?;
+        Ok(())
+    }
+
+    pub fn logical_group_ids_bytes(self) -> Result<u64, KernelContractError> {
+        self.validate()?;
+        checked_product(&[u64::from(self.grouped.num_groups), 4])
+    }
+
+    pub fn validate_logical_group_ids(
+        self,
+        logical_group_ids: &[i32],
+    ) -> Result<(), KernelContractError> {
+        self.validate()?;
+        if logical_group_ids.len() != self.grouped.num_groups as usize {
+            return Err(KernelContractError::InvalidLogicalGroupIdCount(
+                logical_group_ids.len(),
+            ));
+        }
+        for (group, logical_group) in logical_group_ids.iter().copied().enumerate() {
+            if logical_group < 0 || logical_group as u32 >= self.source_group_count {
+                return Err(KernelContractError::InvalidLogicalGroupIds);
+            }
+            if logical_group_ids[..group].contains(&logical_group) {
+                return Err(KernelContractError::InvalidLogicalGroupIds);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SiluNvfp4Spec {
     pub num_experts: u32,
@@ -681,6 +772,10 @@ pub enum KernelContractError {
     InvalidRoutedPadding,
     GroupedAlignment,
     UnsupportedGroupedTactic,
+    InvalidSourceGroupCount(u32),
+    InvalidIndexedGroupStride,
+    InvalidLogicalGroupIdCount(usize),
+    InvalidLogicalGroupIds,
     UnsupportedInputType,
     UnsupportedFusedTactic,
 }
@@ -738,6 +833,22 @@ impl fmt::Display for KernelContractError {
             Self::UnsupportedGroupedTactic => write!(
                 formatter,
                 "linked grouped NVFP4 tactic is 128x128x256 with swap_ab=false"
+            ),
+            Self::InvalidSourceGroupCount(count) => write!(
+                formatter,
+                "indexed grouped NVFP4 requires 1..=512 source groups and at least as many source groups as compact groups, got {count}"
+            ),
+            Self::InvalidIndexedGroupStride => write!(
+                formatter,
+                "indexed grouped NVFP4 weight strides must contain a logical group and align to 16 bytes"
+            ),
+            Self::InvalidLogicalGroupIdCount(count) => write!(
+                formatter,
+                "indexed grouped NVFP4 logical ID count must equal compact group count, got {count}"
+            ),
+            Self::InvalidLogicalGroupIds => write!(
+                formatter,
+                "indexed grouped NVFP4 logical IDs must be unique and within the source bank"
             ),
             Self::UnsupportedInputType => write!(formatter, "expected BF16 input"),
             Self::UnsupportedFusedTactic => {

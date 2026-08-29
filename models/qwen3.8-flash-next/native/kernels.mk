@@ -63,6 +63,8 @@ FLASHINFER_ARCH_FLAGS ?= -D__CUDA_ARCH_SPECIFIC__ --expt-relaxed-constexpr \
 	-diag-suppress 20012 -diag-suppress 20013 -diag-suppress 20015 \
 	-diag-suppress 2908
 FLASHINFER_INCLUDES := -I$(FLASHINFER_INCLUDE) \
+	-I$(FLASHINFER_ROOT)/csrc/nv_internal \
+	-I$(FLASHINFER_ROOT)/csrc/nv_internal/include \
 	-I$(CUTLASS_ROOT)/include \
 	-I$(CUTLASS_ROOT)/tools/util/include
 FLASHINFER_XQA_INCLUDE := -I$(FLASHINFER_ROOT)/csrc/xqa
@@ -358,7 +360,7 @@ $(CUDA_GROUPED_NVFP4_FIXTURE_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DI
 		$(KERNEL_DIR)/tests/nvfp4_grouped_fixture_test.cu \
 		-o $(CUDA_GROUPED_NVFP4_FIXTURE_TEST)
 
-$(CUDA_SILU_NVFP4_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc $(KERNEL_DIR)/internal/nvfp4_silu_backend.h $(KERNEL_DIR)/tests/nvfp4_silu_cute_test.cc $(KERNEL_DIR)/include/flash/kernel_api.h
+$(CUDA_SILU_NVFP4_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu $(KERNEL_DIR)/internal/nvfp4_silu_backend.h $(KERNEL_DIR)/tests/nvfp4_silu_cute_test.cc $(KERNEL_DIR)/include/flash/kernel_api.h
 	test -n "$(CUTE_NVFP4_OBJECT)"
 	test -n "$(TVM_FFI_ROOT)"
 	test -n "$(CUTE_DSL_ROOT)"
@@ -366,7 +368,7 @@ $(CUDA_SILU_NVFP4_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvf
 	mkdir -p $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -DFLASH_WITH_FLASHINFER_CUTE_SILU_NVFP4 \
 		-I$(KERNEL_DIR)/include -I$(KERNEL_DIR) -I$(TVM_FFI_ROOT)/include \
-		$(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc \
+		$(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu \
 		$(KERNEL_DIR)/tests/nvfp4_silu_cute_test.cc "$(CUTE_NVFP4_OBJECT)" \
 		$(CUTE_DSL_ROOT)/lib/libcuda_dialect_runtime_static.a \
 		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lcuda -lcudart -ldl \
@@ -404,7 +406,7 @@ $(CUDA_QWEN_EXPERT_PACK_FIXTURE_TEST): $(KERNEL_DIR)/cuda/qwen_expert_pack.cu $(
 		$(KERNEL_DIR)/tests/qwen_expert_pack_fixture_test.cu \
 		-o $(CUDA_QWEN_EXPERT_PACK_FIXTURE_TEST)
 
-$(CUDA_QWEN_MOE_SHARED): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cc $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/internal/nvfp4_grouped_backend.h $(KERNEL_DIR)/internal/nvfp4_silu_backend.h $(KERNEL_DIR)/internal/nvfp4_quantize_backend.h $(KERNEL_DIR)/internal/moe_route_backend.h $(KERNEL_DIR)/internal/moe_gate_backend.h $(KERNEL_DIR)/internal/shared_expert_backend.h $(KERNEL_DIR)/internal/moe_join_backend.h $(KERNEL_DIR)/include/flash/kernel_api.h
+$(CUDA_QWEN_MOE_SHARED): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_grouped_indexed_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cu $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/internal/nvfp4_grouped_backend.h $(KERNEL_DIR)/internal/nvfp4_silu_backend.h $(KERNEL_DIR)/internal/nvfp4_quantize_backend.h $(KERNEL_DIR)/internal/moe_route_backend.h $(KERNEL_DIR)/internal/moe_gate_backend.h $(KERNEL_DIR)/internal/shared_expert_backend.h $(KERNEL_DIR)/internal/moe_join_backend.h $(KERNEL_DIR)/include/flash/kernel_api.h
 	test -n "$(CUTE_NVFP4_OBJECT)"
 	test -n "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
 	test -n "$(TVM_FFI_ROOT)"
@@ -415,6 +417,7 @@ $(CUDA_QWEN_MOE_SHARED): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvf
 	$(NVCC) $(NVCCFLAGS) --use_fast_math $(FLASHINFER_ARCH_FLAGS) \
 		-diag-suppress 177 -diag-suppress 549 -shared -Xcompiler=-fPIC \
 		-DFLASH_WITH_FLASHINFER_GROUPED_NVFP4 \
+		-DFLASH_WITH_FLASHINFER_INDEXED_GROUPED_NVFP4 \
 		-DFLASH_WITH_FLASHINFER_CUTE_SILU_NVFP4 \
 		-DFLASH_WITH_FLASHINFER_CUTE_NVFP4_QUANTIZE \
 		-DFLASH_WITH_FLASHINFER_MOE_ROUTE \
@@ -424,7 +427,8 @@ $(CUDA_QWEN_MOE_SHARED): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvf
 		-I$(KERNEL_DIR)/include -I$(KERNEL_DIR) $(FLASHINFER_INCLUDES) \
 		-I$(TVM_FFI_ROOT)/include $(KERNEL_DIR)/kernel_contract.cc \
 		$(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu \
-		$(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cc \
+		$(KERNEL_DIR)/cuda/nvfp4_grouped_indexed_flashinfer.cu \
+		$(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cu \
 		$(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu \
 		$(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu \
 		"$(CUTE_NVFP4_OBJECT)" "$(CUTE_NVFP4_QUANTIZE_OBJECT)" \
@@ -578,7 +582,7 @@ $(CUDA_QWEN_DECODE_GLUE_SHARED): $(KERNEL_DIR)/cuda/qwen_decode_glue.cu $(KERNEL
 		$(KERNEL_DIR)/cuda/qwen_decode_glue.cu -lcublas -lcudart \
 		-o $(CUDA_QWEN_DECODE_GLUE_SHARED)
 
-$(CUDA_QWEN_RUNTIME_SHARED): $(GDN_AOT_OBJECT) $(GDN_PREFILL_AOT_OBJECTS) $(CUTE_NVFP4_OBJECT) $(CUTE_NVFP4_QUANTIZE_OBJECT) $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) $(CUDA_QSA_SCORE_OBJECT) $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/qwen_runtime_direct.cc $(KERNEL_DIR)/cuda/gdn_decode.cu $(KERNEL_DIR)/cuda/gdn_decode_flashinfer_cute.cc $(KERNEL_DIR)/cuda/gdn_block_sglang.cu $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cc $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/cuda/mhc_sglang.cu $(KERNEL_DIR)/cuda/ple_gather.cu $(KERNEL_DIR)/cuda/qsa_index_prep_sglang.cu $(KERNEL_DIR)/cuda/qsa_topk_sglang.cu $(KERNEL_DIR)/cuda/qsa_expand_sglang.cu $(KERNEL_DIR)/cuda/qsa_kv_pack_sglang.cu $(KERNEL_DIR)/cuda/qsa_decode_xqa_flashinfer.cu $(KERNEL_DIR)/cuda/qwen_expert_pack.cu $(KERNEL_DIR)/cuda/qwen_gdn_aux.cu $(KERNEL_DIR)/cuda/qwen_qsa_block.cu $(KERNEL_DIR)/cuda/qwen_ple_block.cu $(KERNEL_DIR)/cuda/qwen_decode_glue.cu $(KERNEL_DIR)/include/flash/kernel_api.h $(KERNEL_DIR)/include/flash/qwen_runtime_api.h
+$(CUDA_QWEN_RUNTIME_SHARED): $(GDN_AOT_OBJECT) $(GDN_PREFILL_AOT_OBJECTS) $(CUTE_NVFP4_OBJECT) $(CUTE_NVFP4_QUANTIZE_OBJECT) $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) $(CUDA_QSA_SCORE_OBJECT) $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/qwen_runtime_direct.cc $(KERNEL_DIR)/cuda/gdn_decode.cu $(KERNEL_DIR)/cuda/gdn_decode_flashinfer_cute.cc $(KERNEL_DIR)/cuda/gdn_block_sglang.cu $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_grouped_indexed_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cu $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/cuda/mhc_sglang.cu $(KERNEL_DIR)/cuda/ple_gather.cu $(KERNEL_DIR)/cuda/qsa_index_prep_sglang.cu $(KERNEL_DIR)/cuda/qsa_topk_sglang.cu $(KERNEL_DIR)/cuda/qsa_expand_sglang.cu $(KERNEL_DIR)/cuda/qsa_kv_pack_sglang.cu $(KERNEL_DIR)/cuda/qsa_decode_xqa_flashinfer.cu $(KERNEL_DIR)/cuda/qwen_expert_pack.cu $(KERNEL_DIR)/cuda/qwen_gdn_aux.cu $(KERNEL_DIR)/cuda/qwen_qsa_block.cu $(KERNEL_DIR)/cuda/qwen_ple_block.cu $(KERNEL_DIR)/cuda/qwen_decode_glue.cu $(KERNEL_DIR)/include/flash/kernel_api.h $(KERNEL_DIR)/include/flash/qwen_runtime_api.h $(KERNEL_DIR)/include/flash/qwen_expert_pack_api.h $(KERNEL_DIR)/include/flash/qwen_decode_glue_api.h
 	test -n "$(GDN_AOT_OBJECT)"
 	test -n "$(GDN_PREFILL_AOT_OBJECTS)"
 	test -n "$(CUTE_NVFP4_OBJECT)"
@@ -597,6 +601,7 @@ $(CUDA_QWEN_RUNTIME_SHARED): $(GDN_AOT_OBJECT) $(GDN_PREFILL_AOT_OBJECTS) $(CUTE
 		-DFLASH_WITH_FLASHINFER_GDN_PREFILL_AOT \
 		-DFLASH_WITH_SGLANG_CUBLAS_GDN_BLOCK \
 		-DFLASH_WITH_FLASHINFER_GROUPED_NVFP4 \
+		-DFLASH_WITH_FLASHINFER_INDEXED_GROUPED_NVFP4 \
 		-DFLASH_WITH_FLASHINFER_CUTE_SILU_NVFP4 \
 		-DFLASH_WITH_FLASHINFER_CUTE_NVFP4_QUANTIZE \
 		-DFLASH_WITH_FLASHINFER_MOE_ROUTE \
@@ -615,8 +620,9 @@ $(CUDA_QWEN_RUNTIME_SHARED): $(GDN_AOT_OBJECT) $(GDN_PREFILL_AOT_OBJECTS) $(CUTE
 		$(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/qwen_runtime_direct.cc \
 		$(KERNEL_DIR)/cuda/gdn_decode.cu \
 		$(KERNEL_DIR)/cuda/gdn_decode_flashinfer_cute.cc $(KERNEL_DIR)/cuda/gdn_block_sglang.cu \
-		$(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc \
-		$(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cc $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu \
+		$(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu \
+		$(KERNEL_DIR)/cuda/nvfp4_grouped_indexed_flashinfer.cu \
+		$(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cu $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu \
 		$(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu \
 		$(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/cuda/mhc_sglang.cu \
 		$(KERNEL_DIR)/cuda/ple_gather.cu $(KERNEL_DIR)/cuda/qsa_index_prep_sglang.cu \
@@ -643,7 +649,7 @@ $(CUDA_QSA_DECODE_XQA_FIXTURE_TEST): $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) $(KERNEL_
 		$(CUDA_QSA_DECODE_XQA_MHA_OBJECT) -lcuda \
 		-o $(CUDA_QSA_DECODE_XQA_FIXTURE_TEST)
 
-$(CUDA_QWEN_MOE_FIXTURE_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cc $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/cuda/mhc_sglang.cu $(KERNEL_DIR)/internal/nvfp4_grouped_backend.h $(KERNEL_DIR)/internal/nvfp4_silu_backend.h $(KERNEL_DIR)/internal/nvfp4_quantize_backend.h $(KERNEL_DIR)/internal/moe_route_backend.h $(KERNEL_DIR)/internal/moe_gate_backend.h $(KERNEL_DIR)/internal/shared_expert_backend.h $(KERNEL_DIR)/internal/moe_join_backend.h $(KERNEL_DIR)/internal/mhc_backend.h $(KERNEL_DIR)/tests/qwen_moe_fixture_test.cc $(KERNEL_DIR)/include/flash/kernel_api.h
+$(CUDA_QWEN_MOE_FIXTURE_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cu $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/cuda/mhc_sglang.cu $(KERNEL_DIR)/internal/nvfp4_grouped_backend.h $(KERNEL_DIR)/internal/nvfp4_silu_backend.h $(KERNEL_DIR)/internal/nvfp4_quantize_backend.h $(KERNEL_DIR)/internal/moe_route_backend.h $(KERNEL_DIR)/internal/moe_gate_backend.h $(KERNEL_DIR)/internal/shared_expert_backend.h $(KERNEL_DIR)/internal/moe_join_backend.h $(KERNEL_DIR)/internal/mhc_backend.h $(KERNEL_DIR)/tests/qwen_moe_fixture_test.cc $(KERNEL_DIR)/include/flash/kernel_api.h
 	test -n "$(CUTE_NVFP4_OBJECT)"
 	test -n "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
 	test -n "$(TVM_FFI_ROOT)"
@@ -662,7 +668,7 @@ $(CUDA_QWEN_MOE_FIXTURE_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cu
 		-DFLASH_WITH_SGLANG_CUBLAS_MHC \
 		-I$(KERNEL_DIR)/include -I$(KERNEL_DIR) $(FLASHINFER_INCLUDES) -I$(TVM_FFI_ROOT)/include \
 		$(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu \
-		$(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cc \
+		$(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cu \
 		$(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu \
 		$(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu \
 		$(KERNEL_DIR)/cuda/mhc_sglang.cu \
@@ -672,7 +678,7 @@ $(CUDA_QWEN_MOE_FIXTURE_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cu
 		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lcublas -lcuda -lcudart -ldl \
 		-Xcompiler=-pthread -o $(CUDA_QWEN_MOE_FIXTURE_TEST)
 
-$(CUDA_QWEN_FULL_LAYER_FIXTURE_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/gdn_decode.cu $(KERNEL_DIR)/cuda/gdn_decode_flashinfer_cute.cc $(KERNEL_DIR)/cuda/gdn_block_sglang.cu $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cc $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/cuda/mhc_sglang.cu $(KERNEL_DIR)/tests/qwen_gdn_block_fixture_test.cc $(KERNEL_DIR)/tests/qwen_moe_fixture_test.cc $(KERNEL_DIR)/tests/qwen_full_layer_fixture_test.cc $(KERNEL_DIR)/include/flash/kernel_api.h
+$(CUDA_QWEN_FULL_LAYER_FIXTURE_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/gdn_decode.cu $(KERNEL_DIR)/cuda/gdn_decode_flashinfer_cute.cc $(KERNEL_DIR)/cuda/gdn_block_sglang.cu $(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu $(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cu $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu $(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu $(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/cuda/mhc_sglang.cu $(KERNEL_DIR)/tests/qwen_gdn_block_fixture_test.cc $(KERNEL_DIR)/tests/qwen_moe_fixture_test.cc $(KERNEL_DIR)/tests/qwen_full_layer_fixture_test.cc $(KERNEL_DIR)/include/flash/kernel_api.h
 	test -n "$(GDN_AOT_OBJECT)"
 	test -n "$(CUTE_NVFP4_OBJECT)"
 	test -n "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
@@ -697,8 +703,8 @@ $(CUDA_QWEN_FULL_LAYER_FIXTURE_TEST): $(KERNEL_DIR)/kernel_contract.cc $(KERNEL_
 		-I$(KERNEL_DIR)/include -I$(KERNEL_DIR) $(FLASHINFER_INCLUDES) -I$(TVM_FFI_ROOT)/include \
 		$(KERNEL_DIR)/kernel_contract.cc $(KERNEL_DIR)/cuda/gdn_decode.cu \
 		$(KERNEL_DIR)/cuda/gdn_decode_flashinfer_cute.cc $(KERNEL_DIR)/cuda/gdn_block_sglang.cu \
-		$(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cc \
-		$(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cc $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu \
+		$(KERNEL_DIR)/cuda/nvfp4_grouped_flashinfer.cu $(KERNEL_DIR)/cuda/nvfp4_silu_cute.cu \
+		$(KERNEL_DIR)/cuda/nvfp4_quantize_cute.cu $(KERNEL_DIR)/cuda/moe_route_flashinfer.cu \
 		$(KERNEL_DIR)/cuda/moe_gate_sglang.cu $(KERNEL_DIR)/cuda/shared_expert_sglang.cu \
 		$(KERNEL_DIR)/cuda/moe_join_sglang.cu $(KERNEL_DIR)/cuda/mhc_sglang.cu \
 		$(KERNEL_DIR)/tests/qwen_gdn_block_fixture_test.cc \

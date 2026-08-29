@@ -45,6 +45,10 @@ name = "qwen_serve"
 path = "examples/qwen_serve.rs"
 required-features = ["native-fabric-smoke"]
 
+[[example]]
+name = "qwen_expert_sidecar"
+path = "examples/qwen_expert_sidecar.rs"
+
 [features]
 native-fabric = []
 native-fabric-smoke = ["native-fabric"]

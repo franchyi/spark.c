@@ -1,17 +1,20 @@
 use std::ffi::{c_char, c_void};
 
 use crate::kernel::{
-    DataType, DenseNvfp4Spec, GroupedNvfp4Spec, KERNEL_ABI_VERSION, SegmentedNvfp4QuantizeSpec,
+    DataType, DenseNvfp4Spec, GroupedNvfp4Spec, IndexedGroupedNvfp4Spec,
+    KernelContractError, KERNEL_ABI_VERSION, SegmentedNvfp4QuantizeSpec,
     SegmentedSiluNvfp4Spec, SiluNvfp4Spec,
 };
 use crate::routing::MoeRouteSpec;
 
 pub const FABRIC_ABI_VERSION: u32 = 1;
 pub const QWEN_EXPERT_PACK_ABI_VERSION: u32 = 1;
+pub const QWEN_EXPERT_SIDECAR_ABI_VERSION: u32 = 1;
 pub const QWEN_GDN_AUX_ABI_VERSION: u32 = 1;
 pub const QWEN_QSA_BLOCK_ABI_VERSION: u32 = 1;
 pub const QWEN_PLE_BLOCK_ABI_VERSION: u32 = 1;
 pub const QWEN_DECODE_GLUE_ABI_VERSION: u32 = 1;
+pub const INDEXED_GROUPED_NVFP4_ABI_VERSION: u32 = KERNEL_ABI_VERSION;
 pub const QWEN_EXPERT_CAPACITY: u32 = 16;
 pub const QWEN_W13_WEIGHT_BYTES: u64 = 1_638_400;
 pub const QWEN_W2_WEIGHT_BYTES: u64 = 819_200;
@@ -171,6 +174,74 @@ pub struct QwenExpertPackArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub struct QwenExpertPromoteArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub fills: u32,
+    pub source_capacity: u32,
+    pub source_w13_weights: *const u8,
+    pub source_w2_weights: *const u8,
+    pub source_w13_scales: *const u8,
+    pub source_w2_scales: *const u8,
+    pub source_w13_input_global_scales: *const f32,
+    pub source_w13_alpha: *const f32,
+    pub source_w2_input_global_scales: *const f32,
+    pub source_w2_alpha: *const f32,
+    pub destination_w13_weights: *mut u8,
+    pub destination_w2_weights: *mut u8,
+    pub destination_w13_scales: *mut u8,
+    pub destination_w2_scales: *mut u8,
+    pub destination_w13_input_global_scales: *mut f32,
+    pub destination_w13_alpha: *mut f32,
+    pub destination_w2_input_global_scales: *mut f32,
+    pub destination_w2_alpha: *mut f32,
+    pub source_slots: [u32; QWEN_EXPERT_CAPACITY as usize],
+    pub destination_slots: [u32; QWEN_EXPERT_CAPACITY as usize],
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenExpertSidecarFillArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub fills: u32,
+    pub destination_capacity: u32,
+    pub sidecar_records: *const u8,
+    pub sidecar_record_bytes: u64,
+    pub sidecar_record_count: u64,
+    pub destination_w13_weights: *mut u8,
+    pub destination_w2_weights: *mut u8,
+    pub destination_w13_scales: *mut u8,
+    pub destination_w2_scales: *mut u8,
+    pub destination_w13_input_global_scales: *mut f32,
+    pub destination_w13_alpha: *mut f32,
+    pub destination_w2_input_global_scales: *mut f32,
+    pub destination_w2_alpha: *mut f32,
+    pub source_records: [u32; QWEN_EXPERT_CAPACITY as usize],
+    pub destination_slots: [u32; QWEN_EXPERT_CAPACITY as usize],
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenExpertSidecarScalarGatherArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub values: u32,
+    pub experts: u32,
+    pub layer_records: *const u8,
+    pub record_bytes: u64,
+    pub logical_experts: *const i32,
+    pub w13_input_global_scales: *mut f32,
+    pub w13_alpha: *mut f32,
+    pub w2_input_global_scales: *mut f32,
+    pub w2_alpha: *mut f32,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct QwenBf16ToF32Args {
     pub struct_size: u32,
     pub abi_version: u32,
@@ -270,6 +341,18 @@ pub struct QwenLmHeadArgs {
     pub weight: *const c_void,
     pub logits: *mut f32,
     pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenArgmaxArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub elements: u32,
+    pub reserved: u32,
+    pub values: *const f32,
+    pub output_index: *mut u32,
     pub cuda_stream: *mut c_void,
 }
 
@@ -432,6 +515,86 @@ pub struct GroupedNvfp4Args {
     pub float_workspace: *mut c_void,
     pub float_workspace_bytes: u64,
     pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct IndexedGroupedNvfp4Args {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub grouped: GroupedNvfp4Args,
+    /// CUDA-visible compact-group -> source-group INT32 map.
+    pub logical_group_ids: *const i32,
+    /// CPU mirror used only for range/uniqueness validation at submission.
+    pub logical_group_ids_host: *const i32,
+    pub source_group_count: u32,
+    pub reserved: u32,
+}
+
+impl IndexedGroupedNvfp4Args {
+    /// Bind a compact grouped launch to a strided logical-expert bank.
+    ///
+    /// `logical_group_ids_host` must remain alive until the synchronous FFI
+    /// submission returns. `logical_group_ids_device` must contain the same
+    /// values on the launch stream and remain alive until that stream passes
+    /// the argument-preparation kernel.
+    pub fn new(
+        spec: IndexedGroupedNvfp4Spec,
+        grouped: GroupedNvfp4Args,
+        logical_group_ids_device: *const i32,
+        logical_group_ids_host: &[i32],
+    ) -> Result<Self, KernelContractError> {
+        Self::new_inner(
+            spec,
+            grouped,
+            logical_group_ids_device,
+            logical_group_ids_host,
+            0,
+        )
+    }
+
+    /// Bind device-selected logical IDs whose exact values are not available
+    /// until an earlier kernel on the same stream completes. The host slice is
+    /// a shape/range witness only; the CUDA IDs select the source records.
+    pub fn new_device_selected(
+        spec: IndexedGroupedNvfp4Spec,
+        grouped: GroupedNvfp4Args,
+        logical_group_ids_device: *const i32,
+        logical_group_ids_host_shape: &[i32],
+    ) -> Result<Self, KernelContractError> {
+        Self::new_inner(
+            spec,
+            grouped,
+            logical_group_ids_device,
+            logical_group_ids_host_shape,
+            1,
+        )
+    }
+
+    fn new_inner(
+        spec: IndexedGroupedNvfp4Spec,
+        mut grouped: GroupedNvfp4Args,
+        logical_group_ids_device: *const i32,
+        logical_group_ids_host: &[i32],
+        mode: u32,
+    ) -> Result<Self, KernelContractError> {
+        spec.validate_logical_group_ids(logical_group_ids_host)?;
+        if logical_group_ids_device.is_null() {
+            return Err(KernelContractError::InvalidLogicalGroupIds);
+        }
+        grouped.plan = spec.grouped.into();
+        grouped.weights.packed_group_stride_bytes = spec.packed_group_stride_bytes;
+        grouped.weights.scale_group_stride_bytes = spec.scale_group_stride_bytes;
+        Ok(Self {
+            struct_size: size_u32::<Self>(),
+            abi_version: INDEXED_GROUPED_NVFP4_ABI_VERSION,
+            grouped,
+            logical_group_ids: logical_group_ids_device,
+            logical_group_ids_host: logical_group_ids_host.as_ptr(),
+            source_group_count: spec.source_group_count,
+            reserved: mode,
+        })
+    }
 }
 
 #[repr(C)]
@@ -1434,10 +1597,8 @@ unsafe extern "C" {
     ) -> Status;
     pub fn flash_coherent_region_destroy(region: *mut CoherentRegion) -> Status;
     pub fn flash_cuda_stream_create(stream: *mut *mut CudaStream) -> Status;
-    pub fn flash_cuda_stream_raw(
-        stream: *const CudaStream,
-        raw_stream: *mut *mut c_void,
-    ) -> Status;
+    pub fn flash_cuda_stream_raw(stream: *const CudaStream, raw_stream: *mut *mut c_void)
+    -> Status;
     pub fn flash_cuda_stream_memset_async(
         stream: *mut CudaStream,
         device_pointer: *mut c_void,
@@ -1450,10 +1611,8 @@ unsafe extern "C" {
         source_device_pointer: *const c_void,
         bytes: u64,
     ) -> Status;
-    pub fn flash_cuda_stream_wait_event(
-        stream: *mut CudaStream,
-        event: *const CudaEvent,
-    ) -> Status;
+    pub fn flash_cuda_stream_wait_event(stream: *mut CudaStream, event: *const CudaEvent)
+    -> Status;
     pub fn flash_cuda_stream_synchronize(stream: *mut CudaStream) -> Status;
     pub fn flash_cuda_stream_destroy(stream: *mut CudaStream) -> Status;
     pub fn flash_cuda_event_create(event: *mut *mut CudaEvent) -> Status;
@@ -1466,6 +1625,11 @@ unsafe extern "C" {
     pub fn flash_cuda_blas_destroy(blas: *mut CudaBlas) -> Status;
     pub fn flash_qwen_expert_pack_validate(args: *const QwenExpertPackArgs) -> Status;
     pub fn flash_qwen_expert_pack_launch(args: *const QwenExpertPackArgs) -> Status;
+    pub fn flash_qwen_expert_promote_launch(args: *const QwenExpertPromoteArgs) -> Status;
+    pub fn flash_qwen_expert_sidecar_fill_launch(args: *const QwenExpertSidecarFillArgs) -> Status;
+    pub fn flash_qwen_expert_sidecar_scalar_gather_launch(
+        args: *const QwenExpertSidecarScalarGatherArgs,
+    ) -> Status;
     pub fn flash_qwen_bf16_to_f32_launch(args: *const QwenBf16ToF32Args) -> Status;
     pub fn flash_qwen_qsa_project_launch(args: *const QwenQsaProjectArgs) -> Status;
     pub fn flash_qwen_qsa_finish_launch(args: *const QwenQsaFinishArgs) -> Status;
@@ -1474,14 +1638,9 @@ unsafe extern "C" {
     pub fn flash_qwen_add_hyper_launch(args: *const QwenDecodeGlueArgs) -> Status;
     pub fn flash_qwen_qsa_single_value_launch(args: *const QwenDecodeGlueArgs) -> Status;
     pub fn flash_qwen_lm_head_launch(args: *const QwenLmHeadArgs) -> Status;
-    pub fn flash_qwen_runtime_mhc_mix(
-        caps: *const DeviceCaps,
-        args: *const MhcArgs,
-    ) -> Status;
-    pub fn flash_qwen_runtime_mhc_combine(
-        caps: *const DeviceCaps,
-        args: *const MhcArgs,
-    ) -> Status;
+    pub fn flash_qwen_argmax_launch(args: *const QwenArgmaxArgs) -> Status;
+    pub fn flash_qwen_runtime_mhc_mix(caps: *const DeviceCaps, args: *const MhcArgs) -> Status;
+    pub fn flash_qwen_runtime_mhc_combine(caps: *const DeviceCaps, args: *const MhcArgs) -> Status;
     pub fn flash_qwen_runtime_gdn_prepare(
         caps: *const DeviceCaps,
         args: *const GdnBlockArgs,
@@ -1499,6 +1658,10 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const GroupedNvfp4Args,
     ) -> Status;
+    pub fn flash_qwen_runtime_indexed_grouped_nvfp4(
+        caps: *const DeviceCaps,
+        args: *const IndexedGroupedNvfp4Args,
+    ) -> Status;
     pub fn flash_qwen_runtime_segmented_quantize(
         caps: *const DeviceCaps,
         args: *const SegmentedNvfp4QuantizeArgs,
@@ -1507,10 +1670,8 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const SegmentedSiluNvfp4Args,
     ) -> Status;
-    pub fn flash_qwen_runtime_moe_gate(
-        caps: *const DeviceCaps,
-        args: *const MoeGateArgs,
-    ) -> Status;
+    pub fn flash_qwen_runtime_moe_gate(caps: *const DeviceCaps, args: *const MoeGateArgs)
+    -> Status;
     pub fn flash_qwen_runtime_moe_dispatch(
         caps: *const DeviceCaps,
         args: *const MoeRouteArgs,
@@ -1523,10 +1684,8 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const SharedExpertArgs,
     ) -> Status;
-    pub fn flash_qwen_runtime_moe_join(
-        caps: *const DeviceCaps,
-        args: *const MoeJoinArgs,
-    ) -> Status;
+    pub fn flash_qwen_runtime_moe_join(caps: *const DeviceCaps, args: *const MoeJoinArgs)
+    -> Status;
     pub fn flash_qwen_runtime_ple_gather(
         caps: *const DeviceCaps,
         args: *const PleGatherArgs,
@@ -1538,10 +1697,8 @@ unsafe extern "C" {
         plan: *const DenseNvfp4Plan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_dense_nvfp4_launch(
-        caps: *const DeviceCaps,
-        args: *const DenseNvfp4Args,
-    ) -> Status;
+    pub fn flash_dense_nvfp4_launch(caps: *const DeviceCaps, args: *const DenseNvfp4Args)
+    -> Status;
     pub fn flash_grouped_nvfp4_validate(plan: *const GroupedNvfp4Plan) -> Status;
     pub fn flash_grouped_nvfp4_query(
         caps: *const DeviceCaps,
@@ -1552,16 +1709,17 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const GroupedNvfp4Args,
     ) -> Status;
+    pub fn flash_indexed_grouped_nvfp4_launch(
+        caps: *const DeviceCaps,
+        args: *const IndexedGroupedNvfp4Args,
+    ) -> Status;
     pub fn flash_silu_nvfp4_validate(plan: *const SiluNvfp4Plan) -> Status;
     pub fn flash_silu_nvfp4_query(
         caps: *const DeviceCaps,
         plan: *const SiluNvfp4Plan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_silu_nvfp4_launch(
-        caps: *const DeviceCaps,
-        args: *const SiluNvfp4Args,
-    ) -> Status;
+    pub fn flash_silu_nvfp4_launch(caps: *const DeviceCaps, args: *const SiluNvfp4Args) -> Status;
     pub fn flash_segmented_silu_nvfp4_validate(plan: *const SegmentedSiluNvfp4Plan) -> Status;
     pub fn flash_segmented_silu_nvfp4_query(
         caps: *const DeviceCaps,
@@ -1590,14 +1748,8 @@ unsafe extern "C" {
         plan: *const MoeRoutePlan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_moe_route_dispatch(
-        caps: *const DeviceCaps,
-        args: *const MoeRouteArgs,
-    ) -> Status;
-    pub fn flash_moe_route_finalize(
-        caps: *const DeviceCaps,
-        args: *const MoeRouteArgs,
-    ) -> Status;
+    pub fn flash_moe_route_dispatch(caps: *const DeviceCaps, args: *const MoeRouteArgs) -> Status;
+    pub fn flash_moe_route_finalize(caps: *const DeviceCaps, args: *const MoeRouteArgs) -> Status;
     pub fn flash_moe_gate_validate(plan: *const MoeGatePlan) -> Status;
     pub fn flash_moe_gate_query(
         caps: *const DeviceCaps,
@@ -1636,10 +1788,7 @@ unsafe extern "C" {
         plan: *const PleGatherPlan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_ple_gather_launch(
-        caps: *const DeviceCaps,
-        args: *const PleGatherArgs,
-    ) -> Status;
+    pub fn flash_ple_gather_launch(caps: *const DeviceCaps, args: *const PleGatherArgs) -> Status;
     pub fn flash_qsa_topk_validate(plan: *const QsaTopkPlan) -> Status;
     pub fn flash_qsa_topk_query(
         caps: *const DeviceCaps,
@@ -1653,20 +1802,14 @@ unsafe extern "C" {
         plan: *const QsaExpandPlan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_qsa_expand_launch(
-        caps: *const DeviceCaps,
-        args: *const QsaExpandArgs,
-    ) -> Status;
+    pub fn flash_qsa_expand_launch(caps: *const DeviceCaps, args: *const QsaExpandArgs) -> Status;
     pub fn flash_qsa_score_validate(plan: *const QsaScorePlan) -> Status;
     pub fn flash_qsa_score_query(
         caps: *const DeviceCaps,
         plan: *const QsaScorePlan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_qsa_score_launch(
-        caps: *const DeviceCaps,
-        args: *const QsaScoreArgs,
-    ) -> Status;
+    pub fn flash_qsa_score_launch(caps: *const DeviceCaps, args: *const QsaScoreArgs) -> Status;
     pub fn flash_qsa_index_prep_validate(plan: *const QsaIndexPrepPlan) -> Status;
     pub fn flash_qsa_index_prep_query(
         caps: *const DeviceCaps,
@@ -1683,30 +1826,21 @@ unsafe extern "C" {
         plan: *const QsaKvPackPlan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_qsa_kv_pack_launch(
-        caps: *const DeviceCaps,
-        args: *const QsaKvPackArgs,
-    ) -> Status;
+    pub fn flash_qsa_kv_pack_launch(caps: *const DeviceCaps, args: *const QsaKvPackArgs) -> Status;
     pub fn flash_qsa_decode_validate(plan: *const QsaDecodePlan) -> Status;
     pub fn flash_qsa_decode_query(
         caps: *const DeviceCaps,
         plan: *const QsaDecodePlan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_qsa_decode_launch(
-        caps: *const DeviceCaps,
-        args: *const QsaDecodeArgs,
-    ) -> Status;
+    pub fn flash_qsa_decode_launch(caps: *const DeviceCaps, args: *const QsaDecodeArgs) -> Status;
     pub fn flash_gdn_decode_validate(plan: *const GdnDecodePlan) -> Status;
     pub fn flash_gdn_decode_query(
         caps: *const DeviceCaps,
         plan: *const GdnDecodePlan,
         info: *mut KernelInfo,
     ) -> Status;
-    pub fn flash_gdn_decode_launch(
-        caps: *const DeviceCaps,
-        args: *const GdnDecodeArgs,
-    ) -> Status;
+    pub fn flash_gdn_decode_launch(caps: *const DeviceCaps, args: *const GdnDecodeArgs) -> Status;
     pub fn flash_gdn_block_validate(plan: *const GdnBlockPlan) -> Status;
     pub fn flash_gdn_block_query(
         caps: *const DeviceCaps,
@@ -1720,7 +1854,8 @@ unsafe extern "C" {
     pub fn flash_gdn_block_finish_launch(
         caps: *const DeviceCaps,
         args: *const GdnBlockArgs,
-    ) -> Status;}
+    ) -> Status;
+}
 
 fn size_u32<T>() -> u32 {
     u32::try_from(std::mem::size_of::<T>()).expect("kernel ABI structs fit in u32")
@@ -1742,6 +1877,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<GroupedNvfp4Plan>(), 80);
         assert_eq!(std::mem::size_of::<GroupedNvfp4WeightView>(), 32);
         assert_eq!(std::mem::size_of::<GroupedNvfp4Args>(), 224);
+        assert_eq!(std::mem::size_of::<IndexedGroupedNvfp4Args>(), 256);
         assert_eq!(std::mem::size_of::<SiluNvfp4Plan>(), 48);
         assert_eq!(std::mem::size_of::<SiluNvfp4Args>(), 128);
         assert_eq!(std::mem::size_of::<SegmentedSiluNvfp4Plan>(), 56);
@@ -1778,12 +1914,16 @@ mod tests {
         assert_eq!(std::mem::size_of::<GdnBlockPlan>(), 48);
         assert_eq!(std::mem::size_of::<GdnBlockArgs>(), 216);
         assert_eq!(std::mem::size_of::<QwenExpertPackArgs>(), 176);
+        assert_eq!(std::mem::size_of::<QwenExpertPromoteArgs>(), 280);
+        assert_eq!(std::mem::size_of::<QwenExpertSidecarFillArgs>(), 240);
+        assert_eq!(std::mem::size_of::<QwenExpertSidecarScalarGatherArgs>(), 80);
         assert_eq!(std::mem::size_of::<QwenBf16ToF32Args>(), 40);
         assert_eq!(std::mem::size_of::<QwenQsaProjectArgs>(), 168);
         assert_eq!(std::mem::size_of::<QwenQsaFinishArgs>(), 72);
         assert_eq!(std::mem::size_of::<QwenPleBlockArgs>(), 144);
         assert_eq!(std::mem::size_of::<QwenDecodeGlueArgs>(), 32);
         assert_eq!(std::mem::size_of::<QwenLmHeadArgs>(), 56);
+        assert_eq!(std::mem::size_of::<QwenArgmaxArgs>(), 40);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
     }
 

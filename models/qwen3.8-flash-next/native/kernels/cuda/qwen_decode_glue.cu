@@ -3,6 +3,7 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <string>
 
@@ -60,6 +61,55 @@ __global__ void ExpandSingleValue(const __nv_bfloat16* value,
   const int column = index % kHeadDim;
   const int kv_head = query_head / (kQueryHeads / kKvHeads);
   output[index] = value[kv_head * kHeadDim + column];
+}
+
+struct MaxPair {
+  float value;
+  uint32_t index;
+};
+
+__device__ MaxPair Better(MaxPair left, MaxPair right) {
+  if (right.value > left.value ||
+      (right.value == left.value && right.index < left.index)) {
+    return right;
+  }
+  return left;
+}
+
+// The vocabulary is only about one MiB of FP32 data.  A persistent block with
+// coalesced striding is faster than migrating that region to the CPU and also
+// makes the decode tail capturable by a CUDA graph.
+__global__ __launch_bounds__(kThreads) void GreedyArgmax(
+    const float* values, uint32_t elements, uint32_t* output_index) {
+  MaxPair best = {-CUDART_INF_F, 0U};
+  for (uint32_t index = threadIdx.x; index < elements;
+       index += blockDim.x) {
+    const float value = values[index];
+    if (value > best.value ||
+        (value == best.value && index < best.index)) {
+      best = {value, index};
+    }
+  }
+
+  for (int offset = 16; offset != 0; offset >>= 1) {
+    MaxPair other = {__shfl_down_sync(0xFFFFFFFFU, best.value, offset),
+                     __shfl_down_sync(0xFFFFFFFFU, best.index, offset)};
+    best = Better(best, other);
+  }
+  __shared__ MaxPair warp_best[8];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) warp_best[warp] = best;
+  __syncthreads();
+  if (warp == 0) {
+    best = lane < 8 ? warp_best[lane] : MaxPair{-CUDART_INF_F, UINT32_MAX};
+    for (int offset = 16; offset != 0; offset >>= 1) {
+      MaxPair other = {__shfl_down_sync(0xFFFFFFFFU, best.value, offset),
+                       __shfl_down_sync(0xFFFFFFFFU, best.index, offset)};
+      best = Better(best, other);
+    }
+    if (lane == 0) *output_index = best.index;
+  }
 }
 
 FlashStatus ValidateGlue(const FlashQwenDecodeGlueArgs* args) {
@@ -143,4 +193,20 @@ extern "C" FlashStatus flash_qwen_lm_head_launch(
   return status == CUBLAS_STATUS_SUCCESS
              ? Ok()
              : CublasError("Qwen LM-head projection failed: ", status);
+}
+
+extern "C" FlashStatus flash_qwen_argmax_launch(
+    const FlashQwenArgmaxArgs* args) {
+  if (args == nullptr || args->struct_size != sizeof(*args) ||
+      args->abi_version != FLASH_QWEN_DECODE_GLUE_ABI_VERSION ||
+      args->elements == 0 || args->values == nullptr ||
+      args->output_index == nullptr) {
+    return Invalid("Qwen argmax arguments are invalid");
+  }
+  GreedyArgmax<<<1, kThreads, 0,
+                 static_cast<cudaStream_t>(args->cuda_stream)>>>(
+      args->values, args->elements, args->output_index);
+  const cudaError_t error = cudaGetLastError();
+  return error == cudaSuccess ? Ok()
+                              : CudaError("Qwen argmax failed: ", error);
 }

@@ -5,10 +5,10 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Instant;
 
+use spark_flash_next::engine::QwenNativeEngine;
 use spark_flash_next::openai_server::{
     FinishReason, GenerationError, GenerationRequest, OpenAiServer, TokenGenerator,
 };
-use spark_flash_next::engine::QwenNativeEngine;
 use spark_flash_next::tokenizer::NativeQwenTokenizer;
 
 enum EngineEvent {
@@ -114,19 +114,38 @@ fn run_generation(engine: &mut QwenNativeEngine, command: EngineCommand) {
                 .find(|bucket| *bucket <= remaining)
                 .ok_or("Qwen prefill bucket decomposition failed")?;
             let end = offset + chunk_tokens;
-            let step = engine.forward_tokens(&prompt[offset..end], trace_layers)?;
-            candidate = Some(step.token);
-            eprintln!(
-                "Qwen prefill {end}/{prompt_tokens}: T={chunk_tokens}, next {}, {:.3} s, experts {}/{} hit/pack, {} evictions",
-                step.token,
-                step.elapsed_seconds,
-                step.expert_hits,
-                step.expert_misses,
-                step.expert_evictions,
-            );
+            if end == prompt.len() {
+                let step = engine.forward_tokens(&prompt[offset..end], trace_layers)?;
+                candidate = Some(step.token);
+                eprintln!(
+                    "Qwen prefill {end}/{prompt_tokens}: T={chunk_tokens}, next {}, {:.3} s, experts {}/{} hit/pack, {} evictions",
+                    step.token,
+                    step.elapsed_seconds,
+                    step.expert_hits,
+                    step.expert_misses,
+                    step.expert_evictions,
+                );
+            } else {
+                let step = engine.prefill_tokens(&prompt[offset..end], trace_layers)?;
+                // Per-bucket logging is useful while tracing but turns a 12K
+                // prompt into almost 800 synchronous stderr writes. Keep the
+                // normal service progress coarse and leave full detail opt-in.
+                if trace_layers || end.is_multiple_of(1024) {
+                    eprintln!(
+                        "Qwen prefill {end}/{prompt_tokens}: T={chunk_tokens}, {:.3} s, experts {}/{} hit/pack, {} evictions",
+                        step.elapsed_seconds,
+                        step.expert_hits,
+                        step.expert_misses,
+                        step.expert_evictions,
+                    );
+                }
+            }
             offset = end;
         }
-        eprintln!("Qwen prefill complete in {:.3} s", prefill_started.elapsed().as_secs_f64());
+        eprintln!(
+            "Qwen prefill complete in {:.3} s",
+            prefill_started.elapsed().as_secs_f64()
+        );
         let mut token = candidate.ok_or("Qwen prompt did not produce a decode token")?;
         for generated in 0..request.max_new_tokens {
             if request.stop_token_ids.contains(&token) {
@@ -165,7 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_root = arguments
         .next()
         .unwrap_or_else(|| panic!("usage: qwen_serve <model-root> [bind] [model-id]"));
-    let bind = arguments.next().unwrap_or_else(|| "0.0.0.0:30000".to_owned());
+    let bind = arguments
+        .next()
+        .unwrap_or_else(|| "0.0.0.0:30000".to_owned());
     let model_id = arguments
         .next()
         .unwrap_or_else(|| "RadixArk/Qwen3.8-Flash-Next-NVFP4".to_owned());

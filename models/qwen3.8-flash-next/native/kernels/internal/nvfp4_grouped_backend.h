@@ -12,4 +12,7 @@ size_t flash_flashinfer_grouped_nvfp4_float_workspace_bytes(void);
 FlashStatus flash_flashinfer_grouped_nvfp4_launch(
     const FlashGroupedNvfp4Args* args);
 
+FlashStatus flash_flashinfer_indexed_grouped_nvfp4_launch(
+    const FlashIndexedGroupedNvfp4Args* args);
+
 #endif  // FLASH_INTERNAL_NVFP4_GROUPED_BACKEND_H_

@@ -22,6 +22,8 @@ FlashStatus flash_qwen_runtime_bf16_to_f32(
     const FlashQwenBf16ToF32Args*);
 FlashStatus flash_qwen_runtime_grouped_nvfp4(
     const FlashDeviceCaps*, const FlashGroupedNvfp4Args*);
+FlashStatus flash_qwen_runtime_indexed_grouped_nvfp4(
+    const FlashDeviceCaps*, const FlashIndexedGroupedNvfp4Args*);
 FlashStatus flash_qwen_runtime_segmented_quantize(
     const FlashDeviceCaps*, const FlashSegmentedNvfp4QuantizeArgs*);
 FlashStatus flash_qwen_runtime_segmented_silu(

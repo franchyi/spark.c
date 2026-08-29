@@ -6,16 +6,26 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::checkpoint::{CheckpointError, FlashNextCheckpoint};
 use crate::coherent::{CoherentRegionError, CoherentRegionOwner};
 use crate::cuda::CudaStreamOwner;
 use crate::fabric::ExpertLoad;
 use crate::ffi::{
-    QWEN_EXPERT_CAPACITY, QWEN_EXPERT_PACK_ABI_VERSION, QWEN_W13_SCALE_BYTES,
-    QWEN_W13_WEIGHT_BYTES, QWEN_W2_SCALE_BYTES, QWEN_W2_WEIGHT_BYTES,
-    QwenExpertPackArgs, Status, flash_qwen_expert_pack_launch,
+    QWEN_EXPERT_CAPACITY, QWEN_EXPERT_PACK_ABI_VERSION, QWEN_EXPERT_SIDECAR_ABI_VERSION,
+    QWEN_W2_SCALE_BYTES, QWEN_W2_WEIGHT_BYTES, QWEN_W13_SCALE_BYTES, QWEN_W13_WEIGHT_BYTES,
+    QwenExpertPackArgs, QwenExpertPromoteArgs, QwenExpertSidecarFillArgs,
+    QwenExpertSidecarScalarGatherArgs, Status, flash_qwen_expert_pack_launch,
+    flash_qwen_expert_promote_launch, flash_qwen_expert_sidecar_fill_launch,
+    flash_qwen_expert_sidecar_scalar_gather_launch,
+};
+use crate::qwen_expert_sidecar::{
+    EXPERT_SIDECAR_EXPERTS_PER_LAYER, EXPERT_SIDECAR_RECORD_ALIGNMENT, EXPERT_SIDECAR_RECORD_BYTES,
+    EXPERT_SIDECAR_RECORDS, EXPERT_W2_ALPHA_OFFSET, EXPERT_W2_INPUT_GLOBAL_SCALE_OFFSET,
+    EXPERT_W2_SCALE_OFFSET, EXPERT_W2_WEIGHT_OFFSET, EXPERT_W13_ALPHA_OFFSET,
+    EXPERT_W13_INPUT_GLOBAL_SCALE_OFFSET, EXPERT_W13_SCALE_OFFSET, EXPERT_W13_WEIGHT_OFFSET,
+    ExpertSidecarError, ExpertSidecarHeader, validate_expert_sidecar_for_checkpoint,
 };
 use crate::qwen_weights::{FlashNextWeightMaps, QwenTensorView, QwenWeightError};
 
@@ -32,6 +42,51 @@ pub struct QwenExpertHotViews {
     pub w13_alpha: u64,
     pub w2_input_global_scales: u64,
     pub w2_alpha: u64,
+}
+
+/// Strided component bases for one layer in the all-resident AoS sidecar.
+/// Logical expert `e` lives at `component + e * record_stride_bytes`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QwenResidentExpertLayerViews {
+    pub experts: u32,
+    pub record_stride_bytes: u64,
+    pub w13_weights: u64,
+    pub w2_weights: u64,
+    pub w13_scales: u64,
+    pub w2_scales: u64,
+    pub w13_input_global_scales: u64,
+    pub w13_alpha: u64,
+    pub w2_input_global_scales: u64,
+    pub w2_alpha: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QwenResidentExpertViews {
+    pub record_bytes: u64,
+    pub w13_weights: u64,
+    pub w2_weights: u64,
+    pub w13_scales: u64,
+    pub w2_scales: u64,
+    pub w13_input_global_scale: u64,
+    pub w13_alpha: u64,
+    pub w2_input_global_scale: u64,
+    pub w2_alpha: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QwenResidentExpertScalarOutputs {
+    pub w13_input_global_scales: u64,
+    pub w13_alpha: u64,
+    pub w2_input_global_scales: u64,
+    pub w2_alpha: u64,
+}
+
+/// Validated read-only mmap of every kernel-ready expert record. The coherent
+/// owner CUDA-registers the original sidecar pages; no 63-GiB shadow copy is
+/// allocated. Keep this owner alive through every stream use of its views.
+pub struct QwenResidentExpertSidecar {
+    header: ExpertSidecarHeader,
+    records: CoherentRegionOwner,
 }
 
 pub struct QwenExpertHotCache {
@@ -146,7 +201,11 @@ impl MappedExpertFile {
         unsafe {
             libc::madvise(address, bytes, libc::MADV_RANDOM);
         }
-        Ok(Self { file, address, bytes })
+        Ok(Self {
+            file,
+            address,
+            bytes,
+        })
     }
 
     fn read_exact_at(&self, output: &mut [u8], offset: u64) -> std::io::Result<()> {
@@ -330,13 +389,14 @@ impl QwenExpertFileLoader {
         Ok(f32::from_le_bytes(bytes))
     }
 
-    fn ensure_mapped(&mut self, relative_file: &std::path::Path) -> Result<(), QwenExpertCacheError> {
+    fn ensure_mapped(
+        &mut self,
+        relative_file: &std::path::Path,
+    ) -> Result<(), QwenExpertCacheError> {
         if !self.files.contains_key(relative_file) {
             let path = self.checkpoint.plan.root.join(relative_file);
-            self.files.insert(
-                relative_file.to_path_buf(),
-                MappedExpertFile::open(&path)?,
-            );
+            self.files
+                .insert(relative_file.to_path_buf(), MappedExpertFile::open(&path)?);
         }
         Ok(())
     }
@@ -476,6 +536,150 @@ impl QwenExpertFileLoader {
     }
 }
 
+impl QwenResidentExpertSidecar {
+    pub fn open(
+        checkpoint: &FlashNextCheckpoint,
+        path: &Path,
+        flags: u32,
+        prefault: bool,
+    ) -> Result<Self, QwenExpertCacheError> {
+        let header = validate_expert_sidecar_for_checkpoint(checkpoint, path)?;
+        let records_bytes = header.records_bytes()?;
+        let records = CoherentRegionOwner::file_read_only(
+            path,
+            header.records_offset,
+            records_bytes,
+            EXPERT_SIDECAR_RECORD_ALIGNMENT,
+            flags,
+        )?;
+        if records.payload_bytes()? as u64 != records_bytes
+            || records.device_address() % EXPERT_SIDECAR_RECORD_ALIGNMENT != 0
+        {
+            return Err(QwenExpertCacheError::InvalidSidecarMapping);
+        }
+        let sidecar = Self { header, records };
+        if prefault {
+            sidecar.prefault()?;
+        }
+        Ok(sidecar)
+    }
+
+    pub fn header(&self) -> &ExpertSidecarHeader {
+        &self.header
+    }
+
+    pub fn layer_views(
+        &self,
+        layer: u16,
+    ) -> Result<QwenResidentExpertLayerViews, QwenExpertCacheError> {
+        if u32::from(layer) >= crate::qwen_expert_sidecar::EXPERT_SIDECAR_LAYERS {
+            return Err(QwenExpertCacheError::InvalidSidecarLayer(layer));
+        }
+        let first_record = u64::from(layer)
+            .checked_mul(u64::from(EXPERT_SIDECAR_EXPERTS_PER_LAYER))
+            .ok_or(QwenExpertCacheError::IntegerOverflow)?;
+        let layer_base = self
+            .records
+            .device_address()
+            .checked_add(
+                first_record
+                    .checked_mul(EXPERT_SIDECAR_RECORD_BYTES)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+            )
+            .ok_or(QwenExpertCacheError::IntegerOverflow)?;
+        Ok(QwenResidentExpertLayerViews {
+            experts: EXPERT_SIDECAR_EXPERTS_PER_LAYER,
+            record_stride_bytes: EXPERT_SIDECAR_RECORD_BYTES,
+            w13_weights: layer_base + EXPERT_W13_WEIGHT_OFFSET,
+            w2_weights: layer_base + EXPERT_W2_WEIGHT_OFFSET,
+            w13_scales: layer_base + EXPERT_W13_SCALE_OFFSET,
+            w2_scales: layer_base + EXPERT_W2_SCALE_OFFSET,
+            w13_input_global_scales: layer_base + EXPERT_W13_INPUT_GLOBAL_SCALE_OFFSET,
+            w13_alpha: layer_base + EXPERT_W13_ALPHA_OFFSET,
+            w2_input_global_scales: layer_base + EXPERT_W2_INPUT_GLOBAL_SCALE_OFFSET,
+            w2_alpha: layer_base + EXPERT_W2_ALPHA_OFFSET,
+        })
+    }
+
+    pub fn expert_views(
+        &self,
+        layer: u16,
+        expert: u16,
+    ) -> Result<QwenResidentExpertViews, QwenExpertCacheError> {
+        if u32::from(expert) >= EXPERT_SIDECAR_EXPERTS_PER_LAYER {
+            return Err(QwenExpertCacheError::InvalidSidecarExpert { layer, expert });
+        }
+        let layer_views = self.layer_views(layer)?;
+        let record = u64::from(expert)
+            .checked_mul(layer_views.record_stride_bytes)
+            .ok_or(QwenExpertCacheError::IntegerOverflow)?;
+        Ok(QwenResidentExpertViews {
+            record_bytes: layer_views.record_stride_bytes,
+            w13_weights: layer_views.w13_weights + record,
+            w2_weights: layer_views.w2_weights + record,
+            w13_scales: layer_views.w13_scales + record,
+            w2_scales: layer_views.w2_scales + record,
+            w13_input_global_scale: layer_views.w13_input_global_scales + record,
+            w13_alpha: layer_views.w13_alpha + record,
+            w2_input_global_scale: layer_views.w2_input_global_scales + record,
+            w2_alpha: layer_views.w2_alpha + record,
+        })
+    }
+
+    pub fn device_records(&self) -> u64 {
+        self.records.device_address()
+    }
+
+    /// Gather the four sidecar scalar values for device-resident logical
+    /// expert ids. The output arrays are compact and preserve input-id order.
+    /// The operation contributes exactly one launch on `stream`.
+    pub fn gather_scalars(
+        &self,
+        layer: u16,
+        logical_experts: u64,
+        values: u32,
+        output: QwenResidentExpertScalarOutputs,
+        stream: &mut CudaStreamOwner,
+    ) -> Result<(), QwenExpertCacheError> {
+        if values == 0 {
+            return Err(QwenExpertCacheError::EmptySidecarGather);
+        }
+        let layer_views = self.layer_views(layer)?;
+        let args = QwenExpertSidecarScalarGatherArgs {
+            struct_size: u32::try_from(std::mem::size_of::<QwenExpertSidecarScalarGatherArgs>())
+                .expect("Qwen sidecar scalar-gather ABI fits u32"),
+            abi_version: QWEN_EXPERT_SIDECAR_ABI_VERSION,
+            values,
+            experts: layer_views.experts,
+            layer_records: pointer_const(layer_views.w13_weights),
+            record_bytes: layer_views.record_stride_bytes,
+            logical_experts: pointer_const(logical_experts),
+            w13_input_global_scales: pointer_mut(output.w13_input_global_scales),
+            w13_alpha: pointer_mut(output.w13_alpha),
+            w2_input_global_scales: pointer_mut(output.w2_input_global_scales),
+            w2_alpha: pointer_mut(output.w2_alpha),
+            cuda_stream: stream.raw(),
+        };
+        status_result(unsafe { flash_qwen_expert_sidecar_scalar_gather_launch(&args) })
+    }
+
+    /// Touch one byte per mapped page after CUDA registration. This keeps the
+    /// sidecar file as cold backing while making the 63.3-GiB expert set RAM
+    /// resident before the first routed token.
+    pub fn prefault(&self) -> Result<u64, QwenExpertCacheError> {
+        let bytes = unsafe { self.records.host_payload()? };
+        let mut observed = 0_u8;
+        for offset in (0..bytes.len()).step_by(4096) {
+            observed ^= unsafe { std::ptr::read_volatile(bytes.as_ptr().add(offset)) };
+        }
+        if let Some(last) = bytes.last() {
+            observed ^= unsafe { std::ptr::read_volatile(last) };
+        }
+        std::hint::black_box(observed);
+        Ok(bytes.len() as u64)
+    }
+}
+
 impl QwenExpertHotCache {
     pub fn create(flags: u32) -> Result<Self, QwenExpertCacheError> {
         let capacity = u64::from(QWEN_EXPERT_CAPACITY);
@@ -565,13 +769,9 @@ impl QwenExpertHotCache {
             w2_weights: unsafe { self.w2_weights.host_payload_mut()? },
             w13_scales: unsafe { self.w13_scales.host_payload_mut()? },
             w2_scales: unsafe { self.w2_scales.host_payload_mut()? },
-            w13_input_global_scales: unsafe {
-                self.w13_input_global_scales.host_payload_mut()?
-            },
+            w13_input_global_scales: unsafe { self.w13_input_global_scales.host_payload_mut()? },
             w13_alpha: unsafe { self.w13_alpha.host_payload_mut()? },
-            w2_input_global_scales: unsafe {
-                self.w2_input_global_scales.host_payload_mut()?
-            },
+            w2_input_global_scales: unsafe { self.w2_input_global_scales.host_payload_mut()? },
             w2_alpha: unsafe { self.w2_alpha.host_payload_mut()? },
         })
     }
@@ -589,13 +789,9 @@ impl QwenExpertHotCache {
             w2_weights: unsafe { self.w2_weights.host_payload()? },
             w13_scales: unsafe { self.w13_scales.host_payload()? },
             w2_scales: unsafe { self.w2_scales.host_payload()? },
-            w13_input_global_scales: unsafe {
-                self.w13_input_global_scales.host_payload()?
-            },
+            w13_input_global_scales: unsafe { self.w13_input_global_scales.host_payload()? },
             w13_alpha: unsafe { self.w13_alpha.host_payload()? },
-            w2_input_global_scales: unsafe {
-                self.w2_input_global_scales.host_payload()?
-            },
+            w2_input_global_scales: unsafe { self.w2_input_global_scales.host_payload()? },
             w2_alpha: unsafe { self.w2_alpha.host_payload()? },
         })
     }
@@ -632,20 +828,66 @@ impl QwenExpertHotCache {
             if load.address.slot >= QWEN_EXPERT_CAPACITY {
                 return Err(QwenExpertCacheError::InvalidSlot(load.address.slot));
             }
-            let prefix = format!(
-                "model.language_model.layers.{layer}.mlp.experts.{expert}"
-            );
+            let prefix = format!("model.language_model.layers.{layer}.mlp.experts.{expert}");
             slots.push(load.address.slot);
-            gate_weights.push(byte_tensor(weights, &format!("{prefix}.gate_proj.weight"), "U8", &[640, 1280], 819_200)?);
-            up_weights.push(byte_tensor(weights, &format!("{prefix}.up_proj.weight"), "U8", &[640, 1280], 819_200)?);
-            down_weights.push(byte_tensor(weights, &format!("{prefix}.down_proj.weight"), "U8", &[2560, 320], 819_200)?);
-            gate_scales.push(byte_tensor(weights, &format!("{prefix}.gate_proj.weight_scale"), "F8_E4M3", &[640, 160], 102_400)?);
-            up_scales.push(byte_tensor(weights, &format!("{prefix}.up_proj.weight_scale"), "F8_E4M3", &[640, 160], 102_400)?);
-            down_scales.push(byte_tensor(weights, &format!("{prefix}.down_proj.weight_scale"), "F8_E4M3", &[2560, 40], 102_400)?);
-            gate_input_scales.push(float_tensor(weights, &format!("{prefix}.gate_proj.input_scale"))?);
-            gate_weight_scale_2.push(float_tensor(weights, &format!("{prefix}.gate_proj.weight_scale_2"))?);
-            down_input_scales.push(float_tensor(weights, &format!("{prefix}.down_proj.input_scale"))?);
-            down_weight_scale_2.push(float_tensor(weights, &format!("{prefix}.down_proj.weight_scale_2"))?);
+            gate_weights.push(byte_tensor(
+                weights,
+                &format!("{prefix}.gate_proj.weight"),
+                "U8",
+                &[640, 1280],
+                819_200,
+            )?);
+            up_weights.push(byte_tensor(
+                weights,
+                &format!("{prefix}.up_proj.weight"),
+                "U8",
+                &[640, 1280],
+                819_200,
+            )?);
+            down_weights.push(byte_tensor(
+                weights,
+                &format!("{prefix}.down_proj.weight"),
+                "U8",
+                &[2560, 320],
+                819_200,
+            )?);
+            gate_scales.push(byte_tensor(
+                weights,
+                &format!("{prefix}.gate_proj.weight_scale"),
+                "F8_E4M3",
+                &[640, 160],
+                102_400,
+            )?);
+            up_scales.push(byte_tensor(
+                weights,
+                &format!("{prefix}.up_proj.weight_scale"),
+                "F8_E4M3",
+                &[640, 160],
+                102_400,
+            )?);
+            down_scales.push(byte_tensor(
+                weights,
+                &format!("{prefix}.down_proj.weight_scale"),
+                "F8_E4M3",
+                &[2560, 40],
+                102_400,
+            )?);
+            gate_input_scales.push(float_tensor(
+                weights,
+                &format!("{prefix}.gate_proj.input_scale"),
+            )?);
+            gate_weight_scale_2.push(float_tensor(
+                weights,
+                &format!("{prefix}.gate_proj.weight_scale_2"),
+            )?);
+            down_input_scales.push(float_tensor(
+                weights,
+                &format!("{prefix}.down_proj.input_scale"),
+            )?);
+            down_weight_scale_2.push(float_tensor(
+                weights,
+                &format!("{prefix}.down_proj.weight_scale_2"),
+            )?);
         }
         let views = self.views();
         let args = QwenExpertPackArgs {
@@ -677,6 +919,58 @@ impl QwenExpertHotCache {
         };
         status_result(unsafe { flash_qwen_expert_pack_launch(&args) })
     }
+
+    /// Enqueue one CUDA kernel that copies every requested kernel-ready AoS
+    /// sidecar record into the compact SoA bank. This is the compatibility
+    /// fallback for the existing grouped-GEMM ABI; indexed kernels should use
+    /// `QwenResidentExpertSidecar::layer_views` directly and avoid the copy.
+    pub fn fill_from_sidecar(
+        &mut self,
+        sidecar: &QwenResidentExpertSidecar,
+        loads: &[ExpertLoad],
+        stream: &mut CudaStreamOwner,
+    ) -> Result<(), QwenExpertCacheError> {
+        if loads.is_empty() {
+            return Ok(());
+        }
+        if loads.len() > QWEN_EXPERT_CAPACITY as usize {
+            return Err(QwenExpertCacheError::TooManyFills(loads.len()));
+        }
+        let mut source_records = [0_u32; QWEN_EXPERT_CAPACITY as usize];
+        let mut destination_slots = [0_u32; QWEN_EXPERT_CAPACITY as usize];
+        for (fill, load) in loads.iter().enumerate() {
+            sidecar.expert_views(load.key.layer, load.key.expert)?;
+            let record = u32::from(load.key.layer)
+                .checked_mul(EXPERT_SIDECAR_EXPERTS_PER_LAYER)
+                .and_then(|base| base.checked_add(u32::from(load.key.expert)))
+                .ok_or(QwenExpertCacheError::IntegerOverflow)?;
+            source_records[fill] = record;
+            destination_slots[fill] = load.address.slot;
+        }
+        let views = self.views();
+        let args = QwenExpertSidecarFillArgs {
+            struct_size: u32::try_from(std::mem::size_of::<QwenExpertSidecarFillArgs>())
+                .expect("Qwen expert-sidecar fill ABI fits u32"),
+            abi_version: QWEN_EXPERT_SIDECAR_ABI_VERSION,
+            fills: loads.len() as u32,
+            destination_capacity: QWEN_EXPERT_CAPACITY,
+            sidecar_records: pointer_const(sidecar.device_records()),
+            sidecar_record_bytes: EXPERT_SIDECAR_RECORD_BYTES,
+            sidecar_record_count: EXPERT_SIDECAR_RECORDS,
+            destination_w13_weights: pointer_mut(views.w13_weights),
+            destination_w2_weights: pointer_mut(views.w2_weights),
+            destination_w13_scales: pointer_mut(views.w13_scales),
+            destination_w2_scales: pointer_mut(views.w2_scales),
+            destination_w13_input_global_scales: pointer_mut(views.w13_input_global_scales),
+            destination_w13_alpha: pointer_mut(views.w13_alpha),
+            destination_w2_input_global_scales: pointer_mut(views.w2_input_global_scales),
+            destination_w2_alpha: pointer_mut(views.w2_alpha),
+            source_records,
+            destination_slots,
+            cuda_stream: stream.raw(),
+        };
+        status_result(unsafe { flash_qwen_expert_sidecar_fill_launch(&args) })
+    }
 }
 
 impl QwenPreparedExpertCache {
@@ -687,14 +981,54 @@ impl QwenPreparedExpertCache {
         let slots = u64::from(capacity);
         Ok(Self {
             capacity,
-            w13_weights: slab(slots.checked_mul(QWEN_W13_WEIGHT_BYTES).ok_or(QwenExpertCacheError::IntegerOverflow)?, flags)?,
-            w2_weights: slab(slots.checked_mul(QWEN_W2_WEIGHT_BYTES).ok_or(QwenExpertCacheError::IntegerOverflow)?, flags)?,
-            w13_scales: slab(slots.checked_mul(QWEN_W13_SCALE_BYTES).ok_or(QwenExpertCacheError::IntegerOverflow)?, flags)?,
-            w2_scales: slab(slots.checked_mul(QWEN_W2_SCALE_BYTES).ok_or(QwenExpertCacheError::IntegerOverflow)?, flags)?,
-            w13_input_global_scales: slab(slots.checked_mul(4).ok_or(QwenExpertCacheError::IntegerOverflow)?, flags)?,
-            w13_alpha: slab(slots.checked_mul(4).ok_or(QwenExpertCacheError::IntegerOverflow)?, flags)?,
-            w2_input_global_scales: slab(slots.checked_mul(4).ok_or(QwenExpertCacheError::IntegerOverflow)?, flags)?,
-            w2_alpha: slab(slots.checked_mul(4).ok_or(QwenExpertCacheError::IntegerOverflow)?, flags)?,
+            w13_weights: slab(
+                slots
+                    .checked_mul(QWEN_W13_WEIGHT_BYTES)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+                flags,
+            )?,
+            w2_weights: slab(
+                slots
+                    .checked_mul(QWEN_W2_WEIGHT_BYTES)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+                flags,
+            )?,
+            w13_scales: slab(
+                slots
+                    .checked_mul(QWEN_W13_SCALE_BYTES)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+                flags,
+            )?,
+            w2_scales: slab(
+                slots
+                    .checked_mul(QWEN_W2_SCALE_BYTES)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+                flags,
+            )?,
+            w13_input_global_scales: slab(
+                slots
+                    .checked_mul(4)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+                flags,
+            )?,
+            w13_alpha: slab(
+                slots
+                    .checked_mul(4)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+                flags,
+            )?,
+            w2_input_global_scales: slab(
+                slots
+                    .checked_mul(4)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+                flags,
+            )?,
+            w2_alpha: slab(
+                slots
+                    .checked_mul(4)
+                    .ok_or(QwenExpertCacheError::IntegerOverflow)?,
+                flags,
+            )?,
             residents: BTreeMap::new(),
             slot_keys: vec![None; capacity as usize],
             last_used: vec![0; capacity as usize],
@@ -764,19 +1098,12 @@ impl QwenPreparedExpertCache {
             }
         }
         let keys = loads.iter().map(|load| load.key).collect::<Vec<_>>();
-        let source_slots = unsafe {
-            self.ensure_keys(loader, &keys, 0, self.capacity)?
-        };
+        let source_slots = unsafe { self.ensure_keys(loader, &keys, 0, self.capacity)? };
 
         let source = unsafe { self.host_payloads()? };
         let mut destination = unsafe { hot.storage_mut()? };
         for (source_slot, load) in source_slots.into_iter().zip(loads) {
-            copy_expert_slot(
-                &source,
-                source_slot,
-                &mut destination,
-                load.address.slot,
-            );
+            copy_expert_slot(&source, source_slot, &mut destination, load.address.slot);
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         Ok(())
@@ -813,9 +1140,7 @@ impl QwenPreparedExpertCache {
         }
         let first_slot = self.layer_first_slot(layer, slots_per_layer)?;
         let keys = loads.iter().map(|load| load.key).collect::<Vec<_>>();
-        let source_slots = unsafe {
-            self.ensure_keys(loader, &keys, first_slot, slots_per_layer)?
-        };
+        let source_slots = unsafe { self.ensure_keys(loader, &keys, first_slot, slots_per_layer)? };
         let source = unsafe { self.host_payloads()? };
         let mut destination = unsafe { hot.storage_mut()? };
         for (source_slot, load) in source_slots.into_iter().zip(loads) {
@@ -823,6 +1148,81 @@ impl QwenPreparedExpertCache {
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Resolve a layer's prepared experts exactly as the CPU promotion path
+    /// does, then copy the already-swizzled slots on the CUDA stream. This
+    /// avoids moving roughly 27 MiB per layer through coherent CPU aliases on
+    /// every decode token while retaining the compact ten-group GEMM shape.
+    ///
+    /// # Safety
+    ///
+    /// All earlier CUDA readers of the prepared and hot caches must have
+    /// completed before entry. The returned launch owns both caches until its
+    /// stream reaches the following grouped GEMM.
+    pub unsafe fn prepare_and_promote_layer_device(
+        &mut self,
+        loader: &mut QwenExpertFileLoader,
+        hot: &mut QwenExpertHotCache,
+        loads: &[ExpertLoad],
+        slots_per_layer: u32,
+        stream: &mut CudaStreamOwner,
+    ) -> Result<(), QwenExpertCacheError> {
+        if loads.is_empty() {
+            return Ok(());
+        }
+        if loads.len() > QWEN_EXPERT_CAPACITY as usize {
+            return Err(QwenExpertCacheError::TooManyFills(loads.len()));
+        }
+        let layer = loads[0].key.layer;
+        for load in loads {
+            if load.key.layer != layer {
+                return Err(QwenExpertCacheError::MixedLayerPromotion);
+            }
+            if load.address.slot >= QWEN_EXPERT_CAPACITY {
+                return Err(QwenExpertCacheError::InvalidSlot(load.address.slot));
+            }
+        }
+        let first_slot = self.layer_first_slot(layer, slots_per_layer)?;
+        let keys = loads.iter().map(|load| load.key).collect::<Vec<_>>();
+        let global_slots = unsafe { self.ensure_keys(loader, &keys, first_slot, slots_per_layer)? };
+        let source = self.layer_views(layer, slots_per_layer)?;
+        let destination = hot.views();
+        let mut source_slots = [0_u32; QWEN_EXPERT_CAPACITY as usize];
+        let mut destination_slots = [0_u32; QWEN_EXPERT_CAPACITY as usize];
+        for (fill, (global_slot, load)) in global_slots.iter().zip(loads).enumerate() {
+            source_slots[fill] = global_slot
+                .checked_sub(first_slot)
+                .ok_or(QwenExpertCacheError::IntegerOverflow)?;
+            destination_slots[fill] = load.address.slot;
+        }
+        let args = QwenExpertPromoteArgs {
+            struct_size: u32::try_from(std::mem::size_of::<QwenExpertPromoteArgs>())
+                .map_err(|_| QwenExpertCacheError::IntegerOverflow)?,
+            abi_version: QWEN_EXPERT_PACK_ABI_VERSION,
+            fills: u32::try_from(loads.len()).map_err(|_| QwenExpertCacheError::IntegerOverflow)?,
+            source_capacity: slots_per_layer,
+            source_w13_weights: pointer_const(source.w13_weights),
+            source_w2_weights: pointer_const(source.w2_weights),
+            source_w13_scales: pointer_const(source.w13_scales),
+            source_w2_scales: pointer_const(source.w2_scales),
+            source_w13_input_global_scales: pointer_const(source.w13_input_global_scales),
+            source_w13_alpha: pointer_const(source.w13_alpha),
+            source_w2_input_global_scales: pointer_const(source.w2_input_global_scales),
+            source_w2_alpha: pointer_const(source.w2_alpha),
+            destination_w13_weights: pointer_mut(destination.w13_weights),
+            destination_w2_weights: pointer_mut(destination.w2_weights),
+            destination_w13_scales: pointer_mut(destination.w13_scales),
+            destination_w2_scales: pointer_mut(destination.w2_scales),
+            destination_w13_input_global_scales: pointer_mut(destination.w13_input_global_scales),
+            destination_w13_alpha: pointer_mut(destination.w13_alpha),
+            destination_w2_input_global_scales: pointer_mut(destination.w2_input_global_scales),
+            destination_w2_alpha: pointer_mut(destination.w2_alpha),
+            source_slots,
+            destination_slots,
+            cuda_stream: stream.raw(),
+        };
+        status_result(unsafe { flash_qwen_expert_promote_launch(&args) })
     }
 
     /// Keep a private, fixed-size slot range for each transformer layer and
@@ -848,9 +1248,7 @@ impl QwenPreparedExpertCache {
             .copied()
             .map(|expert| crate::fabric::ExpertKey { layer, expert })
             .collect::<Vec<_>>();
-        let global_slots = unsafe {
-            self.ensure_keys(loader, &keys, first_slot, slots_per_layer)?
-        };
+        let global_slots = unsafe { self.ensure_keys(loader, &keys, first_slot, slots_per_layer)? };
         Ok(global_slots
             .into_iter()
             .map(|slot| slot - first_slot)
@@ -891,21 +1289,13 @@ impl QwenPreparedExpertCache {
                 first_slot,
                 4,
             )?,
-            w13_alpha: component_address(
-                self.w13_alpha.device_address(),
-                first_slot,
-                4,
-            )?,
+            w13_alpha: component_address(self.w13_alpha.device_address(), first_slot, 4)?,
             w2_input_global_scales: component_address(
                 self.w2_input_global_scales.device_address(),
                 first_slot,
                 4,
             )?,
-            w2_alpha: component_address(
-                self.w2_alpha.device_address(),
-                first_slot,
-                4,
-            )?,
+            w2_alpha: component_address(self.w2_alpha.device_address(), first_slot, 4)?,
         })
     }
 
@@ -999,8 +1389,7 @@ impl QwenPreparedExpertCache {
                 let slot = range
                     .clone()
                     .find(|slot| {
-                        self.slot_keys[*slot].is_none()
-                            && !reserved.contains(&(*slot as u32))
+                        self.slot_keys[*slot].is_none() && !reserved.contains(&(*slot as u32))
                     })
                     .map(|slot| slot as u32)
                     .or_else(|| {
@@ -1108,14 +1497,62 @@ fn copy_expert_slot(
     destination: &mut QwenExpertStorageMut<'_>,
     destination_slot: u32,
 ) {
-    copy_component(source.w13_weights, source_slot, destination.w13_weights, destination_slot, QWEN_W13_WEIGHT_BYTES as usize);
-    copy_component(source.w2_weights, source_slot, destination.w2_weights, destination_slot, QWEN_W2_WEIGHT_BYTES as usize);
-    copy_component(source.w13_scales, source_slot, destination.w13_scales, destination_slot, QWEN_W13_SCALE_BYTES as usize);
-    copy_component(source.w2_scales, source_slot, destination.w2_scales, destination_slot, QWEN_W2_SCALE_BYTES as usize);
-    copy_component(source.w13_input_global_scales, source_slot, destination.w13_input_global_scales, destination_slot, 4);
-    copy_component(source.w13_alpha, source_slot, destination.w13_alpha, destination_slot, 4);
-    copy_component(source.w2_input_global_scales, source_slot, destination.w2_input_global_scales, destination_slot, 4);
-    copy_component(source.w2_alpha, source_slot, destination.w2_alpha, destination_slot, 4);
+    copy_component(
+        source.w13_weights,
+        source_slot,
+        destination.w13_weights,
+        destination_slot,
+        QWEN_W13_WEIGHT_BYTES as usize,
+    );
+    copy_component(
+        source.w2_weights,
+        source_slot,
+        destination.w2_weights,
+        destination_slot,
+        QWEN_W2_WEIGHT_BYTES as usize,
+    );
+    copy_component(
+        source.w13_scales,
+        source_slot,
+        destination.w13_scales,
+        destination_slot,
+        QWEN_W13_SCALE_BYTES as usize,
+    );
+    copy_component(
+        source.w2_scales,
+        source_slot,
+        destination.w2_scales,
+        destination_slot,
+        QWEN_W2_SCALE_BYTES as usize,
+    );
+    copy_component(
+        source.w13_input_global_scales,
+        source_slot,
+        destination.w13_input_global_scales,
+        destination_slot,
+        4,
+    );
+    copy_component(
+        source.w13_alpha,
+        source_slot,
+        destination.w13_alpha,
+        destination_slot,
+        4,
+    );
+    copy_component(
+        source.w2_input_global_scales,
+        source_slot,
+        destination.w2_input_global_scales,
+        destination_slot,
+        4,
+    );
+    copy_component(
+        source.w2_alpha,
+        source_slot,
+        destination.w2_alpha,
+        destination_slot,
+        4,
+    );
 }
 
 fn copy_component(
@@ -1219,11 +1656,10 @@ fn interleave_128x4(input: &[u8], output: &mut [u8], rows: usize, columns: usize
                 for row_four in 0..4 {
                     let row = row_block * 128 + row_four * 32 + row_lane;
                     let source = row * columns + column_block * 4;
-                    let destination = (((row_block * column_blocks + column_block) * 32
-                        + row_lane)
-                        * 4
-                        + row_four)
-                        * 4;
+                    let destination =
+                        (((row_block * column_blocks + column_block) * 32 + row_lane) * 4
+                            + row_four)
+                            * 4;
                     output[destination..destination + 4]
                         .copy_from_slice(&input[source..source + 4]);
                 }
@@ -1266,16 +1702,28 @@ fn status_result(status: Status) -> Result<(), QwenExpertCacheError> {
 pub enum QwenExpertCacheError {
     Coherent(CoherentRegionError),
     Checkpoint(CheckpointError),
+    Sidecar(ExpertSidecarError),
     Io(std::io::Error),
     Weight(QwenWeightError),
     IntegerOverflow,
     TooManyFills(usize),
     InvalidPreparedCapacity(u32),
-    PreparedCapacity { requested: usize, capacity: u32 },
+    PreparedCapacity {
+        requested: usize,
+        capacity: u32,
+    },
     NoPreparedVictim,
     DuplicateExpert(crate::fabric::ExpertKey),
-    InvalidPreparedRange { first_slot: u32, slot_count: u32, capacity: u32 },
-    InvalidLayerCache { layer: u16, slots_per_layer: u32, capacity: u32 },
+    InvalidPreparedRange {
+        first_slot: u32,
+        slot_count: u32,
+        capacity: u32,
+    },
+    InvalidLayerCache {
+        layer: u16,
+        slots_per_layer: u32,
+        capacity: u32,
+    },
     ResidentOutsideRange {
         key: crate::fabric::ExpertKey,
         slot: u32,
@@ -1283,29 +1731,53 @@ pub enum QwenExpertCacheError {
         slot_count: u32,
     },
     InvalidSlot(u32),
+    InvalidSidecarMapping,
+    InvalidSidecarLayer(u16),
+    InvalidSidecarExpert {
+        layer: u16,
+        expert: u16,
+    },
+    EmptySidecarGather,
     MixedLayerPromotion,
     TensorGeometry {
         tensor: String,
         expected: String,
         actual: String,
     },
-    Native { code: i32, message: String },
+    Native {
+        code: i32,
+        message: String,
+    },
 }
 
 impl From<CoherentRegionError> for QwenExpertCacheError {
-    fn from(error: CoherentRegionError) -> Self { Self::Coherent(error) }
+    fn from(error: CoherentRegionError) -> Self {
+        Self::Coherent(error)
+    }
 }
 
 impl From<CheckpointError> for QwenExpertCacheError {
-    fn from(error: CheckpointError) -> Self { Self::Checkpoint(error) }
+    fn from(error: CheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
+impl From<ExpertSidecarError> for QwenExpertCacheError {
+    fn from(error: ExpertSidecarError) -> Self {
+        Self::Sidecar(error)
+    }
 }
 
 impl From<std::io::Error> for QwenExpertCacheError {
-    fn from(error: std::io::Error) -> Self { Self::Io(error) }
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 impl From<QwenWeightError> for QwenExpertCacheError {
-    fn from(error: QwenWeightError) -> Self { Self::Weight(error) }
+    fn from(error: QwenWeightError) -> Self {
+        Self::Weight(error)
+    }
 }
 
 impl Display for QwenExpertCacheError {
@@ -1313,20 +1785,92 @@ impl Display for QwenExpertCacheError {
         match self {
             Self::Coherent(error) => write!(formatter, "{error}"),
             Self::Checkpoint(error) => write!(formatter, "{error}"),
+            Self::Sidecar(error) => write!(formatter, "{error}"),
             Self::Io(error) => write!(formatter, "{error}"),
             Self::Weight(error) => write!(formatter, "{error}"),
             Self::IntegerOverflow => formatter.write_str("Qwen expert loader integer overflow"),
-            Self::TooManyFills(fills) => write!(formatter, "Qwen expert cache has {fills} fills, maximum is 16"),
-            Self::InvalidPreparedCapacity(capacity) => write!(formatter, "Qwen prepared expert cache capacity {capacity} is invalid"),
-            Self::PreparedCapacity { requested, capacity } => write!(formatter, "Qwen prepared expert cache request has {requested} experts, capacity is {capacity}"),
-            Self::NoPreparedVictim => formatter.write_str("Qwen prepared expert cache has no available victim slot"),
-            Self::DuplicateExpert(key) => write!(formatter, "Qwen prepared expert request duplicates layer {} expert {}", key.layer, key.expert),
-            Self::InvalidPreparedRange { first_slot, slot_count, capacity } => write!(formatter, "Qwen prepared expert slot range {first_slot}..{} exceeds capacity {capacity}", first_slot.saturating_add(*slot_count)),
-            Self::InvalidLayerCache { layer, slots_per_layer, capacity } => write!(formatter, "Qwen layer {layer} with {slots_per_layer} expert slots does not fit prepared capacity {capacity}"),
-            Self::ResidentOutsideRange { key, slot, first_slot, slot_count } => write!(formatter, "Qwen layer {} expert {} is resident in slot {slot}, outside requested range {first_slot}..{}", key.layer, key.expert, first_slot.saturating_add(*slot_count)),
-            Self::InvalidSlot(slot) => write!(formatter, "Qwen expert cache slot {slot} is out of range"),
-            Self::MixedLayerPromotion => formatter.write_str("Qwen hot promotion mixes experts from different layers"),
-            Self::TensorGeometry { tensor, expected, actual } => write!(formatter, "Qwen tensor {tensor} expected {expected}, got {actual}"),
+            Self::TooManyFills(fills) => write!(
+                formatter,
+                "Qwen expert cache has {fills} fills, maximum is 16"
+            ),
+            Self::InvalidPreparedCapacity(capacity) => write!(
+                formatter,
+                "Qwen prepared expert cache capacity {capacity} is invalid"
+            ),
+            Self::PreparedCapacity {
+                requested,
+                capacity,
+            } => write!(
+                formatter,
+                "Qwen prepared expert cache request has {requested} experts, capacity is {capacity}"
+            ),
+            Self::NoPreparedVictim => {
+                formatter.write_str("Qwen prepared expert cache has no available victim slot")
+            }
+            Self::DuplicateExpert(key) => write!(
+                formatter,
+                "Qwen prepared expert request duplicates layer {} expert {}",
+                key.layer, key.expert
+            ),
+            Self::InvalidPreparedRange {
+                first_slot,
+                slot_count,
+                capacity,
+            } => write!(
+                formatter,
+                "Qwen prepared expert slot range {first_slot}..{} exceeds capacity {capacity}",
+                first_slot.saturating_add(*slot_count)
+            ),
+            Self::InvalidLayerCache {
+                layer,
+                slots_per_layer,
+                capacity,
+            } => write!(
+                formatter,
+                "Qwen layer {layer} with {slots_per_layer} expert slots does not fit prepared capacity {capacity}"
+            ),
+            Self::ResidentOutsideRange {
+                key,
+                slot,
+                first_slot,
+                slot_count,
+            } => write!(
+                formatter,
+                "Qwen layer {} expert {} is resident in slot {slot}, outside requested range {first_slot}..{}",
+                key.layer,
+                key.expert,
+                first_slot.saturating_add(*slot_count)
+            ),
+            Self::InvalidSlot(slot) => {
+                write!(formatter, "Qwen expert cache slot {slot} is out of range")
+            }
+            Self::InvalidSidecarMapping => {
+                formatter.write_str("Qwen resident expert sidecar mapping is invalid")
+            }
+            Self::InvalidSidecarLayer(layer) => {
+                write!(
+                    formatter,
+                    "Qwen resident expert sidecar layer {layer} is out of range"
+                )
+            }
+            Self::InvalidSidecarExpert { layer, expert } => write!(
+                formatter,
+                "Qwen resident expert sidecar expert {layer}:{expert} is out of range"
+            ),
+            Self::EmptySidecarGather => {
+                formatter.write_str("Qwen resident expert scalar gather is empty")
+            }
+            Self::MixedLayerPromotion => {
+                formatter.write_str("Qwen hot promotion mixes experts from different layers")
+            }
+            Self::TensorGeometry {
+                tensor,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "Qwen tensor {tensor} expected {expected}, got {actual}"
+            ),
             Self::Native { code, message } => write!(formatter, "{message} (native status {code})"),
         }
     }
@@ -1351,15 +1895,16 @@ mod tests {
             for (index, value) in input.iter().copied().enumerate() {
                 let row = index / columns;
                 let column = index % columns;
-                let destination = (((row / 128 * column_blocks + column / 4) * 32
-                    + row % 32)
-                    * 4
+                let destination = (((row / 128 * column_blocks + column / 4) * 32 + row % 32) * 4
                     + row % 128 / 32)
                     * 4
                     + column % 4;
                 expected[destination] = value;
             }
-            assert_eq!(actual, expected, "scale interleave differs for {rows}x{columns}");
+            assert_eq!(
+                actual, expected,
+                "scale interleave differs for {rows}x{columns}"
+            );
         }
     }
 }

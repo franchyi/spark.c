@@ -1,11 +1,10 @@
 /*
- * Serving-time adapter for FlashInfer's Apache-2.0 CuTe-DSL BF16 -> NVFP4
- * quantizer. CuTe/Python produces one pinned SM121 K=2560 object; serving
- * calls its exported TVM-FFI symbol directly.
+ * CUDA serving-time adapter for FlashInfer's Apache-2.0 CuTe-DSL fused
+ * BF16 SiLU(gate) * up -> NVFP4 quantizer. CuTe/Python is used only to
+ * produce the pinned SM121 object; this adapter uses its exported C ABI.
  */
 
-#include "internal/nvfp4_quantize_backend.h"
-
+#include "internal/nvfp4_silu_backend.h"
 #include <cuda_runtime_api.h>
 #include <tvm/ffi/c_api.h>
 #include <tvm/ffi/extra/c_env_api.h>
@@ -15,18 +14,18 @@
 #include <string>
 
 extern "C" int
-__tvm_ffi_nvfp4_quantize_swizzled_bfloat16_k2560_sf0_pdl0(
+__tvm_ffi_nvfp4_quantize_swizzled_bfloat16_k640_sf0_pdl0_silu(
     void* handle, const TVMFFIAny* args, int32_t num_args,
     TVMFFIAny* result);
 
 namespace {
 
-constexpr int64_t kHiddenSize = 2560;
+constexpr int64_t kHiddenSize = 640;
+constexpr int64_t kInputColumns = 2 * kHiddenSize;
 constexpr int64_t kPackedColumns = kHiddenSize / 2;
 constexpr int64_t kScaleColumns = kHiddenSize / 16;
 constexpr int64_t kScaleTileRows = 128;
-// FlashInfer uses 480 threads for K=2560: 160 scale groups per row.
-constexpr int64_t kRowsPerBlock = 3;
+constexpr int64_t kRowsPerBlock = 12;
 constexpr int kBlocksPerSm = 4;
 thread_local std::string g_error;
 
@@ -51,6 +50,7 @@ DLTensor Tensor(void* data, DLDevice device, int32_t dimensions,
   tensor.dtype = dtype;
   tensor.shape = shape;
   tensor.strides = strides;
+  tensor.byte_offset = 0;
   return tensor;
 }
 
@@ -98,8 +98,8 @@ FlashStatus LaunchOne(const uint8_t* input, uint8_t* packed_output,
   const int64_t num_blocks = std::min<int64_t>(
       (padded_rows + kRowsPerBlock - 1) / kRowsPerBlock,
       static_cast<int64_t>(multiprocessors) * kBlocksPerSm);
-  int64_t input_shape[2] = {rows, kHiddenSize};
-  int64_t input_strides[2] = {kHiddenSize, 1};
+  int64_t input_shape[2] = {rows, kInputColumns};
+  int64_t input_strides[2] = {kInputColumns, 1};
   int64_t output_shape[2] = {rows, kPackedColumns};
   int64_t output_strides[2] = {kPackedColumns, 1};
   int64_t scale_shape[1] = {padded_rows * kScaleColumns};
@@ -132,56 +132,92 @@ FlashStatus LaunchOne(const uint8_t* input, uint8_t* packed_output,
   TVMFFIAny result = {};
   result.type_index = kTVMFFINone;
   const int status =
-      __tvm_ffi_nvfp4_quantize_swizzled_bfloat16_k2560_sf0_pdl0(
+      __tvm_ffi_nvfp4_quantize_swizzled_bfloat16_k640_sf0_pdl0_silu(
           nullptr, call_args, 7, &result);
   if (status != 0) {
     return {FLASH_STATUS_INTERNAL,
-            "FlashInfer CuTe K=2560 NVFP4 quantizer call failed"};
+            "FlashInfer CuTe fused SiLU NVFP4 call failed"};
   }
   return Ok();
 }
 
 }  // namespace
 
-FlashStatus flash_flashinfer_cute_segmented_nvfp4_quantize_launch(
-    const FlashSegmentedNvfp4QuantizeArgs* args) {
+FlashStatus flash_flashinfer_cute_silu_nvfp4_launch(
+    const FlashSiluNvfp4Args* args) {
   if (args->plan.hidden_size != kHiddenSize) {
-    return Invalid("linked FlashInfer CuTe quantizer is specialized for K=2560");
+    return Invalid("linked FlashInfer CuTe artifact is specialized for K=640");
   }
 
   int device_id = 0;
   cudaError_t error = cudaGetDevice(&device_id);
   if (error != cudaSuccess) {
-    return Internal("cannot resolve NVFP4 quantizer CUDA device: ",
+    return Internal("cannot resolve fused NVFP4 CUDA device: ",
                     cudaGetErrorString(error));
   }
   int multiprocessors = 0;
   error = cudaDeviceGetAttribute(&multiprocessors,
                                  cudaDevAttrMultiProcessorCount, device_id);
   if (error != cudaSuccess) {
-    return Internal("cannot resolve NVFP4 quantizer SM count: ",
+    return Internal("cannot resolve fused NVFP4 SM count: ",
                     cudaGetErrorString(error));
   }
   StreamScope stream_scope(device_id, args->cuda_stream);
   if (stream_scope.status() != 0) {
     return {FLASH_STATUS_INTERNAL,
-            "cannot set the TVM-FFI CUDA stream for the CuTe quantizer"};
+            "cannot set the TVM-FFI CUDA stream for the CuTe artifact"};
   }
 
-  cudaStream_t stream = static_cast<cudaStream_t>(args->cuda_stream);
-  error = cudaMemsetAsync(
-      args->packed_output, 0,
-      args->plan.total_rows * args->plan.hidden_size / 2, stream);
+  const auto* input = static_cast<const uint8_t*>(args->input);
+  auto* packed_output = static_cast<uint8_t*>(args->packed_output);
+  auto* output_scales = static_cast<uint8_t*>(args->output_scales);
+  for (uint32_t expert = 0; expert < args->plan.num_experts; ++expert) {
+    const int32_t rows = args->active_rows[expert];
+    if (rows < 0 || rows > static_cast<int32_t>(args->plan.rows_per_expert)) {
+      return Invalid("active expert rows exceed the fixed expert capacity");
+    }
+    if (rows == 0) continue;
+
+    FlashStatus status = LaunchOne(
+        input + expert * args->input_expert_stride_bytes,
+        packed_output + expert * args->output_expert_stride_bytes,
+        output_scales + expert * args->scale_expert_stride_bytes,
+        args->input_global_scales + expert, rows, device_id, multiprocessors);
+    if (status.code != FLASH_STATUS_OK) return status;
+  }
+
+  error = cudaGetLastError();
   if (error != cudaSuccess) {
-    return Internal("cannot clear segmented NVFP4 values: ",
+    return Internal("FlashInfer CuTe fused SiLU NVFP4 launch failed: ",
                     cudaGetErrorString(error));
   }
-  error = cudaMemsetAsync(
-      args->output_scales, 0,
-      args->plan.input_scale_rows * args->plan.hidden_size / 16, stream);
+  return Ok();
+}
+
+FlashStatus flash_flashinfer_cute_segmented_silu_nvfp4_launch(
+    const FlashSegmentedSiluNvfp4Args* args) {
+  if (args->plan.hidden_size != kHiddenSize) {
+    return Invalid("linked FlashInfer CuTe artifact is specialized for K=640");
+  }
+
+  int device_id = 0;
+  cudaError_t error = cudaGetDevice(&device_id);
   if (error != cudaSuccess) {
-    return Internal("cannot clear segmented NVFP4 scales: ",
+    return Internal("cannot resolve segmented NVFP4 CUDA device: ",
                     cudaGetErrorString(error));
+  }
+  int multiprocessors = 0;
+  error = cudaDeviceGetAttribute(&multiprocessors,
+                                 cudaDevAttrMultiProcessorCount, device_id);
+  if (error != cudaSuccess) {
+    return Internal("cannot resolve segmented NVFP4 SM count: ",
+                    cudaGetErrorString(error));
+  }
+  cudaStream_t stream = static_cast<cudaStream_t>(args->cuda_stream);
+  StreamScope stream_scope(device_id, args->cuda_stream);
+  if (stream_scope.status() != 0) {
+    return {FLASH_STATUS_INTERNAL,
+            "cannot set the TVM-FFI CUDA stream for the CuTe artifact"};
   }
 
   const auto* input = static_cast<const uint8_t*>(args->input);
@@ -203,7 +239,7 @@ FlashStatus flash_flashinfer_cute_segmented_nvfp4_quantize_launch(
 
   error = cudaGetLastError();
   if (error != cudaSuccess) {
-    return Internal("FlashInfer CuTe segmented NVFP4 quantizer failed: ",
+    return Internal("FlashInfer CuTe segmented SiLU NVFP4 launch failed: ",
                     cudaGetErrorString(error));
   }
   return Ok();

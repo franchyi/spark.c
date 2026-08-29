@@ -221,6 +221,24 @@ typedef struct FlashGroupedNvfp4Args {
   void* cuda_stream;
 } FlashGroupedNvfp4Args;
 
+// Sparse logical-expert view over an immutable, strided expert store. The
+// nested grouped arguments retain compact routed activations, m_indptr, output,
+// workspaces, and alpha[num_groups]. `logical_group_ids` is the CUDA-visible
+// compact-group -> source-group map consumed by the FlashInfer argument
+// preparer. With reserved=0 its host mirror is validation-only and must contain
+// identical INT32 values for the duration of launch submission. With
+// reserved=1, device IDs are produced dynamically by an earlier same-stream
+// kernel and the host array is only a valid unique shape/range witness.
+typedef struct FlashIndexedGroupedNvfp4Args {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  FlashGroupedNvfp4Args grouped;
+  const int32_t* logical_group_ids;
+  const int32_t* logical_group_ids_host;
+  uint32_t source_group_count;
+  uint32_t reserved;  // 0=mirrored IDs, 1=device-selected IDs
+} FlashIndexedGroupedNvfp4Args;
+
 // Expert-major fused activation and requantization between the two MoE GEMMs.
 // Input is BF16 [E,M,2K] in [gate,up] order. Output is packed E2M1
 // [E,M,K/2], plus one CUTLASS 128x4 scale tile per expert. `active_rows`
@@ -877,6 +895,10 @@ FlashStatus flash_grouped_nvfp4_query(
 FlashStatus flash_grouped_nvfp4_launch(
     const FlashDeviceCaps* caps,
     const FlashGroupedNvfp4Args* args);
+
+FlashStatus flash_indexed_grouped_nvfp4_launch(
+    const FlashDeviceCaps* caps,
+    const FlashIndexedGroupedNvfp4Args* args);
 
 FlashStatus flash_silu_nvfp4_validate(
     const FlashSiluNvfp4Plan* plan);

@@ -31,6 +31,18 @@ typedef struct FlashQwenLmHeadArgs {
   void* cuda_stream;
 } FlashQwenLmHeadArgs;
 
+// Device-side greedy selection keeps the full vocabulary logits resident on
+// the GPU.  Only the four-byte winning token crosses the coherent CPU alias.
+typedef struct FlashQwenArgmaxArgs {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t elements;
+  uint32_t reserved;
+  const float* values;
+  uint32_t* output_index;
+  void* cuda_stream;
+} FlashQwenArgmaxArgs;
+
 FlashStatus flash_qwen_repeat_embedding_launch(
     const FlashQwenDecodeGlueArgs* args);
 FlashStatus flash_qwen_add_hyper_launch(
@@ -39,6 +51,8 @@ FlashStatus flash_qwen_qsa_single_value_launch(
     const FlashQwenDecodeGlueArgs* args);
 FlashStatus flash_qwen_lm_head_launch(
     const FlashQwenLmHeadArgs* args);
+FlashStatus flash_qwen_argmax_launch(
+    const FlashQwenArgmaxArgs* args);
 
 #ifdef __cplusplus
 }  // extern "C"

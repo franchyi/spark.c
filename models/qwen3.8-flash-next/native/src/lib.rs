@@ -10,11 +10,12 @@ pub mod ffi;
 pub mod kernel;
 #[path = "../../../../common/openai.rs"]
 pub mod openai_server;
+#[cfg(feature = "native-fabric")]
+pub mod qwen_expert_cache;
+pub mod qwen_expert_sidecar;
 pub mod qwen_ple;
 #[cfg(feature = "native-fabric")]
 pub mod qwen_weights;
-#[cfg(feature = "native-fabric")]
-pub mod qwen_expert_cache;
 pub mod routing;
 pub mod storage;
 #[path = "../../../../common/qwen_tokenizer.rs"]

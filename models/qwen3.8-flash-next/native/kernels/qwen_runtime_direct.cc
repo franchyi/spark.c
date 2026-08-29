@@ -23,6 +23,9 @@ FORWARD_TWO(flash_qwen_runtime_gdn_finish,
             flash_gdn_block_finish_launch, FlashGdnBlockArgs)
 FORWARD_TWO(flash_qwen_runtime_grouped_nvfp4,
             flash_grouped_nvfp4_launch, FlashGroupedNvfp4Args)
+FORWARD_TWO(flash_qwen_runtime_indexed_grouped_nvfp4,
+            flash_indexed_grouped_nvfp4_launch,
+            FlashIndexedGroupedNvfp4Args)
 FORWARD_TWO(flash_qwen_runtime_segmented_quantize,
             flash_segmented_nvfp4_quantize_launch,
             FlashSegmentedNvfp4QuantizeArgs)

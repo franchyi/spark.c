@@ -13,6 +13,9 @@
 #ifdef FLASH_WITH_FLASHINFER_GROUPED_NVFP4
 #include "internal/nvfp4_grouped_backend.h"
 #endif
+#ifdef FLASH_WITH_FLASHINFER_INDEXED_GROUPED_NVFP4
+#include "internal/nvfp4_grouped_backend.h"
+#endif
 #ifdef FLASH_WITH_FLASHINFER_CUTE_SILU_NVFP4
 #include "internal/nvfp4_silu_backend.h"
 #endif
@@ -86,6 +89,10 @@ bool IsAligned(uint64_t value, uint64_t alignment) {
 
 bool CanMultiply(uint64_t left, uint64_t right) {
   return left == 0 || right <= std::numeric_limits<uint64_t>::max() / left;
+}
+
+bool CanAdd(uint64_t left, uint64_t right) {
+  return right <= std::numeric_limits<uint64_t>::max() - left;
 }
 
 FlashStatus ValidateHeader(uint32_t struct_size, uint32_t expected_size,
@@ -444,6 +451,105 @@ extern "C" FlashStatus flash_grouped_nvfp4_launch(
 #else
   return Unavailable(
       "grouped NVFP4 contract is valid but no CUDA backend is linked");
+#endif
+}
+
+extern "C" FlashStatus flash_indexed_grouped_nvfp4_launch(
+    const FlashDeviceCaps* caps,
+    const FlashIndexedGroupedNvfp4Args* args) {
+  FlashStatus caps_status = ValidateCaps(caps);
+  if (caps_status.code != FLASH_STATUS_OK) return caps_status;
+  if (args == nullptr) {
+    return Invalid("indexed grouped NVFP4 arguments are required");
+  }
+  FlashStatus args_header =
+      ValidateHeader(args->struct_size, sizeof(*args), args->abi_version);
+  if (args_header.code != FLASH_STATUS_OK) return args_header;
+  const FlashGroupedNvfp4Args* grouped = &args->grouped;
+  FlashStatus grouped_header = ValidateHeader(
+      grouped->struct_size, sizeof(*grouped), grouped->abi_version);
+  if (grouped_header.code != FLASH_STATUS_OK) return grouped_header;
+  FlashStatus plan_status = flash_grouped_nvfp4_validate(&grouped->plan);
+  if (plan_status.code != FLASH_STATUS_OK) return plan_status;
+  if (grouped->input.packed_data == nullptr ||
+      grouped->input.block_scales == nullptr ||
+      grouped->weights.packed_data == nullptr ||
+      grouped->weights.block_scales == nullptr ||
+      grouped->m_indptr == nullptr || grouped->alpha_device == nullptr ||
+      grouped->output == nullptr || args->logical_group_ids == nullptr ||
+      args->logical_group_ids_host == nullptr) {
+    return Invalid("indexed grouped NVFP4 launch pointers cannot be null");
+  }
+  if (reinterpret_cast<uintptr_t>(args->logical_group_ids) %
+              alignof(int32_t) != 0 ||
+      reinterpret_cast<uintptr_t>(args->logical_group_ids_host) %
+              alignof(int32_t) != 0 ||
+      reinterpret_cast<uintptr_t>(grouped->weights.packed_data) % 16 != 0 ||
+      reinterpret_cast<uintptr_t>(grouped->weights.block_scales) % 16 != 0) {
+    return Invalid("indexed grouped NVFP4 pointers violate ABI alignment");
+  }
+  if (args->source_group_count == 0 || args->source_group_count > 512 ||
+      grouped->plan.num_groups > args->source_group_count) {
+    return Invalid("indexed grouped NVFP4 source group count is invalid");
+  }
+  if (args->reserved > 1) {
+    return Invalid("indexed grouped NVFP4 ID selection mode is invalid");
+  }
+  if (grouped->input.packed_row_stride_bytes != grouped->plan.k / 2 ||
+      grouped->input.scale_row_stride_bytes !=
+          grouped->plan.k / grouped->plan.group_size ||
+      grouped->output_row_stride_bytes != grouped->plan.n * 2) {
+    return Invalid(
+        "indexed grouped NVFP4 activation/output strides must be contiguous");
+  }
+  const uint64_t packed_group_bytes =
+      grouped->plan.n * grouped->plan.k / 2;
+  const uint64_t scale_group_bytes =
+      grouped->plan.n * grouped->plan.k / grouped->plan.group_size;
+  const uint64_t packed_stride =
+      grouped->weights.packed_group_stride_bytes;
+  const uint64_t scale_stride =
+      grouped->weights.scale_group_stride_bytes;
+  if (packed_stride < packed_group_bytes ||
+      scale_stride < scale_group_bytes || packed_stride % 16 != 0 ||
+      scale_stride % 16 != 0) {
+    return Invalid(
+        "indexed grouped NVFP4 weight strides are too small or misaligned");
+  }
+  const uint64_t last_source = args->source_group_count - 1;
+  if (!CanMultiply(last_source, packed_stride) ||
+      !CanMultiply(last_source, scale_stride) ||
+      !CanAdd(last_source * packed_stride, packed_group_bytes) ||
+      !CanAdd(last_source * scale_stride, scale_group_bytes)) {
+    return Invalid("indexed grouped NVFP4 source extent overflows");
+  }
+  for (uint32_t group = 0; group < grouped->plan.num_groups; ++group) {
+    const int32_t logical = args->logical_group_ids_host[group];
+    if (logical < 0 ||
+        static_cast<uint32_t>(logical) >= args->source_group_count) {
+      return Invalid("indexed grouped NVFP4 logical group id is out of range");
+    }
+    for (uint32_t prior = 0; prior < group; ++prior) {
+      if (args->logical_group_ids_host[prior] == logical) {
+        return Invalid("indexed grouped NVFP4 logical group ids must be unique");
+      }
+    }
+  }
+#ifdef FLASH_WITH_FLASHINFER_INDEXED_GROUPED_NVFP4
+  FlashKernelInfo info = {sizeof(FlashKernelInfo),
+                          FLASH_KERNEL_ABI_VERSION,
+                          0,
+                          0,
+                          0,
+                          nullptr,
+                          nullptr};
+  FlashStatus query_status =
+      flash_grouped_nvfp4_query(caps, &grouped->plan, &info);
+  if (query_status.code != FLASH_STATUS_OK) return query_status;
+  return flash_flashinfer_indexed_grouped_nvfp4_launch(args);
+#else
+  return Unavailable(
+      "indexed grouped NVFP4 contract is valid but no CUDA backend is linked");
 #endif
 }
 

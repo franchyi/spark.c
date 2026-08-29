@@ -7,59 +7,56 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_void};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::checkpoint::{FlashNextCheckpoint, load_flash_next_checkpoint};
 use crate::coherent::CoherentRegionOwner;
 use crate::cuda::{CudaBlasOwner, CudaStreamOwner};
+use crate::fabric::{ExpertKey, ExpertLoad, ExpertSlotAddress};
 use crate::ffi::{
     DeviceCaps, GdnBlockArgs, GdnBlockPlan, GdnDecodeArgs, GdnDecodePlan, GroupedNvfp4Args,
-    GroupedNvfp4Plan, GroupedNvfp4WeightView, MhcArgs, MhcPlan, MoeGateArgs, MoeGatePlan,
-    MoeJoinArgs, MoeJoinPlan, MoeRouteArgs, MoeRoutePlan, Nvfp4MatrixView, PleGatherArgs,
-    PleGatherPlan, PleRowFragment, QsaDecodeArgs, QsaDecodePlan, QsaExpandArgs,
-    QsaExpandPlan, QsaIndexPrepArgs, QsaIndexPrepPlan, QsaKvPackArgs, QsaKvPackPlan,
-    QsaScoreArgs, QsaScorePlan, QsaTopkArgs, QsaTopkPlan,
-    QWEN_DECODE_GLUE_ABI_VERSION, QWEN_GDN_AUX_ABI_VERSION,
-    QWEN_PLE_BLOCK_ABI_VERSION, QWEN_QSA_BLOCK_ABI_VERSION, QwenBf16ToF32Args,
-    QwenDecodeGlueArgs, QwenLmHeadArgs, QwenPleBlockArgs,
-    QwenQsaFinishArgs, QwenQsaProjectArgs, SegmentedNvfp4QuantizeArgs,
-    SegmentedNvfp4QuantizePlan, SegmentedSiluNvfp4Args, SegmentedSiluNvfp4Plan,
-    SharedExpertArgs, SharedExpertPlan, Status,
+    GroupedNvfp4Plan, GroupedNvfp4WeightView, IndexedGroupedNvfp4Args, MhcArgs, MhcPlan,
+    MoeGateArgs, MoeGatePlan, MoeJoinArgs, MoeJoinPlan, MoeRouteArgs, MoeRoutePlan,
+    Nvfp4MatrixView, PleGatherArgs, PleGatherPlan, PleRowFragment, QWEN_DECODE_GLUE_ABI_VERSION,
+    QWEN_GDN_AUX_ABI_VERSION, QWEN_PLE_BLOCK_ABI_VERSION, QWEN_QSA_BLOCK_ABI_VERSION,
+    QsaDecodeArgs, QsaDecodePlan, QsaExpandArgs, QsaExpandPlan, QsaIndexPrepArgs, QsaIndexPrepPlan,
+    QsaKvPackArgs, QsaKvPackPlan, QsaScoreArgs, QsaScorePlan, QsaTopkArgs, QsaTopkPlan,
+    QwenArgmaxArgs, QwenBf16ToF32Args, QwenDecodeGlueArgs, QwenLmHeadArgs, QwenPleBlockArgs,
+    QwenQsaFinishArgs, QwenQsaProjectArgs, SegmentedNvfp4QuantizeArgs, SegmentedNvfp4QuantizePlan,
+    SegmentedSiluNvfp4Args, SegmentedSiluNvfp4Plan, SharedExpertArgs, SharedExpertPlan, Status,
+    flash_qsa_decode_launch, flash_qsa_expand_launch, flash_qsa_index_prep_launch,
+    flash_qsa_kv_pack_launch, flash_qsa_score_launch, flash_qsa_topk_launch,
+    flash_qwen_add_hyper_launch, flash_qwen_argmax_launch, flash_qwen_lm_head_launch,
+    flash_qwen_ple_block_launch, flash_qwen_qsa_finish_launch, flash_qwen_qsa_project_launch,
+    flash_qwen_repeat_embedding_launch,
+    flash_qwen_runtime_bf16_to_f32 as flash_qwen_bf16_to_f32_launch,
+    flash_qwen_runtime_gdn_decode as flash_gdn_decode_launch,
     flash_qwen_runtime_gdn_finish as flash_gdn_block_finish_launch,
     flash_qwen_runtime_gdn_prepare as flash_gdn_block_prepare_launch,
-    flash_qwen_runtime_gdn_decode as flash_gdn_decode_launch,
     flash_qwen_runtime_grouped_nvfp4 as flash_grouped_nvfp4_launch,
+    flash_qwen_runtime_indexed_grouped_nvfp4 as flash_indexed_grouped_nvfp4_launch,
     flash_qwen_runtime_mhc_combine as flash_mhc_combine_launch,
     flash_qwen_runtime_mhc_mix as flash_mhc_mix_launch,
-    flash_qwen_runtime_moe_gate as flash_moe_gate_launch,
-    flash_qwen_runtime_moe_join as flash_moe_join_launch,
     flash_qwen_runtime_moe_dispatch as flash_moe_route_dispatch,
     flash_qwen_runtime_moe_finalize as flash_moe_route_finalize,
+    flash_qwen_runtime_moe_gate as flash_moe_gate_launch,
+    flash_qwen_runtime_moe_join as flash_moe_join_launch,
     flash_qwen_runtime_ple_gather as flash_ple_gather_launch,
-    flash_qwen_add_hyper_launch,
-    flash_qwen_runtime_bf16_to_f32 as flash_qwen_bf16_to_f32_launch,
-    flash_qwen_lm_head_launch,
-    flash_qwen_ple_block_launch, flash_qwen_qsa_finish_launch,
-    flash_qwen_qsa_project_launch,
-    flash_qwen_repeat_embedding_launch,
     flash_qwen_runtime_segmented_quantize as flash_segmented_nvfp4_quantize_launch,
     flash_qwen_runtime_segmented_silu as flash_segmented_silu_nvfp4_launch,
     flash_qwen_runtime_shared_expert as flash_shared_expert_launch,
-    flash_qsa_decode_launch, flash_qsa_expand_launch,
-    flash_qsa_index_prep_launch, flash_qsa_kv_pack_launch,
-    flash_qsa_score_launch, flash_qsa_topk_launch,
 };
 use crate::kernel::{
-    GroupedNvfp4Spec, KERNEL_ABI_VERSION, SegmentedNvfp4QuantizeSpec,
-    SegmentedSiluNvfp4Spec,
+    GroupedNvfp4Spec, IndexedGroupedNvfp4Spec, KERNEL_ABI_VERSION,
+    SegmentedNvfp4QuantizeSpec, SegmentedSiluNvfp4Spec,
 };
-use crate::fabric::{ExpertKey, ExpertLoad, ExpertSlotAddress};
 use crate::qwen_expert_cache::{
-    QwenExpertFileLoader, QwenExpertHotCache, QwenPreparedExpertCache,
-    QwenPreparedExpertStats,
+    QwenExpertFileLoader, QwenExpertHotCache, QwenPreparedExpertCache, QwenPreparedExpertStats,
+    QwenResidentExpertScalarOutputs, QwenResidentExpertSidecar,
 };
-use crate::qwen_ple::decode_row_ids;
+use crate::qwen_ple::{QWEN_PLE_HEADS, decode_row_ids};
 use crate::qwen_weights::{FlashNextWeightMaps, QwenTensorView};
 use crate::routing::RoutePlan;
 use crate::storage::{FixedPleCache, PleIndex};
@@ -87,6 +84,8 @@ const ROTARY_DIM: u32 = 64;
 const INTERMEDIATE: u64 = 640;
 const TOP_K: u32 = 10;
 const ACTIVE_EXPERTS: u32 = 10;
+const DECODE_COMPACT_IDS: [i32; TOP_K as usize] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+const DECODE_ACTIVE_ROWS: [i32; TOP_K as usize] = [1; TOP_K as usize];
 const PREFILL_CHUNK_TOKENS: u64 = 16;
 // Keep every donor group active. FlashInfer's SM120 grouped kernel can accept
 // empty groups in its metadata, but the current binary has shown a late,
@@ -101,8 +100,11 @@ const PREPARED_EXPERT_SLOTS: u32 = LAYERS * PREPARED_SLOTS_PER_LAYER;
 const WORKSPACE: u64 = 32 * 1024 * 1024;
 const QSA_WORKSPACE: u64 = 128 * 1024 * 1024;
 const VOCABULARY: u64 = 248_320;
-const MOE_PADDED_ROWS: u64 = ACTIVE_EXPERTS as u64 * 4;
-const MOE_SCALE_ROWS: u64 = LAYER_EXPERT_SLOTS as u64 * 128;
+const MAX_MOE_GROUPS: u64 = PREFILL_CHUNK_TOKENS * TOP_K as u64;
+const MOE_PADDED_ROWS: u64 = MAX_MOE_GROUPS * 4;
+// The indexed batch currently needs at most 160*128=20,480 scale rows.
+// Retain the requested 20,864-row arena ceiling for ABI growth headroom.
+const MOE_SCALE_ROWS: u64 = 20_864;
 const QSA_LAYERS: u64 = 12;
 const QSA_COMPRESS_RATIO: u64 = 4;
 const QSA_COMPRESSED_SLOTS: u64 = QWEN_MODEL_MAX_LENGTH as u64 / QSA_COMPRESS_RATIO;
@@ -125,8 +127,6 @@ struct QwenDecodeArena {
     hyper_mid: CoherentRegionOwner,
     attention: CoherentRegionOwner,
     moe_output: CoherentRegionOwner,
-    gdn_a_log: CoherentRegionOwner,
-    gdn_dt: CoherentRegionOwner,
     gdn_projected_qkv: CoherentRegionOwner,
     gdn_projected_z: CoherentRegionOwner,
     gdn_projected_b: CoherentRegionOwner,
@@ -171,6 +171,15 @@ struct QwenDecodeArena {
     route_ids: CoherentRegionOwner,
     route_map: CoherentRegionOwner,
     m_indptr: CoherentRegionOwner,
+    compact_expert_ids: CoherentRegionOwner,
+    compact_w13_input_global_scales: CoherentRegionOwner,
+    compact_w13_alpha: CoherentRegionOwner,
+    compact_w2_input_global_scales: CoherentRegionOwner,
+    compact_w2_alpha: CoherentRegionOwner,
+    // T=1 resident routing is rank-major and therefore constant. Once these
+    // host-authored maps are installed, every later layer can consume the
+    // router's device IDs directly without another CPU ownership fence.
+    decode_route_ready: bool,
     packed_input: CoherentRegionOwner,
     input_fp4: CoherentRegionOwner,
     input_scales: CoherentRegionOwner,
@@ -194,13 +203,13 @@ struct QwenDecodeArena {
     final_hidden: CoherentRegionOwner,
     final_combined: CoherentRegionOwner,
     logits: CoherentRegionOwner,
+    next_token: CoherentRegionOwner,
 }
 
 impl QwenDecodeArena {
     fn create() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut qsa_cos_sin = slab(
-            u64::try_from(QWEN_MODEL_MAX_LENGTH)? * u64::from(ROTARY_DIM) * 4,
-        )?;
+        let mut qsa_cos_sin =
+            slab(u64::try_from(QWEN_MODEL_MAX_LENGTH)? * u64::from(ROTARY_DIM) * 4)?;
         initialize_rope_cache(&mut qsa_cos_sin)?;
         let mut qsa_compressed_page_table = slab(QSA_COMPRESSED_PAGES * 4)?;
         write_identity_i32(&mut qsa_compressed_page_table, QSA_COMPRESSED_PAGES)?;
@@ -220,8 +229,6 @@ impl QwenDecodeArena {
             hyper_mid: slab(PREFILL_CHUNK_TOKENS * HYPER * 2)?,
             attention: slab(PREFILL_CHUNK_TOKENS * HIDDEN * 2)?,
             moe_output: slab(PREFILL_CHUNK_TOKENS * HIDDEN * 2)?,
-            gdn_a_log: slab(VALUE_HEADS * 4)?,
-            gdn_dt: slab(VALUE_HEADS * 4)?,
             gdn_projected_qkv: slab(PREFILL_CHUNK_TOKENS * GDN_CONV_WIDTH * 2)?,
             gdn_projected_z: slab(PREFILL_CHUNK_TOKENS * VALUE_WIDTH * 2)?,
             gdn_projected_b: slab(PREFILL_CHUNK_TOKENS * VALUE_HEADS * 2)?,
@@ -238,22 +245,25 @@ impl QwenDecodeArena {
             qsa_gate: slab(QUERY_WIDTH * 2)?,
             qsa_index_qk: slab(INDEX_WIDTH * 2)?,
             qsa_cos_sin,
-            qsa_positions: slab(8)?,
-            qsa_cache_locs: slab(8)?,
+            // CPU-owned QSA metadata is slotted across the whole AOT prefill
+            // bucket. The values stay immutable while all 12 QSA layers
+            // consume them, eliminating a host fence between prompt tokens.
+            qsa_positions: slab(PREFILL_CHUNK_TOKENS * 8)?,
+            qsa_cache_locs: slab(PREFILL_CHUNK_TOKENS * 8)?,
             qsa_axis_map: slab(u64::from(ROTARY_DIM / 2) * 4)?,
             qsa_index_query: slab(8 * INDEX_HEAD_DIM * 2)?,
             qsa_compressed_page_table,
-            qsa_compressed_lengths: slab(4)?,
+            qsa_compressed_lengths: slab(PREFILL_CHUNK_TOKENS * 4)?,
             qsa_logits: slab(QSA_COMPRESSED_SLOTS * 4)?,
-            qsa_row_start: slab(4)?,
+            qsa_row_start: slab(PREFILL_CHUNK_TOKENS * 4)?,
             qsa_block_indices: slab(QSA_BLOCK_TOPK * 4)?,
-            qsa_query_positions: slab(8)?,
-            qsa_sequence_lengths: slab(4)?,
+            qsa_query_positions: slab(PREFILL_CHUNK_TOKENS * 8)?,
+            qsa_sequence_lengths: slab(PREFILL_CHUNK_TOKENS * 4)?,
             qsa_logical_indices: slab(QSA_FINAL_TOPK * 4)?,
             qsa_request_to_token,
-            qsa_request_indices: slab(4)?,
-            qsa_group_locs: slab(QSA_COMPRESS_RATIO * 4)?,
-            qsa_write_locs: slab(4)?,
+            qsa_request_indices: slab(PREFILL_CHUNK_TOKENS * 4)?,
+            qsa_group_locs: slab(PREFILL_CHUNK_TOKENS * QSA_COMPRESS_RATIO * 4)?,
+            qsa_write_locs: slab(PREFILL_CHUNK_TOKENS * 4)?,
             qsa_packed_key: slab(QSA_PACKED_TOKENS * KV_WIDTH * 2)?,
             qsa_packed_value: slab(QSA_PACKED_TOKENS * KV_WIDTH * 2)?,
             qsa_valid_counts: slab(4)?,
@@ -264,8 +274,14 @@ impl QwenDecodeArena {
             router_logits: slab(PREFILL_CHUNK_TOKENS * 512 * 2)?,
             route_weights: slab(PREFILL_CHUNK_TOKENS * u64::from(TOP_K) * 4)?,
             route_ids: slab(PREFILL_CHUNK_TOKENS * u64::from(TOP_K) * 4)?,
-            route_map: slab(u64::from(TOP_K) * 4)?,
-            m_indptr: slab((u64::from(LAYER_EXPERT_SLOTS) + 1) * 4)?,
+            route_map: slab(MAX_MOE_GROUPS * 4)?,
+            m_indptr: slab((MAX_MOE_GROUPS + 1) * 4)?,
+            compact_expert_ids: slab(MAX_MOE_GROUPS * 4)?,
+            compact_w13_input_global_scales: slab(MAX_MOE_GROUPS * 4)?,
+            compact_w13_alpha: slab(MAX_MOE_GROUPS * 4)?,
+            compact_w2_input_global_scales: slab(MAX_MOE_GROUPS * 4)?,
+            compact_w2_alpha: slab(MAX_MOE_GROUPS * 4)?,
+            decode_route_ready: false,
             packed_input: slab(MOE_PADDED_ROWS * HIDDEN * 2)?,
             input_fp4: slab(MOE_PADDED_ROWS * HIDDEN / 2)?,
             input_scales: slab(MOE_SCALE_ROWS * HIDDEN / 16)?,
@@ -275,10 +291,18 @@ impl QwenDecodeArena {
             expert_output: slab(MOE_PADDED_ROWS * HIDDEN * 2)?,
             int_workspace: slab(WORKSPACE)?,
             float_workspace: slab(WORKSPACE)?,
-            shared_gate_up: slab(2 * INTERMEDIATE * 2)?,
-            shared_activated: slab(INTERMEDIATE * 2)?,
-            shared_output: slab(HIDDEN * 2)?,
-            ple_fragments: slab(u64::try_from(std::mem::size_of::<PleRowFragment>() * 16)?)?,
+            shared_gate_up: slab(PREFILL_CHUNK_TOKENS * 2 * INTERMEDIATE * 2)?,
+            shared_activated: slab(PREFILL_CHUNK_TOKENS * INTERMEDIATE * 2)?,
+            shared_output: slab(PREFILL_CHUNK_TOKENS * HIDDEN * 2)?,
+            // One immutable descriptor set per prompt token lets the CPU pin
+            // the whole PLE row union before any CUDA work is enqueued.  This
+            // avoids a host fence between tokens while preserving the one-copy
+            // coherent NVMe page cache.
+            ple_fragments: slab(u64::try_from(
+                std::mem::size_of::<PleRowFragment>()
+                    * QWEN_PLE_HEADS
+                    * PREFILL_CHUNK_TOKENS as usize,
+            )?)?,
             ple_embedding: slab(HIDDEN * 2)?,
             ple_key: slab(HYPER * 2)?,
             ple_value: slab(HIDDEN * 2)?,
@@ -289,6 +313,7 @@ impl QwenDecodeArena {
             final_hidden: slab(HIDDEN * 2)?,
             final_combined: slab(HYPER * 2)?,
             logits: slab(VOCABULARY * 4)?,
+            next_token: slab(4)?,
         })
     }
 }
@@ -310,9 +335,7 @@ impl QwenPleRuntime {
         checkpoint: &FlashNextCheckpoint,
         model_root: &Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let index = PleIndex::decode(&std::fs::read(
-            model_root.join(".spark.c/ple.ssple"),
-        )?)?;
+        let index = PleIndex::decode(&std::fs::read(model_root.join(".spark.c/ple.ssple"))?)?;
         let multipliers = read_checkpoint_i64(
             checkpoint,
             "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
@@ -360,9 +383,9 @@ struct QwenResidentWeights {
     bytes: u64,
 }
 
-/// Stable identities for the ten donor groups while one layer processes a
-/// short prefill bucket. Experts shared by adjacent tokens stay in place;
-/// only genuine misses are repacked into slots not used by the current top-k.
+/// Stable identities for the ten donor groups. Direct packing keeps one
+/// planner per layer across prompt buckets and decode steps; the prepared-cache
+/// fallback resets its planner for each layer invocation.
 struct QwenLayerExpertSlots {
     slot_experts: [Option<i32>; LAYER_EXPERT_SLOTS as usize],
     last_used: [u64; LAYER_EXPERT_SLOTS as usize],
@@ -435,7 +458,10 @@ impl QwenLayerExpertSlots {
                 evicts,
             });
         }
-        self.tick = self.tick.checked_add(1).ok_or("Qwen expert LRU tick overflow")?;
+        self.tick = self
+            .tick
+            .checked_add(1)
+            .ok_or("Qwen expert LRU tick overflow")?;
         let physical = logical
             .iter()
             .map(|expert| {
@@ -450,6 +476,55 @@ impl QwenLayerExpertSlots {
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         Ok(QwenLayerExpertPlan { loads, physical })
     }
+}
+
+/// Choose an execution order that minimizes replacements in the ten-slot hot
+/// bank.  Routed MoE rows are token-independent within a transformer layer,
+/// and every launch writes back to its original token row, so this reordering
+/// changes neither sequence state nor output order.  Exhausting all possible
+/// starts is cheap for the fixed T<=16 buckets and avoids a poor greedy seed.
+fn moe_token_order(logical: &[i32], num_tokens: u32) -> Vec<u32> {
+    let tokens = num_tokens as usize;
+    if tokens <= 1 {
+        return (0..num_tokens).collect();
+    }
+    let overlap = |left: usize, right: usize| {
+        let left_begin = left * TOP_K as usize;
+        let right_begin = right * TOP_K as usize;
+        logical[left_begin..left_begin + TOP_K as usize]
+            .iter()
+            .filter(|expert| logical[right_begin..right_begin + TOP_K as usize].contains(expert))
+            .count()
+    };
+
+    let mut best_order = Vec::new();
+    let mut best_loads = usize::MAX;
+    for start in 0..tokens {
+        let mut order = Vec::with_capacity(tokens);
+        let mut remaining = (0..tokens).collect::<BTreeSet<_>>();
+        remaining.remove(&start);
+        order.push(start);
+        let mut loads = TOP_K as usize;
+        while !remaining.is_empty() {
+            let current = *order.last().expect("MoE order has a current token");
+            let next = remaining
+                .iter()
+                .copied()
+                .max_by_key(|candidate| (overlap(current, *candidate), usize::MAX - *candidate))
+                .expect("MoE order has a remaining token");
+            loads += TOP_K as usize - overlap(current, next);
+            remaining.remove(&next);
+            order.push(next);
+        }
+        if loads < best_loads {
+            best_loads = loads;
+            best_order = order;
+        }
+    }
+    best_order
+        .into_iter()
+        .map(|token| u32::try_from(token).expect("T<=16 token index fits u32"))
+        .collect()
 }
 
 impl QwenResidentWeights {
@@ -481,7 +556,10 @@ impl QwenResidentWeights {
                 )?;
             }
             self.tensors.insert(name.to_owned(), output);
-            self.bytes = self.bytes.checked_add(bytes).ok_or("resident weight bytes overflow")?;
+            self.bytes = self
+                .bytes
+                .checked_add(bytes)
+                .ok_or("resident weight bytes overflow")?;
         }
         Ok(self
             .tensors
@@ -504,7 +582,11 @@ impl QwenResidentWeights {
         if !self.tensors.contains_key(key) {
             let first = checked_tensor(maps, first_name, "BF16", shape, tensor_bytes)?;
             let second = checked_tensor(maps, second_name, "BF16", shape, tensor_bytes)?;
-            let output = slab(tensor_bytes.checked_mul(2).ok_or("merged weight size overflow")?)?;
+            let output = slab(
+                tensor_bytes
+                    .checked_mul(2)
+                    .ok_or("merged weight size overflow")?,
+            )?;
             unsafe {
                 stream.memcpy_async(
                     output.device_address(),
@@ -529,6 +611,52 @@ impl QwenResidentWeights {
             .expect("merged resident tensor inserted")
             .device_address())
     }
+
+    /// Stage a checkpoint BF16 vector and convert it once for kernels whose
+    /// ABI consumes FP32 constants. GDN A_log and dt_bias are invariant across
+    /// the sequence; converting them in every 16-token prefill bucket adds two
+    /// tiny launches per GDN layer without changing the result.
+    fn bf16_vector_as_f32(
+        &mut self,
+        maps: &mut FlashNextWeightMaps,
+        stream: &mut CudaStreamOwner,
+        name: &str,
+        elements: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let key = format!("{name}.spark_f32");
+        if !self.tensors.contains_key(&key) {
+            let input = self.get(
+                maps,
+                stream,
+                name,
+                "BF16",
+                &[elements],
+                elements.checked_mul(2).ok_or("BF16 vector size overflow")?,
+            )?;
+            let output = slab(elements.checked_mul(4).ok_or("FP32 vector size overflow")?)?;
+            let args = QwenBf16ToF32Args {
+                struct_size: size::<QwenBf16ToF32Args>(),
+                abi_version: QWEN_GDN_AUX_ABI_VERSION,
+                input_bf16: ptr(input).cast::<u16>(),
+                output_f32: ptr_mut(output.device_address()).cast::<f32>(),
+                elements,
+                cuda_stream: stream.raw(),
+            };
+            native("Qwen resident BF16 conversion", unsafe {
+                flash_qwen_bf16_to_f32_launch(&args)
+            })?;
+            self.tensors.insert(key.clone(), output);
+            self.bytes = self
+                .bytes
+                .checked_add(elements * 4)
+                .ok_or("resident weight bytes overflow")?;
+        }
+        Ok(self
+            .tensors
+            .get(&key)
+            .expect("converted resident tensor inserted")
+            .device_address())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -538,6 +666,24 @@ pub struct QwenNativeStep {
     pub expert_hits: u64,
     pub expert_misses: u64,
     pub expert_evictions: u64,
+}
+
+/// Result of an intermediate prompt bucket. It deliberately has no token:
+/// only the final prompt bucket needs the expensive vocabulary projection.
+#[derive(Clone, Copy, Debug)]
+pub struct QwenPrefillStep {
+    pub elapsed_seconds: f64,
+    pub expert_hits: u64,
+    pub expert_misses: u64,
+    pub expert_evictions: u64,
+}
+
+struct QwenBatchStep {
+    token: Option<u32>,
+    elapsed_seconds: f64,
+    expert_hits: u64,
+    expert_misses: u64,
+    expert_evictions: u64,
 }
 
 /// One CUDA owner thread creates and exclusively uses this value. It remains
@@ -561,32 +707,124 @@ pub struct QwenNativeEngine {
     qsa_compressed_keys: CoherentRegionOwner,
     qsa_full_key_states: CoherentRegionOwner,
     qsa_full_value_states: CoherentRegionOwner,
-    hot_experts: QwenExpertHotCache,
-    prepared_experts: QwenPreparedExpertCache,
-    expert_loader: QwenExpertFileLoader,
+    resident_experts: Option<QwenResidentExpertSidecar>,
+    hot_experts: Vec<QwenExpertHotCache>,
+    expert_slots: Vec<QwenLayerExpertSlots>,
+    prepared_experts: Option<QwenPreparedExpertCache>,
+    expert_loader: Option<QwenExpertFileLoader>,
     expert_packs: u64,
     arena: QwenDecodeArena,
     token_history: Vec<u32>,
+    decode_fast_path: bool,
+    direct_expert_pack: bool,
 }
 
 impl QwenNativeEngine {
     pub fn create(model_root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let checkpoint = load_flash_next_checkpoint(model_root)?;
         let ple = QwenPleRuntime::create(&checkpoint, model_root)?;
-        let expert_loader = QwenExpertFileLoader::new(&checkpoint);
-        let weight_maps = FlashNextWeightMaps::new(&checkpoint, 0);
-        let mut hot_experts = QwenExpertHotCache::create(0)?;
-        let mut prepared_experts = QwenPreparedExpertCache::create(PREPARED_EXPERT_SLOTS, 0)?;
+        let resident_sidecar_path = std::env::var_os("FLASH_QWEN_RESIDENT_SIDECAR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        let resident_experts = if let Some(path) = resident_sidecar_path.as_deref() {
+            let started = Instant::now();
+            let sidecar = QwenResidentExpertSidecar::open(&checkpoint, path, 0, true)?;
+            eprintln!(
+                "Qwen resident expert sidecar: {:.3} GiB in {:.3} s ({})",
+                sidecar.header().records_bytes()? as f64 / 1024.0 / 1024.0 / 1024.0,
+                started.elapsed().as_secs_f64(),
+                path.display(),
+            );
+            Some(sidecar)
+        } else {
+            None
+        };
+        let resident_sidecar = resident_experts.is_some();
+        let mut expert_loader = (!resident_sidecar).then(|| QwenExpertFileLoader::new(&checkpoint));
+        let mut weight_maps = FlashNextWeightMaps::new(&checkpoint, 0);
+        let direct_expert_pack = matches!(
+            std::env::var("FLASH_QWEN_DIRECT_EXPERT_PACK").as_deref(),
+            Ok("1")
+        );
+        let hot_expert_banks = if resident_sidecar {
+            0
+        } else if direct_expert_pack {
+            LAYERS
+        } else {
+            1
+        };
+        let mut hot_experts = Vec::with_capacity(usize::try_from(hot_expert_banks)?);
+        for _ in 0..hot_expert_banks {
+            hot_experts.push(QwenExpertHotCache::create(0)?);
+        }
+        let expert_slots = if resident_sidecar {
+            Vec::new()
+        } else {
+            (0..LAYERS)
+                .map(|_| QwenLayerExpertSlots::new())
+                .collect::<Vec<_>>()
+        };
+        let mut prepared_experts = if resident_sidecar {
+            None
+        } else {
+            Some(QwenPreparedExpertCache::create(PREPARED_EXPERT_SLOTS, 0)?)
+        };
         let prefault_started = Instant::now();
-        let prefault_bytes = hot_experts
-            .prefault()?
-            .checked_add(prepared_experts.prefault()?)
-            .ok_or("Qwen expert prefault byte count overflow")?;
+        let mut prefault_bytes = 0_u64;
+        for hot_expert_bank in &mut hot_experts {
+            prefault_bytes = prefault_bytes
+                .checked_add(hot_expert_bank.prefault()?)
+                .ok_or("Qwen expert prefault byte count overflow")?;
+        }
+        if !direct_expert_pack {
+            if let Some(prepared) = prepared_experts.as_mut() {
+                prefault_bytes = prefault_bytes
+                    .checked_add(prepared.prefault()?)
+                    .ok_or("Qwen expert prefault byte count overflow")?;
+            }
+        }
         eprintln!(
-            "Qwen expert arena prefault: {:.3} GiB in {:.3} s",
+            "Qwen expert arena prefault: {:.3} GiB in {:.3} s ({})",
             prefault_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
             prefault_started.elapsed().as_secs_f64(),
+            if resident_sidecar {
+                "resident indexed sidecar"
+            } else if direct_expert_pack {
+                "persistent per-layer direct source-to-hot packing"
+            } else {
+                "prepared cache"
+            },
         );
+        if !resident_sidecar && direct_expert_pack {
+            let started = Instant::now();
+            let source_bytes = expert_loader
+                .as_mut()
+                .ok_or("Qwen expert loader is absent")?
+                .warm_expert_source()?;
+            let mut requested_shards = 0_usize;
+            for layer in 0..LAYERS {
+                for expert in [0_u32, 128, 256, 384] {
+                    let name = format!(
+                        "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"
+                    );
+                    let _ = weight_maps.tensor(&name, 1)?;
+                    requested_shards += 1;
+                }
+            }
+            let mapped_shards = weight_maps.mapped_shards();
+            if mapped_shards != requested_shards {
+                return Err(format!(
+                    "Qwen expert shard registration mapped {mapped_shards} shards, expected {requested_shards}"
+                )
+                .into());
+            }
+            eprintln!(
+                "Qwen direct expert source warm/register: {:.3} GiB in {:.3} s ({} shards)",
+                source_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+                started.elapsed().as_secs_f64(),
+                mapped_shards,
+            );
+        }
         let mut engine = Self {
             stream: CudaStreamOwner::create()?,
             blas: CudaBlasOwner::create()?,
@@ -601,47 +839,44 @@ impl QwenNativeEngine {
             ple_state: slab(HYPER * 9 * 2)?,
             ple,
             qsa_index_key_states: slab(
-                QSA_LAYERS
-                    * u64::try_from(QWEN_MODEL_MAX_LENGTH)?
-                    * INDEX_HEAD_DIM
-                    * 2,
+                QSA_LAYERS * u64::try_from(QWEN_MODEL_MAX_LENGTH)? * INDEX_HEAD_DIM * 2,
             )?,
-            qsa_rope_positions: slab(
-                QSA_LAYERS * u64::try_from(QWEN_MODEL_MAX_LENGTH)? * 3 * 8,
-            )?,
-            qsa_compressed_keys: slab(
-                QSA_LAYERS * QSA_COMPRESSED_SLOTS * INDEX_HEAD_DIM * 2,
-            )?,
+            qsa_rope_positions: slab(QSA_LAYERS * u64::try_from(QWEN_MODEL_MAX_LENGTH)? * 3 * 8)?,
+            qsa_compressed_keys: slab(QSA_LAYERS * QSA_COMPRESSED_SLOTS * INDEX_HEAD_DIM * 2)?,
             qsa_full_key_states: slab(
-                QSA_LAYERS
-                    * u64::try_from(QWEN_MODEL_MAX_LENGTH)?
-                    * KV_WIDTH
-                    * 2,
+                QSA_LAYERS * u64::try_from(QWEN_MODEL_MAX_LENGTH)? * KV_WIDTH * 2,
             )?,
             qsa_full_value_states: slab(
-                QSA_LAYERS
-                    * u64::try_from(QWEN_MODEL_MAX_LENGTH)?
-                    * KV_WIDTH
-                    * 2,
+                QSA_LAYERS * u64::try_from(QWEN_MODEL_MAX_LENGTH)? * KV_WIDTH * 2,
             )?,
+            resident_experts,
             hot_experts,
+            expert_slots,
             prepared_experts,
             expert_loader,
             expert_packs: 0,
             arena: QwenDecodeArena::create()?,
             token_history: Vec::new(),
+            decode_fast_path: std::env::var_os("FLASH_QWEN_DECODE_FAST_PATH").is_some(),
+            direct_expert_pack,
         };
         engine.reset_sequence()?;
-        if std::env::var_os("FLASH_QWEN_WARM_EXPERT_SOURCE").is_some() {
+        if !resident_sidecar
+            && !direct_expert_pack
+            && std::env::var_os("FLASH_QWEN_WARM_EXPERT_SOURCE").is_some()
+        {
             let started = Instant::now();
-            let bytes = engine.expert_loader.warm_expert_source()?;
+            let bytes = engine
+                .expert_loader
+                .as_mut()
+                .ok_or("Qwen expert loader is absent")?
+                .warm_expert_source()?;
             let elapsed = started.elapsed().as_secs_f64();
             eprintln!(
                 "Qwen expert mmap warmup: {:.3} GiB in {:.3} s ({:.3} GiB/s)",
                 bytes as f64 / 1024.0 / 1024.0 / 1024.0,
                 elapsed,
-                bytes as f64 / 1024.0 / 1024.0 / 1024.0
-                    / elapsed.max(f64::MIN_POSITIVE),
+                bytes as f64 / 1024.0 / 1024.0 / 1024.0 / elapsed.max(f64::MIN_POSITIVE),
             );
         }
         Ok(engine)
@@ -689,6 +924,40 @@ impl QwenNativeEngine {
         input_tokens: &[u32],
         verbose: bool,
     ) -> Result<QwenNativeStep, Box<dyn std::error::Error>> {
+        let step = self.advance_tokens(input_tokens, verbose, true)?;
+        Ok(QwenNativeStep {
+            token: step.token.ok_or("Qwen vocabulary projection was skipped")?,
+            elapsed_seconds: step.elapsed_seconds,
+            expert_hits: step.expert_hits,
+            expert_misses: step.expert_misses,
+            expert_evictions: step.expert_evictions,
+        })
+    }
+
+    /// Advance a non-final prompt bucket without running the final hyper mixer,
+    /// 248K-row LM head, device synchronization, or host argmax scan. The next
+    /// bucket consumes only the recurrent/KV state and last layer activations,
+    /// so those operations are pure discarded work until the final bucket.
+    pub fn prefill_tokens(
+        &mut self,
+        input_tokens: &[u32],
+        verbose: bool,
+    ) -> Result<QwenPrefillStep, Box<dyn std::error::Error>> {
+        let step = self.advance_tokens(input_tokens, verbose, false)?;
+        Ok(QwenPrefillStep {
+            elapsed_seconds: step.elapsed_seconds,
+            expert_hits: step.expert_hits,
+            expert_misses: step.expert_misses,
+            expert_evictions: step.expert_evictions,
+        })
+    }
+
+    fn advance_tokens(
+        &mut self,
+        input_tokens: &[u32],
+        verbose: bool,
+        project_vocabulary: bool,
+    ) -> Result<QwenBatchStep, Box<dyn std::error::Error>> {
         if !matches!(input_tokens.len(), 1 | 2 | 4 | 8 | 16)
             || input_tokens
                 .iter()
@@ -700,6 +969,17 @@ impl QwenNativeEngine {
         let start_position = self.token_history.len();
         self.token_history.extend_from_slice(input_tokens);
         let num_tokens = u32::try_from(input_tokens.len())?;
+        // Prepare every token's immutable QSA metadata before enqueuing any
+        // layer work. Each token owns one fixed slot for the whole bucket, so
+        // the ordered CUDA stream needs no host fence between prompt tokens.
+        let fast_decode = self.decode_fast_path && input_tokens.len() == 1 && project_vocabulary;
+        for token_offset in 0..input_tokens.len() {
+            prepare_qsa_metadata(
+                &mut self.arena,
+                u32::try_from(start_position + token_offset)?,
+                u32::try_from(token_offset)?,
+            )?;
+        }
 
         let embedding = self.resident.get(
             &mut self.weight_maps,
@@ -727,7 +1007,9 @@ impl QwenNativeEngine {
             )?;
         }
 
-        let expert_stats_before = self.prepared_experts.stats();
+        let expert_stats_before = self.expert_stats();
+        let expert_packs_before = self.expert_packs;
+        let direct_expert_pack = self.direct_expert_pack;
         let started = Instant::now();
         for layer in 0..LAYERS {
             let (current, next) = if layer.is_multiple_of(2) {
@@ -736,21 +1018,35 @@ impl QwenNativeEngine {
                 (&self.hyper_b, &self.hyper_a)
             };
             if layer == 1 {
-                for token_offset in 0..input_tokens.len() {
-                    run_ple(
-                        &mut self.weight_maps,
-                        &mut self.resident,
-                        &mut self.ple,
-                        &self.token_history[..start_position + token_offset + 1],
-                        current.device_address() + u64::try_from(token_offset)? * HYPER * 2,
-                        &self.ple_state,
-                        &mut self.arena,
-                        &mut self.stream,
-                        &self.blas,
-                        &self.caps,
-                    )?;
-                }
+                run_ple(
+                    &mut self.weight_maps,
+                    &mut self.resident,
+                    &mut self.ple,
+                    &self.token_history,
+                    start_position,
+                    input_tokens.len(),
+                    current.device_address(),
+                    &self.ple_state,
+                    &mut self.arena,
+                    &mut self.stream,
+                    &self.blas,
+                    &self.caps,
+                    fast_decode,
+                )?;
             }
+            let layer_index = usize::try_from(layer)?;
+            let resident_sidecar = self.resident_experts.is_some();
+            let hot_expert_index = if direct_expert_pack { layer_index } else { 0 };
+            let hot_experts = if resident_sidecar {
+                None
+            } else {
+                Some(&mut self.hot_experts[hot_expert_index])
+            };
+            let expert_slots = if resident_sidecar {
+                None
+            } else {
+                Some(&mut self.expert_slots[layer_index])
+            };
             run_layer(
                 &mut self.weight_maps,
                 &mut self.resident,
@@ -766,15 +1062,19 @@ impl QwenNativeEngine {
                 &self.qsa_full_value_states,
                 u32::try_from(start_position)?,
                 num_tokens,
-                &mut self.hot_experts,
-                &mut self.prepared_experts,
-                &mut self.expert_loader,
+                self.resident_experts.as_ref(),
+                hot_experts,
+                expert_slots,
+                self.prepared_experts.as_mut(),
+                self.expert_loader.as_mut(),
                 &mut self.expert_packs,
                 &mut self.arena,
                 &mut self.stream,
                 &self.blas,
                 &self.caps,
                 verbose,
+                fast_decode,
+                direct_expert_pack,
             )?;
             if verbose {
                 println!(
@@ -784,29 +1084,38 @@ impl QwenNativeEngine {
                 );
             }
         }
-        let final_hyper_base = if LAYERS.is_multiple_of(2) {
-            self.hyper_a.device_address()
+        let token = if project_vocabulary {
+            let final_hyper_base = if LAYERS.is_multiple_of(2) {
+                self.hyper_a.device_address()
+            } else {
+                self.hyper_b.device_address()
+            };
+            let final_hyper = final_hyper_base + u64::try_from(input_tokens.len() - 1)? * HYPER * 2;
+            Some(finish_logits(
+                &mut self.weight_maps,
+                &mut self.resident,
+                final_hyper,
+                &self.arena,
+                &mut self.stream,
+                &self.blas,
+                &self.caps,
+                fast_decode,
+            )?)
         } else {
-            self.hyper_b.device_address()
+            None
         };
-        let final_hyper = final_hyper_base
-            + u64::try_from(input_tokens.len() - 1)? * HYPER * 2;
-        let token = finish_logits(
-            &mut self.weight_maps,
-            &mut self.resident,
-            final_hyper,
-            &self.arena,
-            &mut self.stream,
-            &self.blas,
-            &self.caps,
-        )?;
         let elapsed_seconds = started.elapsed().as_secs_f64();
-        let expert_stats_after = self.prepared_experts.stats();
-        Ok(QwenNativeStep {
+        let expert_stats_after = self.expert_stats();
+        let direct_expert_packs = self.expert_packs - expert_packs_before;
+        Ok(QwenBatchStep {
             token,
             elapsed_seconds,
             expert_hits: expert_stats_after.hits - expert_stats_before.hits,
-            expert_misses: expert_stats_after.misses - expert_stats_before.misses,
+            expert_misses: if self.direct_expert_pack {
+                direct_expert_packs
+            } else {
+                expert_stats_after.misses - expert_stats_before.misses
+            },
             expert_evictions: expert_stats_after.evictions - expert_stats_before.evictions,
         })
     }
@@ -820,25 +1129,31 @@ impl QwenNativeEngine {
     }
 
     pub fn expert_stats(&self) -> QwenPreparedExpertStats {
-        self.prepared_experts.stats()
+        self.prepared_experts
+            .as_ref()
+            .map(QwenPreparedExpertCache::stats)
+            .unwrap_or(QwenPreparedExpertStats {
+                capacity: 0,
+                resident: 0,
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+            })
     }
 }
 
 pub fn smoke_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
-    let model = arguments
-        .next()
-        .unwrap_or_else(|| panic!("usage: qwen_first_token <model-root> [input-token-id] [replays]"));
+    let model = arguments.next().unwrap_or_else(|| {
+        panic!("usage: qwen_first_token <model-root> [input-token-id] [replays]")
+    });
     let input_token = arguments
         .next()
         .map_or(Ok(9707_u32), |value| value.parse::<u32>())?;
     let replays = arguments
         .next()
         .map_or(Ok(1_u32), |value| value.parse::<u32>())?;
-    if arguments.next().is_some()
-        || u64::from(input_token) >= VOCABULARY
-        || replays == 0
-    {
+    if arguments.next().is_some() || u64::from(input_token) >= VOCABULARY || replays == 0 {
         return Err("invalid Qwen input token or replay count".into());
     }
     let model_root = Path::new(&model);
@@ -886,15 +1201,19 @@ fn run_layer(
     qsa_full_value_states: &CoherentRegionOwner,
     start_position: u32,
     num_tokens: u32,
-    hot_experts: &mut QwenExpertHotCache,
-    prepared_experts: &mut QwenPreparedExpertCache,
-    expert_loader: &mut QwenExpertFileLoader,
+    resident_experts: Option<&QwenResidentExpertSidecar>,
+    hot_experts: Option<&mut QwenExpertHotCache>,
+    expert_slots: Option<&mut QwenLayerExpertSlots>,
+    prepared_experts: Option<&mut QwenPreparedExpertCache>,
+    expert_loader: Option<&mut QwenExpertFileLoader>,
     expert_packs: &mut u64,
     arena: &mut QwenDecodeArena,
     stream: &mut CudaStreamOwner,
     blas: &CudaBlasOwner,
     caps: &DeviceCaps,
     trace: bool,
+    fast_decode: bool,
+    direct_expert_pack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let attn_prefix = format!("model.language_model.layers.{layer}.attn_hyper_connection");
     let attn_weights = load_mhc_weights(maps, resident, stream, &attn_prefix)?;
@@ -923,6 +1242,7 @@ fn run_layer(
                 resident,
                 layer,
                 start_position + token_offset,
+                token_offset,
                 arena.mixed.device_address() + u64::from(token_offset) * HIDDEN * 2,
                 arena.attention.device_address() + u64::from(token_offset) * HIDDEN * 2,
                 qsa_index_key_states,
@@ -934,10 +1254,8 @@ fn run_layer(
                 stream,
                 blas,
                 caps,
+                fast_decode,
             )?;
-            // QSA reuses scalar metadata and one-token scratch. Complete the
-            // prior token before the CPU updates those coherent locations.
-            stream.synchronize()?;
         }
     } else {
         run_gdn(
@@ -987,7 +1305,9 @@ fn run_layer(
         arena.mixed.device_address(),
         arena.moe_output.device_address(),
         arena,
+        resident_experts,
         hot_experts,
+        expert_slots,
         prepared_experts,
         expert_loader,
         expert_packs,
@@ -995,6 +1315,8 @@ fn run_layer(
         blas,
         caps,
         trace,
+        fast_decode,
+        direct_expert_pack,
     )?;
     trace_stage(stream, trace, layer, "MoE")?;
     native("Qwen MLP mHC combine", unsafe {
@@ -1116,48 +1438,194 @@ fn run_gdn(
     caps: &DeviceCaps,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let prefix = format!("model.language_model.layers.{layer}.linear_attn");
-    let qkv = resident.get(maps, stream, &format!("{prefix}.in_proj_qkv.weight"), "BF16", &[GDN_CONV_WIDTH, HIDDEN], GDN_CONV_WIDTH * HIDDEN * 2)?;
-    let z = resident.get(maps, stream, &format!("{prefix}.in_proj_z.weight"), "BF16", &[VALUE_WIDTH, HIDDEN], VALUE_WIDTH * HIDDEN * 2)?;
-    let b = resident.get(maps, stream, &format!("{prefix}.in_proj_b.weight"), "BF16", &[VALUE_HEADS, HIDDEN], VALUE_HEADS * HIDDEN * 2)?;
-    let a = resident.get(maps, stream, &format!("{prefix}.in_proj_a.weight"), "BF16", &[VALUE_HEADS, HIDDEN], VALUE_HEADS * HIDDEN * 2)?;
-    let conv = resident.get(maps, stream, &format!("{prefix}.conv1d.weight"), "BF16", &[GDN_CONV_WIDTH, 1, 4], GDN_CONV_WIDTH * 4 * 2)?;
-    let norm = resident.get(maps, stream, &format!("{prefix}.norm.weight"), "BF16", &[HEAD_DIM], HEAD_DIM * 2)?;
-    let out = resident.get(maps, stream, &format!("{prefix}.out_proj.weight"), "BF16", &[HIDDEN, VALUE_WIDTH], HIDDEN * VALUE_WIDTH * 2)?;
-    let a_log_bf16 = resident.get(maps, stream, &format!("{prefix}.A_log"), "BF16", &[VALUE_HEADS], VALUE_HEADS * 2)?;
-    let dt_bf16 = resident.get(maps, stream, &format!("{prefix}.dt_bias"), "BF16", &[VALUE_HEADS], VALUE_HEADS * 2)?;
-    convert_bf16(stream, a_log_bf16, &arena.gdn_a_log, VALUE_HEADS)?;
-    convert_bf16(stream, dt_bf16, &arena.gdn_dt, VALUE_HEADS)?;
+    let qkv = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.in_proj_qkv.weight"),
+        "BF16",
+        &[GDN_CONV_WIDTH, HIDDEN],
+        GDN_CONV_WIDTH * HIDDEN * 2,
+    )?;
+    let z = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.in_proj_z.weight"),
+        "BF16",
+        &[VALUE_WIDTH, HIDDEN],
+        VALUE_WIDTH * HIDDEN * 2,
+    )?;
+    let b = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.in_proj_b.weight"),
+        "BF16",
+        &[VALUE_HEADS, HIDDEN],
+        VALUE_HEADS * HIDDEN * 2,
+    )?;
+    let a = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.in_proj_a.weight"),
+        "BF16",
+        &[VALUE_HEADS, HIDDEN],
+        VALUE_HEADS * HIDDEN * 2,
+    )?;
+    let conv = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.conv1d.weight"),
+        "BF16",
+        &[GDN_CONV_WIDTH, 1, 4],
+        GDN_CONV_WIDTH * 4 * 2,
+    )?;
+    let norm = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.norm.weight"),
+        "BF16",
+        &[HEAD_DIM],
+        HEAD_DIM * 2,
+    )?;
+    let out = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.out_proj.weight"),
+        "BF16",
+        &[HIDDEN, VALUE_WIDTH],
+        HIDDEN * VALUE_WIDTH * 2,
+    )?;
+    let a_log =
+        resident.bf16_vector_as_f32(maps, stream, &format!("{prefix}.A_log"), VALUE_HEADS)?;
+    let dt =
+        resident.bf16_vector_as_f32(maps, stream, &format!("{prefix}.dt_bias"), VALUE_HEADS)?;
     let gdn_ordinal = u64::from(layer - layer / 4);
     let conv_state = conv_states.device_address() + gdn_ordinal * GDN_CONV_WIDTH * 3 * 2;
-    let temporal_state = temporal_states.device_address()
-        + gdn_ordinal * VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2;
+    let temporal_state =
+        temporal_states.device_address() + gdn_ordinal * VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2;
     let block = GdnBlockArgs {
-        struct_size: size::<GdnBlockArgs>(), abi_version: KERNEL_ABI_VERSION,
-        plan: GdnBlockPlan::qwen38_flash_decode(num_tokens), hidden_states: ptr(arena.mixed.device_address()),
-        in_proj_qkv_weight: ptr(qkv), in_proj_z_weight: ptr(z),
-        in_proj_b_weight: ptr(b), in_proj_a_weight: ptr(a),
-        conv_weight: ptr(conv), gated_norm_weight: ptr(norm),
-        out_proj_weight: ptr(out), conv_state_pool: ptr_mut(conv_state),
-        state_indices: ptr(arena.state_index.device_address()).cast::<i32>(), projected_qkv: ptr_mut(arena.gdn_projected_qkv.device_address()),
-        projected_z: ptr_mut(arena.gdn_projected_z.device_address()), projected_b: ptr_mut(arena.gdn_projected_b.device_address()),
-        projected_a: ptr_mut(arena.gdn_projected_a.device_address()), convolved_qkv: ptr_mut(arena.gdn_convolved.device_address()),
-        gdn_core_output: ptr(arena.gdn_core.device_address()), gated_norm_output: ptr_mut(arena.gdn_gated.device_address()),
-        attention_output: ptr_mut(arena.attention.device_address()), cublas_handle: blas.raw(), cuda_stream: stream.raw(),
+        struct_size: size::<GdnBlockArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: GdnBlockPlan::qwen38_flash_decode(num_tokens),
+        hidden_states: ptr(arena.mixed.device_address()),
+        in_proj_qkv_weight: ptr(qkv),
+        in_proj_z_weight: ptr(z),
+        in_proj_b_weight: ptr(b),
+        in_proj_a_weight: ptr(a),
+        conv_weight: ptr(conv),
+        gated_norm_weight: ptr(norm),
+        out_proj_weight: ptr(out),
+        conv_state_pool: ptr_mut(conv_state),
+        state_indices: ptr(arena.state_index.device_address()).cast::<i32>(),
+        projected_qkv: ptr_mut(arena.gdn_projected_qkv.device_address()),
+        projected_z: ptr_mut(arena.gdn_projected_z.device_address()),
+        projected_b: ptr_mut(arena.gdn_projected_b.device_address()),
+        projected_a: ptr_mut(arena.gdn_projected_a.device_address()),
+        convolved_qkv: ptr_mut(arena.gdn_convolved.device_address()),
+        gdn_core_output: ptr(arena.gdn_core.device_address()),
+        gated_norm_output: ptr_mut(arena.gdn_gated.device_address()),
+        attention_output: ptr_mut(arena.attention.device_address()),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
     };
     let recurrence = GdnDecodeArgs {
-        struct_size: size::<GdnDecodeArgs>(), abi_version: KERNEL_ABI_VERSION,
-        plan: GdnDecodePlan::qwen38_flash_decode(1, 1), q: ptr(arena.gdn_convolved.device_address()),
+        struct_size: size::<GdnDecodeArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: GdnDecodePlan::qwen38_flash_decode(1, 1),
+        q: ptr(arena.gdn_convolved.device_address()),
         k: ptr(arena.gdn_convolved.device_address() + u64::from(num_tokens) * QK_WIDTH * 2),
         v: ptr(arena.gdn_convolved.device_address() + 2 * u64::from(num_tokens) * QK_WIDTH * 2),
-        a: ptr(arena.gdn_projected_a.device_address()), b: ptr(arena.gdn_projected_b.device_address()),
-        a_log: ptr(arena.gdn_a_log.device_address()).cast::<f32>(), dt_bias: ptr(arena.gdn_dt.device_address()).cast::<f32>(),
-        state_pool: ptr_mut(temporal_state), state_indices: ptr(arena.state_index.device_address()).cast::<i32>(),
-        output: ptr_mut(arena.gdn_core.device_address()), scale: 1.0 / (HEAD_DIM as f32).sqrt(),
-        sequence_length: num_tokens, cuda_stream: stream.raw(),
+        a: ptr(arena.gdn_projected_a.device_address()),
+        b: ptr(arena.gdn_projected_b.device_address()),
+        a_log: ptr(a_log).cast::<f32>(),
+        dt_bias: ptr(dt).cast::<f32>(),
+        state_pool: ptr_mut(temporal_state),
+        state_indices: ptr(arena.state_index.device_address()).cast::<i32>(),
+        output: ptr_mut(arena.gdn_core.device_address()),
+        scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        sequence_length: num_tokens,
+        cuda_stream: stream.raw(),
     };
-    native("Qwen GDN prepare", unsafe { flash_gdn_block_prepare_launch(caps, &block) })?;
-    native("Qwen GDN recurrence", unsafe { flash_gdn_decode_launch(caps, &recurrence) })?;
-    native("Qwen GDN finish", unsafe { flash_gdn_block_finish_launch(caps, &block) })?;
+    native("Qwen GDN prepare", unsafe {
+        flash_gdn_block_prepare_launch(caps, &block)
+    })?;
+    native("Qwen GDN recurrence", unsafe {
+        flash_gdn_decode_launch(caps, &recurrence)
+    })?;
+    native("Qwen GDN finish", unsafe {
+        flash_gdn_block_finish_launch(caps, &block)
+    })?;
+    Ok(())
+}
+
+fn prepare_qsa_metadata(
+    arena: &mut QwenDecodeArena,
+    position: u32,
+    slot: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if u64::from(slot) >= PREFILL_CHUNK_TOKENS {
+        return Err("Qwen QSA metadata slot exceeds the AOT bucket".into());
+    }
+    let sequence_length = position
+        .checked_add(1)
+        .ok_or("Qwen QSA position overflow")?;
+    let compress_ratio = u32::try_from(QSA_COMPRESS_RATIO)?;
+    let compressed_length = sequence_length / compress_ratio;
+    write_word_at(
+        &mut arena.qsa_positions,
+        u64::from(slot) * 8,
+        i64::from(position).to_ne_bytes(),
+    )?;
+    write_word_at(
+        &mut arena.qsa_cache_locs,
+        u64::from(slot) * 8,
+        i64::from(position).to_ne_bytes(),
+    )?;
+    write_word_at(
+        &mut arena.qsa_query_positions,
+        u64::from(slot) * 8,
+        i64::from(position).to_ne_bytes(),
+    )?;
+    write_word_at(
+        &mut arena.qsa_sequence_lengths,
+        u64::from(slot) * 4,
+        i32::try_from(sequence_length)?.to_ne_bytes(),
+    )?;
+    write_word_at(
+        &mut arena.qsa_compressed_lengths,
+        u64::from(slot) * 4,
+        i32::try_from(compressed_length)?.to_ne_bytes(),
+    )?;
+    write_word_at(
+        &mut arena.qsa_row_start,
+        u64::from(slot) * 4,
+        0_i32.to_ne_bytes(),
+    )?;
+    write_word_at(
+        &mut arena.qsa_request_indices,
+        u64::from(slot) * 4,
+        0_i32.to_ne_bytes(),
+    )?;
+    if sequence_length.is_multiple_of(compress_ratio) {
+        let first = position
+            .checked_sub(3)
+            .ok_or("Qwen QSA compression group underflow")?;
+        let group_offset = u64::from(slot) * QSA_COMPRESS_RATIO * 4;
+        for (index, location) in [first, first + 1, first + 2, position]
+            .into_iter()
+            .enumerate()
+        {
+            write_word_at(
+                &mut arena.qsa_group_locs,
+                group_offset + u64::try_from(index)? * 4,
+                i32::try_from(location)?.to_ne_bytes(),
+            )?;
+        }
+        write_word_at(
+            &mut arena.qsa_write_locs,
+            u64::from(slot) * 4,
+            i32::try_from(compressed_length - 1)?.to_ne_bytes(),
+        )?;
+    }
     Ok(())
 }
 
@@ -1167,6 +1635,7 @@ fn run_qsa(
     resident: &mut QwenResidentWeights,
     layer: u32,
     position: u32,
+    metadata_slot: u32,
     hidden_states: u64,
     attention_output: u64,
     index_key_states: &CoherentRegionOwner,
@@ -1178,18 +1647,87 @@ fn run_qsa(
     stream: &mut CudaStreamOwner,
     blas: &CudaBlasOwner,
     caps: &DeviceCaps,
+    fast_decode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let prefix = format!("model.language_model.layers.{layer}.self_attn");
-    write_i64_scalar(&mut arena.qsa_positions, i64::from(position))?;
-    let q = resident.get(maps, stream, &format!("{prefix}.q_proj.weight"), "BF16", &[2 * QUERY_WIDTH, HIDDEN], 2 * QUERY_WIDTH * HIDDEN * 2)?;
-    let k = resident.get(maps, stream, &format!("{prefix}.k_proj.weight"), "BF16", &[KV_WIDTH, HIDDEN], KV_WIDTH * HIDDEN * 2)?;
-    let v = resident.get(maps, stream, &format!("{prefix}.v_proj.weight"), "BF16", &[KV_WIDTH, HIDDEN], KV_WIDTH * HIDDEN * 2)?;
-    let index = resident.get(maps, stream, &format!("{prefix}.indexer.index_qk_proj.weight"), "BF16", &[INDEX_WIDTH, HIDDEN], INDEX_WIDTH * HIDDEN * 2)?;
-    let q_norm = resident.get(maps, stream, &format!("{prefix}.q_norm.weight"), "BF16", &[QSA_HEAD_DIM], QSA_HEAD_DIM * 2)?;
-    let k_norm = resident.get(maps, stream, &format!("{prefix}.k_norm.weight"), "BF16", &[QSA_HEAD_DIM], QSA_HEAD_DIM * 2)?;
-    let index_q_norm = resident.get(maps, stream, &format!("{prefix}.indexer.q_layernorm.weight"), "BF16", &[INDEX_HEAD_DIM], INDEX_HEAD_DIM * 2)?;
-    let index_k_norm = resident.get(maps, stream, &format!("{prefix}.indexer.k_layernorm.weight"), "BF16", &[INDEX_HEAD_DIM], INDEX_HEAD_DIM * 2)?;
-    let out = resident.get(maps, stream, &format!("{prefix}.o_proj.weight"), "BF16", &[HIDDEN, QUERY_WIDTH], HIDDEN * QUERY_WIDTH * 2)?;
+    if u64::from(metadata_slot) >= PREFILL_CHUNK_TOKENS {
+        return Err("Qwen QSA metadata slot exceeds the AOT bucket".into());
+    }
+    let metadata_i32 = u64::from(metadata_slot) * 4;
+    let metadata_i64 = u64::from(metadata_slot) * 8;
+    let group_metadata = u64::from(metadata_slot) * QSA_COMPRESS_RATIO * 4;
+    let q = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.q_proj.weight"),
+        "BF16",
+        &[2 * QUERY_WIDTH, HIDDEN],
+        2 * QUERY_WIDTH * HIDDEN * 2,
+    )?;
+    let k = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.k_proj.weight"),
+        "BF16",
+        &[KV_WIDTH, HIDDEN],
+        KV_WIDTH * HIDDEN * 2,
+    )?;
+    let v = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.v_proj.weight"),
+        "BF16",
+        &[KV_WIDTH, HIDDEN],
+        KV_WIDTH * HIDDEN * 2,
+    )?;
+    let index = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.indexer.index_qk_proj.weight"),
+        "BF16",
+        &[INDEX_WIDTH, HIDDEN],
+        INDEX_WIDTH * HIDDEN * 2,
+    )?;
+    let q_norm = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.q_norm.weight"),
+        "BF16",
+        &[QSA_HEAD_DIM],
+        QSA_HEAD_DIM * 2,
+    )?;
+    let k_norm = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.k_norm.weight"),
+        "BF16",
+        &[QSA_HEAD_DIM],
+        QSA_HEAD_DIM * 2,
+    )?;
+    let index_q_norm = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.indexer.q_layernorm.weight"),
+        "BF16",
+        &[INDEX_HEAD_DIM],
+        INDEX_HEAD_DIM * 2,
+    )?;
+    let index_k_norm = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.indexer.k_layernorm.weight"),
+        "BF16",
+        &[INDEX_HEAD_DIM],
+        INDEX_HEAD_DIM * 2,
+    )?;
+    let out = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.o_proj.weight"),
+        "BF16",
+        &[HIDDEN, QUERY_WIDTH],
+        HIDDEN * QUERY_WIDTH * 2,
+    )?;
 
     let qsa_ordinal = u64::from(layer / 4);
     if qsa_ordinal >= QSA_LAYERS {
@@ -1197,69 +1735,74 @@ fn run_qsa(
     }
     let context_capacity = u64::try_from(QWEN_MODEL_MAX_LENGTH)?;
     let position_u64 = u64::from(position);
-    let sequence_length = position.checked_add(1).ok_or("Qwen QSA position overflow")?;
+    let sequence_length = position
+        .checked_add(1)
+        .ok_or("Qwen QSA position overflow")?;
     let compressed_length = sequence_length / u32::try_from(QSA_COMPRESS_RATIO)?;
     let groups = u32::from(sequence_length.is_multiple_of(u32::try_from(QSA_COMPRESS_RATIO)?));
-    let index_state_base = index_key_states.device_address()
-        + qsa_ordinal * context_capacity * INDEX_HEAD_DIM * 2;
-    let rope_positions_base = rope_positions.device_address()
-        + qsa_ordinal * context_capacity * 3 * 8;
-    let compressed_keys_base = compressed_keys.device_address()
-        + qsa_ordinal * QSA_COMPRESSED_SLOTS * INDEX_HEAD_DIM * 2;
-    let full_key_base = full_key_states.device_address()
-        + qsa_ordinal * context_capacity * KV_WIDTH * 2;
-    let full_value_base = full_value_states.device_address()
-        + qsa_ordinal * context_capacity * KV_WIDTH * 2;
+    let index_state_base =
+        index_key_states.device_address() + qsa_ordinal * context_capacity * INDEX_HEAD_DIM * 2;
+    let rope_positions_base =
+        rope_positions.device_address() + qsa_ordinal * context_capacity * 3 * 8;
+    let compressed_keys_base =
+        compressed_keys.device_address() + qsa_ordinal * QSA_COMPRESSED_SLOTS * INDEX_HEAD_DIM * 2;
+    let full_key_base =
+        full_key_states.device_address() + qsa_ordinal * context_capacity * KV_WIDTH * 2;
+    let full_value_base =
+        full_value_states.device_address() + qsa_ordinal * context_capacity * KV_WIDTH * 2;
 
-    write_i64_scalar(&mut arena.qsa_cache_locs, i64::from(position))?;
-    write_i64_scalar(&mut arena.qsa_query_positions, i64::from(position))?;
-    write_i32(&mut arena.qsa_sequence_lengths, &[i32::try_from(sequence_length)?])?;
-    write_i32(&mut arena.qsa_compressed_lengths, &[i32::try_from(compressed_length)?])?;
-    write_i32(&mut arena.qsa_row_start, &[0])?;
-    write_i32(&mut arena.qsa_request_indices, &[0])?;
-    if groups != 0 {
-        let first = position.checked_sub(3).ok_or("Qwen QSA compression group underflow")?;
-        write_i32(
-            &mut arena.qsa_group_locs,
-            &[
-                i32::try_from(first)?,
-                i32::try_from(first + 1)?,
-                i32::try_from(first + 2)?,
-                i32::try_from(position)?,
-            ],
-        )?;
-        write_i32(
-            &mut arena.qsa_write_locs,
-            &[i32::try_from(compressed_length - 1)?],
-        )?;
-    }
-
-    let project = QwenQsaProjectArgs {
-        struct_size: size::<QwenQsaProjectArgs>(), abi_version: QWEN_QSA_BLOCK_ABI_VERSION,
-        tokens: 1, rotary_dim: ROTARY_DIM, cos_sin_stride: u64::from(ROTARY_DIM),
-        hidden_states: ptr(hidden_states), q_weight: ptr(q),
-        k_weight: ptr(k), v_weight: ptr(v),
-        index_qk_weight: ptr(index), q_norm_weight: ptr(q_norm),
-        k_norm_weight: ptr(k_norm), cos_sin_cache: ptr(arena.qsa_cos_sin.device_address()).cast::<f32>(),
-        positions: ptr(arena.qsa_positions.device_address()).cast::<i64>(), projected_q: ptr_mut(arena.qsa_projected_q.device_address()),
-        projected_k: ptr_mut(arena.qsa_projected_k.device_address()), query: ptr_mut(arena.qsa_query.device_address()),
-        key: ptr_mut(arena.qsa_key.device_address()), value: ptr_mut(arena.qsa_value.device_address()),
-        gate: ptr_mut(arena.qsa_gate.device_address()), index_qk: ptr_mut(arena.qsa_index_qk.device_address()),
-        cublas_handle: blas.raw(), cuda_stream: stream.raw(),
+    let key_destination = if fast_decode {
+        full_key_base + position_u64 * KV_WIDTH * 2
+    } else {
+        arena.qsa_key.device_address()
     };
-    native("Qwen QSA project", unsafe { flash_qwen_qsa_project_launch(&project) })?;
+    let value_destination = if fast_decode {
+        full_value_base + position_u64 * KV_WIDTH * 2
+    } else {
+        arena.qsa_value.device_address()
+    };
+    let project = QwenQsaProjectArgs {
+        struct_size: size::<QwenQsaProjectArgs>(),
+        abi_version: QWEN_QSA_BLOCK_ABI_VERSION,
+        tokens: 1,
+        rotary_dim: ROTARY_DIM,
+        cos_sin_stride: u64::from(ROTARY_DIM),
+        hidden_states: ptr(hidden_states),
+        q_weight: ptr(q),
+        k_weight: ptr(k),
+        v_weight: ptr(v),
+        index_qk_weight: ptr(index),
+        q_norm_weight: ptr(q_norm),
+        k_norm_weight: ptr(k_norm),
+        cos_sin_cache: ptr(arena.qsa_cos_sin.device_address()).cast::<f32>(),
+        positions: ptr(arena.qsa_positions.device_address() + metadata_i64).cast::<i64>(),
+        projected_q: ptr_mut(arena.qsa_projected_q.device_address()),
+        projected_k: ptr_mut(arena.qsa_projected_k.device_address()),
+        query: ptr_mut(arena.qsa_query.device_address()),
+        key: ptr_mut(key_destination),
+        value: ptr_mut(value_destination),
+        gate: ptr_mut(arena.qsa_gate.device_address()),
+        index_qk: ptr_mut(arena.qsa_index_qk.device_address()),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen QSA project", unsafe {
+        flash_qwen_qsa_project_launch(&project)
+    })?;
 
-    unsafe {
-        stream.memcpy_async(
-            full_key_base + position_u64 * KV_WIDTH * 2,
-            arena.qsa_key.device_address(),
-            usize::try_from(KV_WIDTH * 2)?,
-        )?;
-        stream.memcpy_async(
-            full_value_base + position_u64 * KV_WIDTH * 2,
-            arena.qsa_value.device_address(),
-            usize::try_from(KV_WIDTH * 2)?,
-        )?;
+    if !fast_decode {
+        unsafe {
+            stream.memcpy_async(
+                full_key_base + position_u64 * KV_WIDTH * 2,
+                arena.qsa_key.device_address(),
+                usize::try_from(KV_WIDTH * 2)?,
+            )?;
+            stream.memcpy_async(
+                full_value_base + position_u64 * KV_WIDTH * 2,
+                arena.qsa_value.device_address(),
+                usize::try_from(KV_WIDTH * 2)?,
+            )?;
+        }
     }
 
     let index_prep = QsaIndexPrepArgs {
@@ -1276,18 +1819,34 @@ fn run_qsa(
         qk: ptr(arena.qsa_index_qk.device_address()),
         q_output: ptr_mut(arena.qsa_index_query.device_address()),
         q_norm_weight: ptr(index_q_norm),
-        k_norm_weight: if groups == 0 { std::ptr::null() } else { ptr(index_k_norm) },
+        k_norm_weight: if groups == 0 {
+            std::ptr::null()
+        } else {
+            ptr(index_k_norm)
+        },
         cos_sin_cache: ptr(arena.qsa_cos_sin.device_address()).cast::<f32>(),
         cos_sin_rows: context_capacity,
         axis_map: ptr(arena.qsa_axis_map.device_address()).cast::<i32>(),
-        positions: ptr(arena.qsa_positions.device_address()).cast::<i64>(),
+        positions: ptr(arena.qsa_positions.device_address() + metadata_i64).cast::<i64>(),
         positions_stride: 1,
-        cache_locs: ptr(arena.qsa_cache_locs.device_address()).cast::<i64>(),
+        cache_locs: ptr(arena.qsa_cache_locs.device_address() + metadata_i64).cast::<i64>(),
         key_state: ptr_mut(index_state_base),
         rope_positions: ptr_mut(rope_positions_base).cast::<i64>(),
-        group_locs: if groups == 0 { std::ptr::null() } else { ptr(arena.qsa_group_locs.device_address()).cast::<i32>() },
-        write_locs: if groups == 0 { std::ptr::null() } else { ptr(arena.qsa_write_locs.device_address()).cast::<i32>() },
-        compressed_keys: if groups == 0 { std::ptr::null_mut() } else { ptr_mut(compressed_keys_base) },
+        group_locs: if groups == 0 {
+            std::ptr::null()
+        } else {
+            ptr(arena.qsa_group_locs.device_address() + group_metadata).cast::<i32>()
+        },
+        write_locs: if groups == 0 {
+            std::ptr::null()
+        } else {
+            ptr(arena.qsa_write_locs.device_address() + metadata_i32).cast::<i32>()
+        },
+        compressed_keys: if groups == 0 {
+            std::ptr::null_mut()
+        } else {
+            ptr_mut(compressed_keys_base)
+        },
         eps: 1.0e-6,
         reserved: 0,
         cuda_stream: stream.raw(),
@@ -1299,11 +1858,7 @@ fn run_qsa(
     let max_pages = compressed_length
         .div_ceil(u32::try_from(QSA_COMPRESSED_PAGE_SIZE)?)
         .max(1);
-    let score_plan = QsaScorePlan::qwen38_flash(
-        1,
-        u32::try_from(QSA_COMPRESSED_PAGES)?,
-        max_pages,
-    );
+    let score_plan = QsaScorePlan::qwen38_flash(1, u32::try_from(QSA_COMPRESSED_PAGES)?, max_pages);
     let score = QsaScoreArgs {
         struct_size: size::<QsaScoreArgs>(),
         abi_version: KERNEL_ABI_VERSION,
@@ -1311,7 +1866,8 @@ fn run_qsa(
         query: ptr(arena.qsa_index_query.device_address()),
         key_cache: ptr(compressed_keys_base),
         page_table: ptr(arena.qsa_compressed_page_table.device_address()).cast::<i32>(),
-        context_lengths: ptr(arena.qsa_compressed_lengths.device_address()).cast::<i32>(),
+        context_lengths: ptr(arena.qsa_compressed_lengths.device_address() + metadata_i32)
+            .cast::<i32>(),
         logits: ptr_mut(arena.qsa_logits.device_address()).cast::<f32>(),
         score_scale: (INDEX_HEAD_DIM as f32).sqrt(),
         reserved: 0,
@@ -1330,8 +1886,9 @@ fn run_qsa(
             u64::from(score_plan.max_model_len),
         ),
         scores: ptr(arena.qsa_logits.device_address()).cast::<f32>(),
-        row_starts: ptr(arena.qsa_row_start.device_address()).cast::<i32>(),
-        lengths: ptr(arena.qsa_compressed_lengths.device_address()).cast::<i32>(),
+        row_starts: ptr(arena.qsa_row_start.device_address() + metadata_i32).cast::<i32>(),
+        lengths: ptr(arena.qsa_compressed_lengths.device_address() + metadata_i32)
+            .cast::<i32>(),
         indices: ptr_mut(arena.qsa_block_indices.device_address()).cast::<i32>(),
         cuda_stream: stream.raw(),
     };
@@ -1344,8 +1901,10 @@ fn run_qsa(
         abi_version: KERNEL_ABI_VERSION,
         plan: QsaExpandPlan::qwen38_flash(1),
         block_indices: ptr(arena.qsa_block_indices.device_address()).cast::<i32>(),
-        query_positions: ptr(arena.qsa_query_positions.device_address()).cast::<i64>(),
-        sequence_lengths: ptr(arena.qsa_sequence_lengths.device_address()).cast::<i32>(),
+        query_positions: ptr(arena.qsa_query_positions.device_address() + metadata_i64)
+            .cast::<i64>(),
+        sequence_lengths: ptr(arena.qsa_sequence_lengths.device_address() + metadata_i32)
+            .cast::<i32>(),
         logical_indices: ptr_mut(arena.qsa_logical_indices.device_address()).cast::<i32>(),
         cuda_stream: stream.raw(),
     };
@@ -1365,9 +1924,11 @@ fn run_qsa(
         key_state: ptr(full_key_base),
         value_state: ptr(full_value_base),
         req_to_token: ptr(arena.qsa_request_to_token.device_address()).cast::<i32>(),
-        request_indices: ptr(arena.qsa_request_indices.device_address()).cast::<i32>(),
+        request_indices: ptr(arena.qsa_request_indices.device_address() + metadata_i32)
+            .cast::<i32>(),
         logical_indices: ptr(arena.qsa_logical_indices.device_address()).cast::<i32>(),
-        sequence_lengths: ptr(arena.qsa_sequence_lengths.device_address()).cast::<i32>(),
+        sequence_lengths: ptr(arena.qsa_sequence_lengths.device_address() + metadata_i32)
+            .cast::<i32>(),
         valid_counts: ptr_mut(arena.qsa_valid_counts.device_address()).cast::<i32>(),
         packed_key: ptr_mut(arena.qsa_packed_key.device_address()),
         packed_value: ptr_mut(arena.qsa_packed_value.device_address()),
@@ -1398,43 +1959,106 @@ fn run_qsa(
     })?;
 
     let finish = QwenQsaFinishArgs {
-        struct_size: size::<QwenQsaFinishArgs>(), abi_version: QWEN_QSA_BLOCK_ABI_VERSION,
-        tokens: 1, reserved: 0, attention_output: ptr(arena.qsa_raw_attention.device_address()),
-        gate: ptr(arena.qsa_gate.device_address()), out_weight: ptr(out),
-        gated_output: ptr_mut(arena.qsa_gated.device_address()), output: ptr_mut(attention_output),
-        cublas_handle: blas.raw(), cuda_stream: stream.raw(),
+        struct_size: size::<QwenQsaFinishArgs>(),
+        abi_version: QWEN_QSA_BLOCK_ABI_VERSION,
+        tokens: 1,
+        reserved: 0,
+        attention_output: ptr(arena.qsa_raw_attention.device_address()),
+        gate: ptr(arena.qsa_gate.device_address()),
+        out_weight: ptr(out),
+        gated_output: ptr_mut(arena.qsa_gated.device_address()),
+        output: ptr_mut(attention_output),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
     };
-    native("Qwen QSA finish", unsafe { flash_qwen_qsa_finish_launch(&finish) })?;
+    native("Qwen QSA finish", unsafe {
+        flash_qwen_qsa_finish_launch(&finish)
+    })?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_moe(
-    maps: &mut FlashNextWeightMaps, resident: &mut QwenResidentWeights,
-    layer: u32, num_tokens: u32, hidden_states: u64, moe_output: u64,
+    maps: &mut FlashNextWeightMaps,
+    resident: &mut QwenResidentWeights,
+    layer: u32,
+    num_tokens: u32,
+    hidden_states: u64,
+    moe_output: u64,
     arena: &mut QwenDecodeArena,
-    hot_experts: &mut QwenExpertHotCache,
-    prepared_experts: &mut QwenPreparedExpertCache,
-    expert_loader: &mut QwenExpertFileLoader,
+    resident_experts: Option<&QwenResidentExpertSidecar>,
+    hot_experts: Option<&mut QwenExpertHotCache>,
+    expert_slots: Option<&mut QwenLayerExpertSlots>,
+    prepared_experts: Option<&mut QwenPreparedExpertCache>,
+    expert_loader: Option<&mut QwenExpertFileLoader>,
     expert_packs: &mut u64,
-    stream: &mut CudaStreamOwner, blas: &CudaBlasOwner, caps: &DeviceCaps,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
+    caps: &DeviceCaps,
     trace: bool,
+    fast_decode: bool,
+    direct_expert_pack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let prefix = format!("model.language_model.layers.{layer}.mlp");
-    let router = resident.get(maps, stream, &format!("{prefix}.gate.weight"), "BF16", &[512, HIDDEN], 512 * HIDDEN * 2)?;
+    let router = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.gate.weight"),
+        "BF16",
+        &[512, HIDDEN],
+        512 * HIDDEN * 2,
+    )?;
     let gate = MoeGateArgs {
-        struct_size: size::<MoeGateArgs>(), abi_version: KERNEL_ABI_VERSION,
-        plan: MoeGatePlan::qwen38_flash(num_tokens), hidden_states: ptr(hidden_states),
-        router_weight: ptr(router), router_logits: ptr_mut(arena.router_logits.device_address()),
-        topk_weights: ptr_mut(arena.route_weights.device_address()).cast::<f32>(), topk_ids: ptr_mut(arena.route_ids.device_address()).cast::<i32>(),
-        cublas_handle: blas.raw(), cuda_stream: stream.raw(),
+        struct_size: size::<MoeGateArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: MoeGatePlan::qwen38_flash(num_tokens),
+        hidden_states: ptr(hidden_states),
+        router_weight: ptr(router),
+        router_logits: ptr_mut(arena.router_logits.device_address()),
+        topk_weights: ptr_mut(arena.route_weights.device_address()).cast::<f32>(),
+        topk_ids: ptr_mut(arena.route_ids.device_address()).cast::<i32>(),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
     };
     let router_started = Instant::now();
     native("Qwen router", unsafe { flash_moe_gate_launch(caps, &gate) })?;
+    // The SGLang top-k donor emits ten distinct IDs for T=1. Treat each rank
+    // as one compact group and let the indexed FlashInfer argument preparer
+    // read those IDs on the same CUDA stream. The fixed host IDs below validate
+    // only the ten-group shape; device IDs select the actual sidecar records.
+    // This removes 48 router synchronizations and host readbacks per token.
+    if num_tokens == 1 {
+        if let Some(sidecar) = resident_experts {
+            return run_moe_batch(
+                maps,
+                resident,
+                sidecar,
+                layer,
+                num_tokens,
+                hidden_states,
+                moe_output,
+                &DECODE_COMPACT_IDS,
+                &DECODE_COMPACT_IDS,
+                Some(arena.route_ids.device_address()),
+                arena,
+                stream,
+                blas,
+                caps,
+                trace,
+                fast_decode,
+            );
+        }
+    }
     stream.synchronize()?;
-    if trace { eprintln!("Qwen trace layer {layer} MoE: router complete"); }
+    if trace {
+        eprintln!("Qwen trace layer {layer} MoE: router complete");
+    }
     let router_seconds = router_started.elapsed().as_secs_f64();
-    let route_count = usize::try_from(num_tokens.checked_mul(TOP_K).ok_or("Qwen route count overflow")?)?;
+    let route_count = usize::try_from(
+        num_tokens
+            .checked_mul(TOP_K)
+            .ok_or("Qwen route count overflow")?,
+    )?;
     let logical = read_i32_region(&arena.route_ids, route_count)?;
     for token_routes in logical.chunks_exact(TOP_K as usize) {
         let unique = token_routes.iter().copied().collect::<BTreeSet<_>>();
@@ -1445,22 +2069,79 @@ fn run_moe(
     let union = logical.iter().copied().collect::<BTreeSet<_>>();
     let union_keys = union
         .into_iter()
-        .map(|expert| Ok(ExpertKey {
-            layer: u16::try_from(layer)?,
-            expert: u16::try_from(expert)?,
-        }))
+        .map(|expert| {
+            Ok(ExpertKey {
+                layer: u16::try_from(layer)?,
+                expert: u16::try_from(expert)?,
+            })
+        })
         .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
+    if let Some(sidecar) = resident_experts {
+        let compact_logical = union_keys
+            .iter()
+            .map(|key| i32::from(key.expert))
+            .collect::<Vec<_>>();
+        return run_moe_batch(
+            maps,
+            resident,
+            sidecar,
+            layer,
+            num_tokens,
+            hidden_states,
+            moe_output,
+            &logical,
+            &compact_logical,
+            None,
+            arena,
+            stream,
+            blas,
+            caps,
+            trace,
+            fast_decode,
+        );
+    }
+    let hot_experts = hot_experts.ok_or("Qwen hot expert cache is absent")?;
+    let expert_slots = expert_slots.ok_or("Qwen expert slot planner is absent")?;
+    let prepared_experts = prepared_experts.ok_or("Qwen prepared expert cache is absent")?;
+    let expert_loader = expert_loader.ok_or("Qwen expert file loader is absent")?;
     let prepare_started = Instant::now();
-    expert_loader.prefetch_experts(&union_keys)?;
+    if !direct_expert_pack {
+        expert_loader.prefetch_experts(&union_keys)?;
+        // Prime a short bucket's complete working set in one prepared-cache
+        // transaction when it fits the layer's fixed range.  This prevents the
+        // per-token planner from filling, evicting, and later refilling the same
+        // expert within the bucket.  Larger unions retain the bounded LRU path;
+        // expanding the fixed range would add several GiB to the Spark footprint.
+        if num_tokens > 1 && union_keys.len() <= PREPARED_SLOTS_PER_LAYER as usize {
+            let union_experts = union_keys.iter().map(|key| key.expert).collect::<Vec<_>>();
+            unsafe {
+                prepared_experts.ensure_layer(
+                    expert_loader,
+                    u16::try_from(layer)?,
+                    PREPARED_SLOTS_PER_LAYER,
+                    &union_experts,
+                )?;
+            }
+        }
+    }
     let prefetch_seconds = prepare_started.elapsed().as_secs_f64();
     if trace || prefetch_seconds >= 0.25 {
         eprintln!(
-            "Qwen layer {layer} route union: {} experts, router {:.3} s, prefetch {:.3} s",
-            union_keys.len(), router_seconds, prefetch_seconds,
+            "Qwen layer {layer} route union: {} experts, router {:.3} s, {} {:.3} s",
+            union_keys.len(),
+            router_seconds,
+            if direct_expert_pack {
+                "direct pack setup"
+            } else {
+                "prefetch"
+            },
+            prefetch_seconds,
         );
     }
-    let mut expert_slots = QwenLayerExpertSlots::new();
-    for token_offset in 0..num_tokens {
+    if !direct_expert_pack {
+        *expert_slots = QwenLayerExpertSlots::new();
+    }
+    for token_offset in moe_token_order(&logical, num_tokens) {
         let route_begin = usize::try_from(token_offset * TOP_K)?;
         let route_end = route_begin + TOP_K as usize;
         let slot_plan = expert_slots.plan(layer, &logical[route_begin..route_end])?;
@@ -1470,8 +2151,7 @@ fn run_moe(
             layer,
             hidden_states + u64::from(token_offset) * HIDDEN * 2,
             moe_output + u64::from(token_offset) * HIDDEN * 2,
-            arena.route_weights.device_address()
-                + u64::from(token_offset) * u64::from(TOP_K) * 4,
+            arena.route_weights.device_address() + u64::from(token_offset) * u64::from(TOP_K) * 4,
             &slot_plan.physical,
             &slot_plan.loads,
             arena,
@@ -1483,106 +2163,535 @@ fn run_moe(
             blas,
             caps,
             trace,
+            fast_decode,
+            direct_expert_pack,
         )?;
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_moe_batch(
+    maps: &mut FlashNextWeightMaps,
+    resident: &mut QwenResidentWeights,
+    sidecar: &QwenResidentExpertSidecar,
+    layer: u32,
+    num_tokens: u32,
+    hidden_states: u64,
+    moe_output: u64,
+    logical: &[i32],
+    compact_logical: &[i32],
+    logical_ids_device: Option<u64>,
+    arena: &mut QwenDecodeArena,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
+    caps: &DeviceCaps,
+    trace: bool,
+    fast_decode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compact_groups = u32::try_from(compact_logical.len())?;
+    if compact_groups == 0 || u64::from(compact_groups) > MAX_MOE_GROUPS {
+        return Err("Qwen resident MoE compact union exceeds the fixed arena".into());
+    }
+    static DECODE_ROUTE: OnceLock<RoutePlan> = OnceLock::new();
+    let owned_route;
+    let route = if logical_ids_device.is_some() {
+        DECODE_ROUTE.get_or_init(|| {
+            let slots = (0..TOP_K).collect::<Vec<_>>();
+            RoutePlan::build(1, TOP_K, ACTIVE_EXPERTS, &slots)
+                .expect("fixed Qwen decode route must be valid")
+        })
+    } else {
+        let compact_routes = logical
+            .iter()
+            .map(|expert| {
+                compact_logical
+                    .binary_search(expert)
+                    .map_err(|_| "Qwen logical expert is absent from its compact union")
+                    .and_then(|index| {
+                        u32::try_from(index).map_err(|_| "Qwen compact expert index overflow")
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        owned_route = RoutePlan::build(num_tokens, TOP_K, compact_groups, &compact_routes)?;
+        &owned_route
+    };
+    if route.grouped.total_rows > MOE_PADDED_ROWS
+        || route.grouped.input_scale_rows > MOE_SCALE_ROWS
+    {
+        return Err("Qwen resident MoE route exceeds the fixed batch arena".into());
+    }
+    let compact_ids_device = if let Some(device_ids) = logical_ids_device {
+        if !arena.decode_route_ready {
+            write_u32(&mut arena.route_map, &route.route_to_packed_row)?;
+            write_i32(&mut arena.m_indptr, &route.grouped.m_indptr)?;
+            arena.decode_route_ready = true;
+        }
+        device_ids
+    } else {
+        write_u32(&mut arena.route_map, &route.route_to_packed_row)?;
+        write_i32(&mut arena.m_indptr, &route.grouped.m_indptr)?;
+        write_i32(&mut arena.compact_expert_ids, compact_logical)?;
+        arena.decode_route_ready = false;
+        arena.compact_expert_ids.device_address()
+    };
+
+    let layer_u16 = u16::try_from(layer)?;
+    let layer_views = sidecar.layer_views(layer_u16)?;
+    sidecar.gather_scalars(
+        layer_u16,
+        compact_ids_device,
+        compact_groups,
+        QwenResidentExpertScalarOutputs {
+            w13_input_global_scales: arena.compact_w13_input_global_scales.device_address(),
+            w13_alpha: arena.compact_w13_alpha.device_address(),
+            w2_input_global_scales: arena.compact_w2_input_global_scales.device_address(),
+            w2_alpha: arena.compact_w2_alpha.device_address(),
+        },
+        stream,
+    )?;
+
+    let route_args = MoeRouteArgs {
+        struct_size: size::<MoeRouteArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: MoeRoutePlan::from(route.kernel_spec(HIDDEN)?),
+        token_input: ptr(hidden_states),
+        route_to_packed_row: ptr(arena.route_map.device_address()).cast::<u32>(),
+        packed_input: ptr_mut(arena.packed_input.device_address()),
+        route_weights: ptr(arena.route_weights.device_address()).cast::<f32>(),
+        packed_expert_output: ptr(arena.expert_output.device_address()),
+        token_output: ptr_mut(moe_output),
+        token_input_row_stride_bytes: HIDDEN * 2,
+        packed_row_stride_bytes: HIDDEN * 2,
+        expert_output_row_stride_bytes: HIDDEN * 2,
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen resident route dispatch", unsafe {
+        flash_moe_route_dispatch(caps, &route_args)
+    })?;
+    trace_stage(stream, trace, layer, "resident MoE route dispatch")?;
+
+    let owned_active_rows;
+    let active_rows: &[i32] = if logical_ids_device.is_some() {
+        &DECODE_ACTIVE_ROWS
+    } else {
+        owned_active_rows = route
+            .expert_rows
+            .iter()
+            .map(|rows| i32::try_from(*rows))
+            .collect::<Result<Vec<_>, _>>()?;
+        &owned_active_rows
+    };
+    let quantize = SegmentedNvfp4QuantizeArgs {
+        struct_size: size::<SegmentedNvfp4QuantizeArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: SegmentedNvfp4QuantizePlan::from(
+            SegmentedNvfp4QuantizeSpec::from_grouped_layout(&route.grouped, HIDDEN)?,
+        ),
+        input: ptr(arena.packed_input.device_address()),
+        input_global_scales: ptr(arena.compact_w13_input_global_scales.device_address())
+            .cast::<f32>(),
+        active_rows_host: active_rows.as_ptr(),
+        m_indptr_host: route.grouped.m_indptr.as_ptr(),
+        scale_row_offsets_host: route.grouped.scale_row_offsets.as_ptr(),
+        packed_output: ptr_mut(arena.input_fp4.device_address()),
+        output_scales: ptr_mut(arena.input_scales.device_address()),
+        input_row_stride_bytes: HIDDEN * 2,
+        output_row_stride_bytes: HIDDEN / 2,
+        scale_row_stride_bytes: HIDDEN / 16,
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen resident routed quantize", unsafe {
+        flash_segmented_nvfp4_quantize_launch(caps, &quantize)
+    })?;
+    trace_stage(stream, trace, layer, "resident MoE routed quantize")?;
+
+    let w13_spec = GroupedNvfp4Spec::qwen_expert_projection(
+        &route.grouped,
+        2 * INTERMEDIATE,
+        HIDDEN,
+    )?;
+    let w13_indexed_spec = IndexedGroupedNvfp4Spec::new(
+        w13_spec,
+        layer_views.experts,
+        layer_views.record_stride_bytes,
+        layer_views.record_stride_bytes,
+    )?;
+    let w13_grouped = grouped_args(
+        GroupedNvfp4Plan::from(w13_spec),
+        arena.input_fp4.device_address(),
+        arena.input_scales.device_address(),
+        layer_views.w13_weights,
+        layer_views.w13_scales,
+        arena.m_indptr.device_address(),
+        arena.compact_w13_alpha.device_address(),
+        arena.gate_up.device_address(),
+        arena.int_workspace.device_address(),
+        arena.float_workspace.device_address(),
+        2 * INTERMEDIATE,
+        HIDDEN,
+        stream.raw(),
+    );
+    let w13 = if logical_ids_device.is_some() {
+        IndexedGroupedNvfp4Args::new_device_selected(
+            w13_indexed_spec,
+            w13_grouped,
+            ptr(compact_ids_device).cast::<i32>(),
+            compact_logical,
+        )?
+    } else {
+        IndexedGroupedNvfp4Args::new(
+            w13_indexed_spec,
+            w13_grouped,
+            ptr(compact_ids_device).cast::<i32>(),
+            compact_logical,
+        )?
+    };
+    native("Qwen resident indexed gate/up", unsafe {
+        flash_indexed_grouped_nvfp4_launch(caps, &w13)
+    })?;
+    trace_stage(stream, trace, layer, "resident MoE indexed gate/up")?;
+
+    let silu = SegmentedSiluNvfp4Args {
+        struct_size: size::<SegmentedSiluNvfp4Args>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: SegmentedSiluNvfp4Plan::from(SegmentedSiluNvfp4Spec::from_grouped_layout(
+            &route.grouped,
+            INTERMEDIATE,
+        )?),
+        input: ptr(arena.gate_up.device_address()),
+        input_global_scales: ptr(arena.compact_w2_input_global_scales.device_address())
+            .cast::<f32>(),
+        active_rows_host: active_rows.as_ptr(),
+        m_indptr_host: route.grouped.m_indptr.as_ptr(),
+        scale_row_offsets_host: route.grouped.scale_row_offsets.as_ptr(),
+        packed_output: ptr_mut(arena.down_input.device_address()),
+        output_scales: ptr_mut(arena.down_scales.device_address()),
+        input_row_stride_bytes: 2 * INTERMEDIATE * 2,
+        output_row_stride_bytes: INTERMEDIATE / 2,
+        scale_row_stride_bytes: INTERMEDIATE / 16,
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen resident SiLU quantize", unsafe {
+        flash_segmented_silu_nvfp4_launch(caps, &silu)
+    })?;
+    trace_stage(stream, trace, layer, "resident MoE SiLU quantize")?;
+
+    let w2_spec = GroupedNvfp4Spec::qwen_expert_projection(
+        &route.grouped,
+        HIDDEN,
+        INTERMEDIATE,
+    )?;
+    let w2_indexed_spec = IndexedGroupedNvfp4Spec::new(
+        w2_spec,
+        layer_views.experts,
+        layer_views.record_stride_bytes,
+        layer_views.record_stride_bytes,
+    )?;
+    let w2_grouped = grouped_args(
+        GroupedNvfp4Plan::from(w2_spec),
+        arena.down_input.device_address(),
+        arena.down_scales.device_address(),
+        layer_views.w2_weights,
+        layer_views.w2_scales,
+        arena.m_indptr.device_address(),
+        arena.compact_w2_alpha.device_address(),
+        arena.expert_output.device_address(),
+        arena.int_workspace.device_address(),
+        arena.float_workspace.device_address(),
+        HIDDEN,
+        INTERMEDIATE,
+        stream.raw(),
+    );
+    let w2 = if logical_ids_device.is_some() {
+        IndexedGroupedNvfp4Args::new_device_selected(
+            w2_indexed_spec,
+            w2_grouped,
+            ptr(compact_ids_device).cast::<i32>(),
+            compact_logical,
+        )?
+    } else {
+        IndexedGroupedNvfp4Args::new(
+            w2_indexed_spec,
+            w2_grouped,
+            ptr(compact_ids_device).cast::<i32>(),
+            compact_logical,
+        )?
+    };
+    native("Qwen resident indexed down", unsafe {
+        flash_indexed_grouped_nvfp4_launch(caps, &w2)
+    })?;
+    trace_stage(stream, trace, layer, "resident MoE indexed down")?;
+
+    native("Qwen resident route finalize", unsafe {
+        flash_moe_route_finalize(caps, &route_args)
+    })?;
+    trace_stage(stream, trace, layer, "resident MoE route finalize")?;
+
+    let prefix = format!("model.language_model.layers.{layer}.mlp");
+    let shared_gate_up = resident.merged_bf16_pair(
+        maps,
+        stream,
+        &format!("{prefix}.shared_expert.gate_up_merged"),
+        &format!("{prefix}.shared_expert.gate_proj.weight"),
+        &format!("{prefix}.shared_expert.up_proj.weight"),
+        &[INTERMEDIATE, HIDDEN],
+        INTERMEDIATE * HIDDEN * 2,
+    )?;
+    let shared_down = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.shared_expert.down_proj.weight"),
+        "BF16",
+        &[HIDDEN, INTERMEDIATE],
+        HIDDEN * INTERMEDIATE * 2,
+    )?;
+    let shared_gate_weight = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.shared_expert_gate.weight"),
+        "BF16",
+        &[1, HIDDEN],
+        HIDDEN * 2,
+    )?;
+    let shared = SharedExpertArgs {
+        struct_size: size::<SharedExpertArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: SharedExpertPlan::qwen38_flash(num_tokens),
+        hidden_states: ptr(hidden_states),
+        gate_up_weight: ptr(shared_gate_up),
+        down_weight: ptr(shared_down),
+        shared_gate_weight: ptr(shared_gate_weight),
+        gate_up: ptr_mut(arena.shared_gate_up.device_address()),
+        activated: ptr_mut(arena.shared_activated.device_address()),
+        shared_gate: std::ptr::null_mut(),
+        output: ptr_mut(arena.shared_output.device_address()),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen resident shared expert", unsafe {
+        flash_shared_expert_launch(caps, &shared)
+    })?;
+    trace_stage(stream, trace, layer, "resident MoE shared expert")?;
+    let join = MoeJoinArgs {
+        struct_size: size::<MoeJoinArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: MoeJoinPlan::qwen38_flash(num_tokens),
+        hidden_states: ptr(hidden_states),
+        shared_gate_weight: ptr(shared_gate_weight),
+        shared_output: ptr(arena.shared_output.device_address()),
+        routed_output: ptr_mut(moe_output),
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen resident MoE join", unsafe {
+        flash_moe_join_launch(caps, &join)
+    })?;
+    trace_stage(stream, trace, layer, "resident MoE join")?;
+    if !fast_decode || trace {
+        stream.synchronize()?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_moe_token(
-    maps: &mut FlashNextWeightMaps, resident: &mut QwenResidentWeights,
-    layer: u32, hidden_states: u64, moe_output: u64, route_weights: u64,
-    physical: &[u32], loads: &[ExpertLoad], arena: &mut QwenDecodeArena,
+    maps: &mut FlashNextWeightMaps,
+    resident: &mut QwenResidentWeights,
+    layer: u32,
+    hidden_states: u64,
+    moe_output: u64,
+    route_weights: u64,
+    physical: &[u32],
+    loads: &[ExpertLoad],
+    arena: &mut QwenDecodeArena,
     hot_experts: &mut QwenExpertHotCache,
     prepared_experts: &mut QwenPreparedExpertCache,
     expert_loader: &mut QwenExpertFileLoader,
     expert_packs: &mut u64,
-    stream: &mut CudaStreamOwner, blas: &CudaBlasOwner, caps: &DeviceCaps,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
+    caps: &DeviceCaps,
     trace: bool,
+    fast_decode: bool,
+    direct_expert_pack: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let moe_started = Instant::now();
     let prefix = format!("model.language_model.layers.{layer}.mlp");
     let pack_started = Instant::now();
-    let misses_before = prepared_experts.stats().misses;
-    unsafe {
-        prepared_experts.prepare_and_promote_layer(
-            expert_loader,
-            hot_experts,
-            loads,
-            PREPARED_SLOTS_PER_LAYER,
-        )?;
-    }
-    let prepared_fills = prepared_experts.stats().misses - misses_before;
+    let packed_experts = if direct_expert_pack {
+        hot_experts.pack_misses(maps, loads, stream)?;
+        u64::try_from(loads.len())?
+    } else {
+        let misses_before = prepared_experts.stats().misses;
+        unsafe {
+            // Both decode and prefill already establish ownership before touching
+            // the shared hot bank: decode stays ordered on this stream, while the
+            // reference prefill path synchronizes at the end of the prior token.
+            // Keep the roughly 27-MiB promotion on the GPU for both paths instead
+            // of writing coherent hot-cache aliases from the CPU on every token.
+            prepared_experts.prepare_and_promote_layer_device(
+                expert_loader,
+                hot_experts,
+                loads,
+                PREPARED_SLOTS_PER_LAYER,
+                stream,
+            )?;
+        }
+        prepared_experts.stats().misses - misses_before
+    };
     *expert_packs = expert_packs
-        .checked_add(prepared_fills)
+        .checked_add(packed_experts)
         .ok_or("Qwen GPU expert pack counter overflow")?;
     if trace {
-        eprintln!(
-            "Qwen trace layer {layer} MoE: {prepared_fills} prepared fills, {} promotions",
-            loads.len(),
-        );
+        if direct_expert_pack {
+            eprintln!("Qwen trace layer {layer} MoE: {packed_experts} direct source-to-hot packs",);
+        } else {
+            eprintln!(
+                "Qwen trace layer {layer} MoE: {packed_experts} prepared fills, {} promotions",
+                loads.len(),
+            );
+        }
     }
     let pack_submit_seconds = pack_started.elapsed().as_secs_f64();
     if pack_submit_seconds >= 0.25 {
         eprintln!(
-            "Qwen layer {layer} prepared expert fill/promote: {:.3} s for {} experts",
+            "Qwen layer {layer} {}: {:.3} s for {} experts",
+            if direct_expert_pack {
+                "direct source-to-hot expert pack"
+            } else {
+                "prepared expert fill/promote"
+            },
             pack_submit_seconds,
             loads.len(),
         );
     }
     let route = RoutePlan::build(1, TOP_K, LAYER_EXPERT_SLOTS, physical)?;
-    if route.grouped.total_rows > MOE_PADDED_ROWS || route.grouped.input_scale_rows > MOE_SCALE_ROWS {
+    if route.grouped.total_rows > MOE_PADDED_ROWS || route.grouped.input_scale_rows > MOE_SCALE_ROWS
+    {
         return Err("Qwen decode route exceeds fixed arena".into());
     }
     write_u32(&mut arena.route_map, &route.route_to_packed_row)?;
     write_i32(&mut arena.m_indptr, &route.grouped.m_indptr)?;
     let route_args = MoeRouteArgs {
-        struct_size: size::<MoeRouteArgs>(), abi_version: KERNEL_ABI_VERSION,
-        plan: MoeRoutePlan::from(route.kernel_spec(HIDDEN)?), token_input: ptr(hidden_states),
-        route_to_packed_row: ptr(arena.route_map.device_address()).cast::<u32>(), packed_input: ptr_mut(arena.packed_input.device_address()),
-        route_weights: ptr(route_weights).cast::<f32>(), packed_expert_output: ptr(arena.expert_output.device_address()),
-        token_output: ptr_mut(moe_output), token_input_row_stride_bytes: HIDDEN * 2,
-        packed_row_stride_bytes: HIDDEN * 2, expert_output_row_stride_bytes: HIDDEN * 2, cuda_stream: stream.raw(),
+        struct_size: size::<MoeRouteArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: MoeRoutePlan::from(route.kernel_spec(HIDDEN)?),
+        token_input: ptr(hidden_states),
+        route_to_packed_row: ptr(arena.route_map.device_address()).cast::<u32>(),
+        packed_input: ptr_mut(arena.packed_input.device_address()),
+        route_weights: ptr(route_weights).cast::<f32>(),
+        packed_expert_output: ptr(arena.expert_output.device_address()),
+        token_output: ptr_mut(moe_output),
+        token_input_row_stride_bytes: HIDDEN * 2,
+        packed_row_stride_bytes: HIDDEN * 2,
+        expert_output_row_stride_bytes: HIDDEN * 2,
+        cuda_stream: stream.raw(),
     };
-    native("Qwen route dispatch", unsafe { flash_moe_route_dispatch(caps, &route_args) })?;
+    native("Qwen route dispatch", unsafe {
+        flash_moe_route_dispatch(caps, &route_args)
+    })?;
     trace_stage(stream, trace, layer, "MoE route dispatch")?;
-    let active_rows = route.expert_rows.iter().map(|rows| i32::try_from(*rows).unwrap()).collect::<Vec<_>>();
+    let active_rows = route
+        .expert_rows
+        .iter()
+        .map(|rows| i32::try_from(*rows).unwrap())
+        .collect::<Vec<_>>();
     let views = hot_experts.views();
     let quantize = SegmentedNvfp4QuantizeArgs {
-        struct_size: size::<SegmentedNvfp4QuantizeArgs>(), abi_version: KERNEL_ABI_VERSION,
-        plan: SegmentedNvfp4QuantizePlan::from(SegmentedNvfp4QuantizeSpec::from_grouped_layout(&route.grouped, HIDDEN)?),
-        input: ptr(arena.packed_input.device_address()), input_global_scales: ptr(views.w13_input_global_scales).cast::<f32>(),
-        active_rows_host: active_rows.as_ptr(), m_indptr_host: route.grouped.m_indptr.as_ptr(),
-        scale_row_offsets_host: route.grouped.scale_row_offsets.as_ptr(), packed_output: ptr_mut(arena.input_fp4.device_address()),
-        output_scales: ptr_mut(arena.input_scales.device_address()), input_row_stride_bytes: HIDDEN * 2,
-        output_row_stride_bytes: HIDDEN / 2, scale_row_stride_bytes: HIDDEN / 16, cuda_stream: stream.raw(),
+        struct_size: size::<SegmentedNvfp4QuantizeArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: SegmentedNvfp4QuantizePlan::from(SegmentedNvfp4QuantizeSpec::from_grouped_layout(
+            &route.grouped,
+            HIDDEN,
+        )?),
+        input: ptr(arena.packed_input.device_address()),
+        input_global_scales: ptr(views.w13_input_global_scales).cast::<f32>(),
+        active_rows_host: active_rows.as_ptr(),
+        m_indptr_host: route.grouped.m_indptr.as_ptr(),
+        scale_row_offsets_host: route.grouped.scale_row_offsets.as_ptr(),
+        packed_output: ptr_mut(arena.input_fp4.device_address()),
+        output_scales: ptr_mut(arena.input_scales.device_address()),
+        input_row_stride_bytes: HIDDEN * 2,
+        output_row_stride_bytes: HIDDEN / 2,
+        scale_row_stride_bytes: HIDDEN / 16,
+        cuda_stream: stream.raw(),
     };
-    native("Qwen routed quantize", unsafe { flash_segmented_nvfp4_quantize_launch(caps, &quantize) })?;
+    native("Qwen routed quantize", unsafe {
+        flash_segmented_nvfp4_quantize_launch(caps, &quantize)
+    })?;
     trace_stage(stream, trace, layer, "MoE routed quantize")?;
-    let w13 = grouped_args(GroupedNvfp4Plan::from(GroupedNvfp4Spec::qwen_expert_projection(&route.grouped, 2 * INTERMEDIATE, HIDDEN)?),
-        arena.input_fp4.device_address(), arena.input_scales.device_address(), views.w13_weights, views.w13_scales,
-        arena.m_indptr.device_address(), views.w13_alpha, arena.gate_up.device_address(), arena.int_workspace.device_address(),
-        arena.float_workspace.device_address(), 2 * INTERMEDIATE, HIDDEN, stream.raw());
-    native("Qwen grouped gate/up", unsafe { flash_grouped_nvfp4_launch(caps, &w13) })?;
+    let w13 = grouped_args(
+        GroupedNvfp4Plan::from(GroupedNvfp4Spec::qwen_expert_projection(
+            &route.grouped,
+            2 * INTERMEDIATE,
+            HIDDEN,
+        )?),
+        arena.input_fp4.device_address(),
+        arena.input_scales.device_address(),
+        views.w13_weights,
+        views.w13_scales,
+        arena.m_indptr.device_address(),
+        views.w13_alpha,
+        arena.gate_up.device_address(),
+        arena.int_workspace.device_address(),
+        arena.float_workspace.device_address(),
+        2 * INTERMEDIATE,
+        HIDDEN,
+        stream.raw(),
+    );
+    native("Qwen grouped gate/up", unsafe {
+        flash_grouped_nvfp4_launch(caps, &w13)
+    })?;
     trace_stage(stream, trace, layer, "MoE grouped gate/up")?;
     let silu = SegmentedSiluNvfp4Args {
-        struct_size: size::<SegmentedSiluNvfp4Args>(), abi_version: KERNEL_ABI_VERSION,
-        plan: SegmentedSiluNvfp4Plan::from(SegmentedSiluNvfp4Spec::from_grouped_layout(&route.grouped, INTERMEDIATE)?),
-        input: ptr(arena.gate_up.device_address()), input_global_scales: ptr(views.w2_input_global_scales).cast::<f32>(),
-        active_rows_host: active_rows.as_ptr(), m_indptr_host: route.grouped.m_indptr.as_ptr(),
-        scale_row_offsets_host: route.grouped.scale_row_offsets.as_ptr(), packed_output: ptr_mut(arena.down_input.device_address()),
-        output_scales: ptr_mut(arena.down_scales.device_address()), input_row_stride_bytes: 2 * INTERMEDIATE * 2,
-        output_row_stride_bytes: INTERMEDIATE / 2, scale_row_stride_bytes: INTERMEDIATE / 16, cuda_stream: stream.raw(),
+        struct_size: size::<SegmentedSiluNvfp4Args>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: SegmentedSiluNvfp4Plan::from(SegmentedSiluNvfp4Spec::from_grouped_layout(
+            &route.grouped,
+            INTERMEDIATE,
+        )?),
+        input: ptr(arena.gate_up.device_address()),
+        input_global_scales: ptr(views.w2_input_global_scales).cast::<f32>(),
+        active_rows_host: active_rows.as_ptr(),
+        m_indptr_host: route.grouped.m_indptr.as_ptr(),
+        scale_row_offsets_host: route.grouped.scale_row_offsets.as_ptr(),
+        packed_output: ptr_mut(arena.down_input.device_address()),
+        output_scales: ptr_mut(arena.down_scales.device_address()),
+        input_row_stride_bytes: 2 * INTERMEDIATE * 2,
+        output_row_stride_bytes: INTERMEDIATE / 2,
+        scale_row_stride_bytes: INTERMEDIATE / 16,
+        cuda_stream: stream.raw(),
     };
-    native("Qwen SiLU quantize", unsafe { flash_segmented_silu_nvfp4_launch(caps, &silu) })?;
+    native("Qwen SiLU quantize", unsafe {
+        flash_segmented_silu_nvfp4_launch(caps, &silu)
+    })?;
     trace_stage(stream, trace, layer, "MoE SiLU quantize")?;
-    let w2 = grouped_args(GroupedNvfp4Plan::from(GroupedNvfp4Spec::qwen_expert_projection(&route.grouped, HIDDEN, INTERMEDIATE)?),
-        arena.down_input.device_address(), arena.down_scales.device_address(), views.w2_weights, views.w2_scales,
-        arena.m_indptr.device_address(), views.w2_alpha, arena.expert_output.device_address(), arena.int_workspace.device_address(),
-        arena.float_workspace.device_address(), HIDDEN, INTERMEDIATE, stream.raw());
-    native("Qwen grouped down", unsafe { flash_grouped_nvfp4_launch(caps, &w2) })?;
+    let w2 = grouped_args(
+        GroupedNvfp4Plan::from(GroupedNvfp4Spec::qwen_expert_projection(
+            &route.grouped,
+            HIDDEN,
+            INTERMEDIATE,
+        )?),
+        arena.down_input.device_address(),
+        arena.down_scales.device_address(),
+        views.w2_weights,
+        views.w2_scales,
+        arena.m_indptr.device_address(),
+        views.w2_alpha,
+        arena.expert_output.device_address(),
+        arena.int_workspace.device_address(),
+        arena.float_workspace.device_address(),
+        HIDDEN,
+        INTERMEDIATE,
+        stream.raw(),
+    );
+    native("Qwen grouped down", unsafe {
+        flash_grouped_nvfp4_launch(caps, &w2)
+    })?;
     trace_stage(stream, trace, layer, "MoE grouped down")?;
-    native("Qwen route finalize", unsafe { flash_moe_route_finalize(caps, &route_args) })?;
+    native("Qwen route finalize", unsafe {
+        flash_moe_route_finalize(caps, &route_args)
+    })?;
     trace_stage(stream, trace, layer, "MoE route finalize")?;
 
     let shared_gate_up = resident.merged_bf16_pair(
@@ -1594,31 +2703,64 @@ fn run_moe_token(
         &[INTERMEDIATE, HIDDEN],
         INTERMEDIATE * HIDDEN * 2,
     )?;
-    let shared_down = resident.get(maps, stream, &format!("{prefix}.shared_expert.down_proj.weight"), "BF16", &[HIDDEN, INTERMEDIATE], HIDDEN * INTERMEDIATE * 2)?;
-    let shared_gate_weight = resident.get(maps, stream, &format!("{prefix}.shared_expert_gate.weight"), "BF16", &[1, HIDDEN], HIDDEN * 2)?;
+    let shared_down = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.shared_expert.down_proj.weight"),
+        "BF16",
+        &[HIDDEN, INTERMEDIATE],
+        HIDDEN * INTERMEDIATE * 2,
+    )?;
+    let shared_gate_weight = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.shared_expert_gate.weight"),
+        "BF16",
+        &[1, HIDDEN],
+        HIDDEN * 2,
+    )?;
     let shared = SharedExpertArgs {
-        struct_size: size::<SharedExpertArgs>(), abi_version: KERNEL_ABI_VERSION, plan: SharedExpertPlan::qwen38_flash(1),
-        hidden_states: ptr(hidden_states), gate_up_weight: ptr(shared_gate_up),
-        down_weight: ptr(shared_down), shared_gate_weight: ptr(shared_gate_weight),
-        gate_up: ptr_mut(arena.shared_gate_up.device_address()), activated: ptr_mut(arena.shared_activated.device_address()),
-        shared_gate: std::ptr::null_mut(), output: ptr_mut(arena.shared_output.device_address()), cublas_handle: blas.raw(), cuda_stream: stream.raw(),
+        struct_size: size::<SharedExpertArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: SharedExpertPlan::qwen38_flash(1),
+        hidden_states: ptr(hidden_states),
+        gate_up_weight: ptr(shared_gate_up),
+        down_weight: ptr(shared_down),
+        shared_gate_weight: ptr(shared_gate_weight),
+        gate_up: ptr_mut(arena.shared_gate_up.device_address()),
+        activated: ptr_mut(arena.shared_activated.device_address()),
+        shared_gate: std::ptr::null_mut(),
+        output: ptr_mut(arena.shared_output.device_address()),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
     };
-    native("Qwen shared expert", unsafe { flash_shared_expert_launch(caps, &shared) })?;
+    native("Qwen shared expert", unsafe {
+        flash_shared_expert_launch(caps, &shared)
+    })?;
     trace_stage(stream, trace, layer, "MoE shared expert")?;
     let join = MoeJoinArgs {
-        struct_size: size::<MoeJoinArgs>(), abi_version: KERNEL_ABI_VERSION, plan: MoeJoinPlan::qwen38_flash(1),
-        hidden_states: ptr(hidden_states), shared_gate_weight: ptr(shared_gate_weight),
-        shared_output: ptr(arena.shared_output.device_address()), routed_output: ptr_mut(moe_output), cuda_stream: stream.raw(),
+        struct_size: size::<MoeJoinArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: MoeJoinPlan::qwen38_flash(1),
+        hidden_states: ptr(hidden_states),
+        shared_gate_weight: ptr(shared_gate_weight),
+        shared_output: ptr(arena.shared_output.device_address()),
+        routed_output: ptr_mut(moe_output),
+        cuda_stream: stream.raw(),
     };
-    native("Qwen MoE join", unsafe { flash_moe_join_launch(caps, &join) })?;
+    native("Qwen MoE join", unsafe {
+        flash_moe_join_launch(caps, &join)
+    })?;
     trace_stage(stream, trace, layer, "MoE join")?;
-    stream.synchronize()?;
+    // The following layer's router synchronization is the ownership fence for
+    // the shared hot-expert bank.  Avoid a second fence here so mHC and the
+    // next attention frontend can already be queued on the same stream.
+    if !fast_decode || trace {
+        stream.synchronize()?;
+    }
     let moe_seconds = moe_started.elapsed().as_secs_f64();
     if moe_seconds >= 0.25 {
-        eprintln!(
-            "Qwen layer {layer} MoE token stages: {:.3} s",
-            moe_seconds,
-        );
+        eprintln!("Qwen layer {layer} MoE token stages: {:.3} s", moe_seconds,);
     }
     Ok(())
 }
@@ -1629,9 +2771,15 @@ fn run_ple(
     resident: &mut QwenResidentWeights,
     ple_runtime: &mut QwenPleRuntime,
     token_history: &[u32],
-    hyper: u64, state: &CoherentRegionOwner,
+    start_position: usize,
+    num_tokens: usize,
+    hyper_base: u64,
+    state: &CoherentRegionOwner,
     arena: &mut QwenDecodeArena,
-    stream: &mut CudaStreamOwner, blas: &CudaBlasOwner, caps: &DeviceCaps,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
+    caps: &DeviceCaps,
+    fast_decode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let QwenPleRuntime {
         cache,
@@ -1646,102 +2794,295 @@ fn run_ple(
         .copied()
         .map(i64::from)
         .collect::<Vec<_>>();
-    let rows = decode_row_ids(&history, 248_044, *multipliers, *sizes, *offsets)?;
+    let mut rows = Vec::with_capacity(num_tokens * QWEN_PLE_HEADS);
+    for token_offset in 0..num_tokens {
+        rows.extend_from_slice(&decode_row_ids(
+            &history[..start_position + token_offset + 1],
+            248_044,
+            *multipliers,
+            *sizes,
+            *offsets,
+        )?);
+    }
+    // Fetch the full bucket as one protected lease.  Every gather below reads
+    // this same immutable slab; the CPU cannot evict or overwrite a page until
+    // all token launches have been submitted.
     let batch = cache.fetch_rows(index, &rows)?;
-    let mut fragments = [PleRowFragment { first_offset_bytes: 0, second_offset_bytes: 0, first_bytes: 0, second_bytes: 0 }; 16];
-    batch.write_kernel_fragments(&mut fragments)?;
-    let bytes = unsafe { std::slice::from_raw_parts(fragments.as_ptr().cast::<u8>(), std::mem::size_of_val(&fragments)) };
-    unsafe { arena.ple_fragments.host_payload_mut()? }.copy_from_slice(bytes);
-    let gather = PleGatherArgs {
-        struct_size: size::<PleGatherArgs>(), abi_version: KERNEL_ABI_VERSION,
-        plan: PleGatherPlan::qwen38_flash(16), coherent_base: batch.device_base().ok_or("PLE cache not CUDA-visible")?.as_ptr(),
-        fragments: arena.ple_fragments.device_address() as usize as *const PleRowFragment,
-        output: ptr_mut(arena.ple_embedding.device_address()), output_row_stride_bytes: 320,
-        scale_bf16_bits: index.scale_bf16_bits, reserved16: 0, reserved32: 0, cuda_stream: stream.raw(),
+    let mut fragments = [PleRowFragment {
+        first_offset_bytes: 0,
+        second_offset_bytes: 0,
+        first_bytes: 0,
+        second_bytes: 0,
+    }; QWEN_PLE_HEADS * PREFILL_CHUNK_TOKENS as usize];
+    let fragments = batch.write_kernel_fragments(&mut fragments)?;
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            fragments.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(fragments),
+        )
     };
-    native("Qwen PLE gather", unsafe { flash_ple_gather_launch(caps, &gather) })?;
+    (unsafe { arena.ple_fragments.host_payload_mut()? })[..bytes.len()].copy_from_slice(bytes);
+    let coherent_base = batch
+        .device_base()
+        .ok_or("PLE cache not CUDA-visible")?
+        .as_ptr();
     let prefix = "model.language_model.layers.1.ple";
-    let key_weight = resident.get(maps, stream, &format!("{prefix}.key_proj.weight"), "BF16", &[HYPER, HIDDEN], HYPER * HIDDEN * 2)?;
-    let value_weight = resident.get(maps, stream, &format!("{prefix}.value_proj.weight"), "BF16", &[HIDDEN, HIDDEN], HIDDEN * HIDDEN * 2)?;
-    let norm_key = resident.get(maps, stream, &format!("{prefix}.norm_key.weight"), "BF16", &[HYPER], HYPER * 2)?;
-    let norm_query = resident.get(maps, stream, &format!("{prefix}.norm_query.weight"), "BF16", &[HYPER], HYPER * 2)?;
-    let norm_conv = resident.get(maps, stream, &format!("{prefix}.norm_conv.weight"), "BF16", &[HYPER], HYPER * 2)?;
-    let conv = resident.get(maps, stream, &format!("{prefix}.conv1d.weight"), "BF16", &[HYPER, 1, 4], HYPER * 4 * 2)?;
-    let ple = QwenPleBlockArgs {
-        struct_size: size::<QwenPleBlockArgs>(), abi_version: QWEN_PLE_BLOCK_ABI_VERSION, tokens: 1, reserved: 0,
-        hidden_states: ptr(hyper), embedding: ptr(arena.ple_embedding.device_address()),
-        key_weight: ptr(key_weight), value_weight: ptr(value_weight),
-        norm_key_weight: ptr(norm_key), norm_query_weight: ptr(norm_query),
-        norm_conv_weight: ptr(norm_conv), conv_weight: ptr(conv),
-        conv_state: ptr_mut(state.device_address()), key_scratch: ptr_mut(arena.ple_key.device_address()),
-        value_scratch: ptr_mut(arena.ple_value.device_address()), gated_scratch: ptr_mut(arena.ple_gated.device_address()),
-        normed_scratch: ptr_mut(arena.ple_normed.device_address()), output: ptr_mut(arena.ple_delta.device_address()),
-        cublas_handle: blas.raw(), cuda_stream: stream.raw(),
-    };
-    native("Qwen PLE block", unsafe { flash_qwen_ple_block_launch(&ple) })?;
-    glue("Qwen PLE add", arena.ple_delta.device_address(), hyper, stream, flash_qwen_add_hyper_launch)?;
-    stream.synchronize()?;
+    let key_weight = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.key_proj.weight"),
+        "BF16",
+        &[HYPER, HIDDEN],
+        HYPER * HIDDEN * 2,
+    )?;
+    let value_weight = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.value_proj.weight"),
+        "BF16",
+        &[HIDDEN, HIDDEN],
+        HIDDEN * HIDDEN * 2,
+    )?;
+    let norm_key = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.norm_key.weight"),
+        "BF16",
+        &[HYPER],
+        HYPER * 2,
+    )?;
+    let norm_query = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.norm_query.weight"),
+        "BF16",
+        &[HYPER],
+        HYPER * 2,
+    )?;
+    let norm_conv = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.norm_conv.weight"),
+        "BF16",
+        &[HYPER],
+        HYPER * 2,
+    )?;
+    let conv = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.conv1d.weight"),
+        "BF16",
+        &[HYPER, 1, 4],
+        HYPER * 4 * 2,
+    )?;
+    for token_offset in 0..num_tokens {
+        let fragment_offset = u64::try_from(
+            token_offset * QWEN_PLE_HEADS * std::mem::size_of::<PleRowFragment>(),
+        )?;
+        let gather = PleGatherArgs {
+            struct_size: size::<PleGatherArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan: PleGatherPlan::qwen38_flash(u32::try_from(QWEN_PLE_HEADS)?),
+            coherent_base,
+            fragments: (arena.ple_fragments.device_address() + fragment_offset) as usize
+                as *const PleRowFragment,
+            output: ptr_mut(arena.ple_embedding.device_address()),
+            output_row_stride_bytes: 320,
+            scale_bf16_bits: index.scale_bf16_bits,
+            reserved16: 0,
+            reserved32: 0,
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen PLE gather", unsafe {
+            flash_ple_gather_launch(caps, &gather)
+        })?;
+        let hyper = hyper_base + u64::try_from(token_offset)? * HYPER * 2;
+        let ple = QwenPleBlockArgs {
+            struct_size: size::<QwenPleBlockArgs>(),
+            abi_version: QWEN_PLE_BLOCK_ABI_VERSION,
+            tokens: 1,
+            reserved: 0,
+            hidden_states: ptr(hyper),
+            embedding: ptr(arena.ple_embedding.device_address()),
+            key_weight: ptr(key_weight),
+            value_weight: ptr(value_weight),
+            norm_key_weight: ptr(norm_key),
+            norm_query_weight: ptr(norm_query),
+            norm_conv_weight: ptr(norm_conv),
+            conv_weight: ptr(conv),
+            conv_state: ptr_mut(state.device_address()),
+            key_scratch: ptr_mut(arena.ple_key.device_address()),
+            value_scratch: ptr_mut(arena.ple_value.device_address()),
+            gated_scratch: ptr_mut(arena.ple_gated.device_address()),
+            normed_scratch: ptr_mut(arena.ple_normed.device_address()),
+            output: ptr_mut(arena.ple_delta.device_address()),
+            cublas_handle: blas.raw(),
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen PLE block", unsafe {
+            flash_qwen_ple_block_launch(&ple)
+        })?;
+        glue(
+            "Qwen PLE add",
+            arena.ple_delta.device_address(),
+            hyper,
+            stream,
+            flash_qwen_add_hyper_launch,
+        )?;
+    }
+    // T=1 decode keeps its existing asynchronous behavior. Prefill now needs
+    // one bucket fence rather than one fence per token; layer 1's MoE owns the
+    // next mandatory synchronization, but retain this final fence for the
+    // non-resident/reference path's cache lifetime contract.
+    if !fast_decode {
+        stream.synchronize()?;
+    }
     Ok(())
 }
 
 fn finish_logits(
-    maps: &mut FlashNextWeightMaps, resident: &mut QwenResidentWeights,
+    maps: &mut FlashNextWeightMaps,
+    resident: &mut QwenResidentWeights,
     hyper: u64,
-    arena: &QwenDecodeArena, stream: &mut CudaStreamOwner, blas: &CudaBlasOwner,
+    arena: &QwenDecodeArena,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
     caps: &DeviceCaps,
+    fast_decode: bool,
 ) -> Result<u32, Box<dyn std::error::Error>> {
     let prefix = "model.language_model.hyper_connection_mixer";
-    let norm = resident.get(maps, stream, &format!("{prefix}.hc_norm.weight"), "BF16", &[HYPER], HYPER * 2)?;
-    let down = resident.get(maps, stream, &format!("{prefix}.input_mix_weight_down.weight"), "BF16", &[LOWRANK, HYPER], LOWRANK * HYPER * 2)?;
-    let up = resident.get(maps, stream, &format!("{prefix}.input_mix_weight_up.weight"), "BF16", &[HYPER, LOWRANK], HYPER * LOWRANK * 2)?;
+    let norm = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.hc_norm.weight"),
+        "BF16",
+        &[HYPER],
+        HYPER * 2,
+    )?;
+    let down = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.input_mix_weight_down.weight"),
+        "BF16",
+        &[LOWRANK, HYPER],
+        LOWRANK * HYPER * 2,
+    )?;
+    let up = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.input_mix_weight_up.weight"),
+        "BF16",
+        &[HYPER, LOWRANK],
+        HYPER * LOWRANK * 2,
+    )?;
     let args = MhcArgs {
-        struct_size: size::<MhcArgs>(), abi_version: KERNEL_ABI_VERSION, plan: MhcPlan::qwen38_flash(1),
-        hyper_input: ptr(hyper), norm_weight: ptr(norm),
-        mix_down_weight: ptr(down), mix_up_weight: ptr(up),
-        inject_weight: ptr(arena.final_dummy.device_address()), block_output: ptr(arena.final_hidden.device_address()),
-        normed: ptr_mut(arena.mhc_normed.device_address()), mix_down: ptr_mut(arena.mhc_down.device_address()),
-        mix_activated: ptr_mut(arena.mhc_activated.device_address()), mix_up: ptr_mut(arena.mhc_up.device_address()),
-        mixed_output: ptr_mut(arena.final_hidden.device_address()), combined_output: ptr_mut(arena.final_combined.device_address()),
-        cublas_handle: blas.raw(), cuda_stream: stream.raw(),
+        struct_size: size::<MhcArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: MhcPlan::qwen38_flash(1),
+        hyper_input: ptr(hyper),
+        norm_weight: ptr(norm),
+        mix_down_weight: ptr(down),
+        mix_up_weight: ptr(up),
+        inject_weight: ptr(arena.final_dummy.device_address()),
+        block_output: ptr(arena.final_hidden.device_address()),
+        normed: ptr_mut(arena.mhc_normed.device_address()),
+        mix_down: ptr_mut(arena.mhc_down.device_address()),
+        mix_activated: ptr_mut(arena.mhc_activated.device_address()),
+        mix_up: ptr_mut(arena.mhc_up.device_address()),
+        mixed_output: ptr_mut(arena.final_hidden.device_address()),
+        combined_output: ptr_mut(arena.final_combined.device_address()),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
     };
-    native("Qwen final hyper mix", unsafe { flash_mhc_mix_launch(caps, &args) })?;
-    let lm_head = resident.get(maps, stream, "lm_head.weight", "BF16", &[VOCABULARY, HIDDEN], VOCABULARY * HIDDEN * 2)?;
+    native("Qwen final hyper mix", unsafe {
+        flash_mhc_mix_launch(caps, &args)
+    })?;
+    let lm_head = resident.get(
+        maps,
+        stream,
+        "lm_head.weight",
+        "BF16",
+        &[VOCABULARY, HIDDEN],
+        VOCABULARY * HIDDEN * 2,
+    )?;
     let head = QwenLmHeadArgs {
-        struct_size: size::<QwenLmHeadArgs>(), abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
-        vocabulary: VOCABULARY as u32, hidden_size: HIDDEN as u32,
-        hidden_states: ptr(arena.final_hidden.device_address()), weight: ptr(lm_head),
-        logits: ptr_mut(arena.logits.device_address()).cast::<f32>(), cublas_handle: blas.raw(), cuda_stream: stream.raw(),
+        struct_size: size::<QwenLmHeadArgs>(),
+        abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
+        vocabulary: VOCABULARY as u32,
+        hidden_size: HIDDEN as u32,
+        hidden_states: ptr(arena.final_hidden.device_address()),
+        weight: ptr(lm_head),
+        logits: ptr_mut(arena.logits.device_address()).cast::<f32>(),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
     };
     native("Qwen LM head", unsafe { flash_qwen_lm_head_launch(&head) })?;
+    if fast_decode {
+        let argmax = QwenArgmaxArgs {
+            struct_size: size::<QwenArgmaxArgs>(),
+            abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
+            elements: u32::try_from(VOCABULARY)?,
+            reserved: 0,
+            values: ptr(arena.logits.device_address()).cast::<f32>(),
+            output_index: ptr_mut(arena.next_token.device_address()).cast::<u32>(),
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen device argmax", unsafe {
+            flash_qwen_argmax_launch(&argmax)
+        })?;
+        stream.synchronize()?;
+        return read_u32_scalar(&arena.next_token);
+    }
     stream.synchronize()?;
     let values = unsafe { arena.logits.host_payload()? };
     let mut best = (0_u32, f32::NEG_INFINITY);
     for (index, bytes) in values.chunks_exact(4).enumerate() {
         let value = f32::from_ne_bytes(bytes.try_into()?);
-        if value > best.1 { best = (u32::try_from(index)?, value); }
+        if value > best.1 {
+            best = (u32::try_from(index)?, value);
+        }
     }
     Ok(best.0)
 }
 
 fn checked_tensor(
-    maps: &mut FlashNextWeightMaps, name: &str, dtype: &str, shape: &[u64], bytes: u64,
+    maps: &mut FlashNextWeightMaps,
+    name: &str,
+    dtype: &str,
+    shape: &[u64],
+    bytes: u64,
 ) -> Result<QwenTensorView, Box<dyn std::error::Error>> {
     let tensor = maps.tensor(name, 1)?;
     if tensor.dtype != dtype || tensor.shape != shape || tensor.data_bytes != bytes {
-        return Err(format!("unexpected tensor geometry for {name}: {} {:?} {}", tensor.dtype, tensor.shape, tensor.data_bytes).into());
+        return Err(format!(
+            "unexpected tensor geometry for {name}: {} {:?} {}",
+            tensor.dtype, tensor.shape, tensor.data_bytes
+        )
+        .into());
     }
     Ok(tensor)
 }
 
-fn read_checkpoint_i64(checkpoint: &FlashNextCheckpoint, name: &str) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+fn read_checkpoint_i64(
+    checkpoint: &FlashNextCheckpoint,
+    name: &str,
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
     let tensor = checkpoint.tensor(name)?;
-    if tensor.dtype != "I64" || !tensor.data_bytes.is_multiple_of(8) { return Err(format!("{name} is not i64").into()); }
+    if tensor.dtype != "I64" || !tensor.data_bytes.is_multiple_of(8) {
+        return Err(format!("{name} is not i64").into());
+    }
     let file = std::fs::File::open(checkpoint.plan.root.join(&tensor.relative_file))?;
-    let mut bytes = vec![0_u8; usize::try_from(tensor.data_bytes)?]; file.read_exact_at(&mut bytes, tensor.absolute_offset)?;
-    Ok(bytes.chunks_exact(8).map(|value| i64::from_le_bytes(value.try_into().unwrap())).collect())
+    let mut bytes = vec![0_u8; usize::try_from(tensor.data_bytes)?];
+    file.read_exact_at(&mut bytes, tensor.absolute_offset)?;
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|value| i64::from_le_bytes(value.try_into().unwrap()))
+        .collect())
 }
 
-fn initialize_rope_cache(region: &mut CoherentRegionOwner) -> Result<(), Box<dyn std::error::Error>> {
+fn initialize_rope_cache(
+    region: &mut CoherentRegionOwner,
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload = unsafe { region.host_payload_mut()? };
     let rotary_dim = usize::try_from(ROTARY_DIM)?;
     let half = rotary_dim / 2;
@@ -1764,44 +3105,79 @@ fn initialize_rope_cache(region: &mut CoherentRegionOwner) -> Result<(), Box<dyn
     Ok(())
 }
 
-fn write_i64_scalar(
+fn write_word_at<const N: usize>(
     region: &mut CoherentRegionOwner,
-    value: i64,
+    byte_offset: u64,
+    value: [u8; N],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output = unsafe { region.host_payload_mut()? };
-    if output.len() != 8 {
-        return Err("Qwen i64 scalar slab size mismatch".into());
+    let begin = usize::try_from(byte_offset)?;
+    let end = begin.checked_add(N).ok_or("Qwen metadata offset overflow")?;
+    if end > output.len() {
+        return Err("Qwen metadata write exceeds its coherent slab".into());
     }
-    output.copy_from_slice(&value.to_ne_bytes());
+    output[begin..end].copy_from_slice(&value);
     Ok(())
 }
 
-fn convert_bf16(stream: &CudaStreamOwner, input: u64, output: &CoherentRegionOwner, elements: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let args = QwenBf16ToF32Args { struct_size: size::<QwenBf16ToF32Args>(), abi_version: QWEN_GDN_AUX_ABI_VERSION,
-        input_bf16: ptr(input).cast::<u16>(), output_f32: ptr_mut(output.device_address()).cast::<f32>(), elements, cuda_stream: stream.raw() };
-    native("Qwen BF16 conversion", unsafe { flash_qwen_bf16_to_f32_launch(&args) })
-}
-
 fn glue(
-    stage: &str, input: u64, output: u64, stream: &CudaStreamOwner,
+    stage: &str,
+    input: u64,
+    output: u64,
+    stream: &CudaStreamOwner,
     launch: unsafe extern "C" fn(*const QwenDecodeGlueArgs) -> Status,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let args = QwenDecodeGlueArgs { struct_size: size::<QwenDecodeGlueArgs>(), abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
-        input: ptr(input), output: ptr_mut(output), cuda_stream: stream.raw() };
+    let args = QwenDecodeGlueArgs {
+        struct_size: size::<QwenDecodeGlueArgs>(),
+        abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
+        input: ptr(input),
+        output: ptr_mut(output),
+        cuda_stream: stream.raw(),
+    };
     native(stage, unsafe { launch(&args) })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn grouped_args(plan: GroupedNvfp4Plan, input: u64, input_scales: u64, weights: u64,
-    weight_scales: u64, m_indptr: u64, alpha: u64, output: u64, int_workspace: u64,
-    float_workspace: u64, n: u64, k: u64, stream: *mut c_void) -> GroupedNvfp4Args {
+fn grouped_args(
+    plan: GroupedNvfp4Plan,
+    input: u64,
+    input_scales: u64,
+    weights: u64,
+    weight_scales: u64,
+    m_indptr: u64,
+    alpha: u64,
+    output: u64,
+    int_workspace: u64,
+    float_workspace: u64,
+    n: u64,
+    k: u64,
+    stream: *mut c_void,
+) -> GroupedNvfp4Args {
     GroupedNvfp4Args {
-        struct_size: size::<GroupedNvfp4Args>(), abi_version: KERNEL_ABI_VERSION, plan,
-        input: Nvfp4MatrixView { packed_data: ptr(input), block_scales: ptr(input_scales), packed_row_stride_bytes: k / 2, scale_row_stride_bytes: k / 16 },
-        weights: GroupedNvfp4WeightView { packed_data: ptr(weights), block_scales: ptr(weight_scales), packed_group_stride_bytes: n * k / 2, scale_group_stride_bytes: n * k / 16 },
-        m_indptr: ptr(m_indptr).cast::<i32>(), alpha_device: ptr(alpha).cast::<f32>(), output: ptr_mut(output),
-        output_row_stride_bytes: n * 2, int_workspace: ptr_mut(int_workspace), int_workspace_bytes: WORKSPACE,
-        float_workspace: ptr_mut(float_workspace), float_workspace_bytes: WORKSPACE, cuda_stream: stream,
+        struct_size: size::<GroupedNvfp4Args>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan,
+        input: Nvfp4MatrixView {
+            packed_data: ptr(input),
+            block_scales: ptr(input_scales),
+            packed_row_stride_bytes: k / 2,
+            scale_row_stride_bytes: k / 16,
+        },
+        weights: GroupedNvfp4WeightView {
+            packed_data: ptr(weights),
+            block_scales: ptr(weight_scales),
+            packed_group_stride_bytes: n * k / 2,
+            scale_group_stride_bytes: n * k / 16,
+        },
+        m_indptr: ptr(m_indptr).cast::<i32>(),
+        alpha_device: ptr(alpha).cast::<f32>(),
+        output: ptr_mut(output),
+        output_row_stride_bytes: n * 2,
+        int_workspace: ptr_mut(int_workspace),
+        int_workspace_bytes: WORKSPACE,
+        float_workspace: ptr_mut(float_workspace),
+        float_workspace_bytes: WORKSPACE,
+        cuda_stream: stream,
     }
 }
 
@@ -1820,28 +3196,78 @@ fn read_i32_region(
         .collect())
 }
 
-fn write_u32(region: &mut CoherentRegionOwner, values: &[u32]) -> Result<(), Box<dyn std::error::Error>> { write_words(region, values.iter().map(|value| value.to_ne_bytes())) }
-fn write_i32(region: &mut CoherentRegionOwner, values: &[i32]) -> Result<(), Box<dyn std::error::Error>> { write_words(region, values.iter().map(|value| value.to_ne_bytes())) }
-fn write_identity_i32(region: &mut CoherentRegionOwner, count: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn read_u32_scalar(region: &CoherentRegionOwner) -> Result<u32, Box<dyn std::error::Error>> {
+    let payload = unsafe { region.host_payload()? };
+    if payload.len() != 4 {
+        return Err("u32 scalar slab size mismatch".into());
+    }
+    Ok(u32::from_ne_bytes(payload.try_into()?))
+}
+
+fn write_u32(
+    region: &mut CoherentRegionOwner,
+    values: &[u32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_words(region, values.iter().map(|value| value.to_ne_bytes()))
+}
+fn write_i32(
+    region: &mut CoherentRegionOwner,
+    values: &[i32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_words(region, values.iter().map(|value| value.to_ne_bytes()))
+}
+fn write_identity_i32(
+    region: &mut CoherentRegionOwner,
+    count: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let output = unsafe { region.host_payload_mut()? };
     let expected = usize::try_from(count.checked_mul(4).ok_or("identity slab size overflow")?)?;
-    if output.len() != expected { return Err("identity slab size mismatch".into()); }
+    if output.len() != expected {
+        return Err("identity slab size mismatch".into());
+    }
     for (index, word) in output.chunks_exact_mut(4).enumerate() {
         word.copy_from_slice(&i32::try_from(index)?.to_ne_bytes());
     }
     Ok(())
 }
-fn write_words<const N: usize>(region: &mut CoherentRegionOwner, values: impl Iterator<Item = [u8; N]>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut bytes = Vec::new(); for value in values { bytes.extend_from_slice(&value); }
-    let output = unsafe { region.host_payload_mut()? }; if output.len() != bytes.len() { return Err("word slab size mismatch".into()); } output.copy_from_slice(&bytes); Ok(())
+fn write_words<const N: usize>(
+    region: &mut CoherentRegionOwner,
+    values: impl Iterator<Item = [u8; N]>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    for value in values {
+        bytes.extend_from_slice(&value);
+    }
+    let output = unsafe { region.host_payload_mut()? };
+    if bytes.len() > output.len() {
+        return Err("word slab size mismatch".into());
+    }
+    output[..bytes.len()].copy_from_slice(&bytes);
+    Ok(())
 }
 
-fn slab(bytes: u64) -> Result<CoherentRegionOwner, Box<dyn std::error::Error>> { Ok(CoherentRegionOwner::slab(bytes, 256, 0)?) }
-fn size<T>() -> u32 { u32::try_from(std::mem::size_of::<T>()).unwrap() }
-fn ptr(address: u64) -> *const c_void { address as usize as *const c_void }
-fn ptr_mut(address: u64) -> *mut c_void { address as usize as *mut c_void }
+fn slab(bytes: u64) -> Result<CoherentRegionOwner, Box<dyn std::error::Error>> {
+    Ok(CoherentRegionOwner::slab(bytes, 256, 0)?)
+}
+fn size<T>() -> u32 {
+    u32::try_from(std::mem::size_of::<T>()).unwrap()
+}
+fn ptr(address: u64) -> *const c_void {
+    address as usize as *const c_void
+}
+fn ptr_mut(address: u64) -> *mut c_void {
+    address as usize as *mut c_void
+}
 fn native(stage: &str, status: Status) -> Result<(), Box<dyn std::error::Error>> {
-    if status.code == 0 { return Ok(()); }
-    let message = if status.message.is_null() { "native error".to_owned() } else { unsafe { CStr::from_ptr(status.message) }.to_string_lossy().into_owned() };
+    if status.code == 0 {
+        return Ok(());
+    }
+    let message = if status.message.is_null() {
+        "native error".to_owned()
+    } else {
+        unsafe { CStr::from_ptr(status.message) }
+            .to_string_lossy()
+            .into_owned()
+    };
     Err(format!("{stage}: {message} (status {})", status.code).into())
 }
