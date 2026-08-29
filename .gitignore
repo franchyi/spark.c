@@ -9,3 +9,5 @@ build/
 dist/
 target/
 compile_commands.json
+engines/*/.native.pid
+engines/*/.server.pid

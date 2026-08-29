@@ -2,21 +2,45 @@
 
 ## 1. Product boundary
 
-SparkServe serves one low-concurrency, long-context model on a DGX Spark. It is
-latency-first and memory-deterministic. It exposes an OpenAI-compatible API, but
-the initial milestone is a token-by-token-correct offline runner.
+SparkServe is three model-specific engines for one low-concurrency, long-context
+model at a time on DGX Spark. It is not one general model runtime. Each engine is
+latency-first, memory-deterministic, and exposes the same minimum
+OpenAI-compatible surface, but may use the shortest proven implementation for
+its graph.
+
+| Capsule | First shipping implementation | Native direction |
+| --- | --- | --- |
+| Qwen3.8-27B NVFP4 | pinned MiaAI/SGLang Spark recipe | extract only measured GDN, full-attention, dense-NVFP4, and MTP boundaries |
+| Qwen3.8-Flash-Next NVFP4 | SparkServe Rust/CUDA | retain model-local GDN, QSA, PLE, mHC, MoE, and state scheduling |
+| GLM-5.3-Flash Q2 GGUF | pristine pinned ds4 C/CUDA | optional Rust admission layer around one long-lived ds4 context |
+
+The capsules share directory shape, environment vocabulary, API minimums,
+benchmark reporting, and provenance rules. They deliberately do not share a
+model trait, dynamic operator graph, tensor registry, allocator, or kernel
+dispatcher. Small duplicated glue is preferred to an abstraction that couples
+three different graphs or brings unused dependencies onto the edge device. See
+`engines/CONTRACT.md` for the integration boundary.
 
 We reuse file formats, tokenizers, model metadata, and proven kernel libraries.
-We do not inherit a general-purpose serving framework's allocator or scheduler.
-The running SGLang deployment and llama.cpp/DS4 are treated as test oracles.
+We do not inherit a general-purpose serving framework's allocator or scheduler
+in a native engine. SGLang/vLLM deployments are test oracles; ds4 is both the
+shipping GLM engine and its oracle.
 
 ## 2. Runtime split
 
-One Rust process handles configuration, tokenization, request admission, SSE,
-the OpenAI API, model state, storage I/O, and scheduling. C++/CUDA owns only the
-hot kernels behind a stable C ABI of opaque device pointers and CUDA streams.
-Python is an offline `uv`-managed tool layer for checkpoint inspection,
-conversion, benchmarks, and oracle comparisons; it is not shipped in the server.
+The Rust/CUDA split applies to the native Flash-Next capsule, not as a mandate
+for all engines. Its Rust process handles configuration, tokenization, request
+admission, SSE, the OpenAI API, model state, storage I/O, and scheduling.
+C++/CUDA owns only hot arithmetic behind stable C ABIs of opaque pointers and
+CUDA streams. Python is an offline `uv`-managed tool layer for checkpoint
+inspection, conversion, benchmarks, and oracle comparisons; it is not shipped
+in that server.
+
+Qwen3.8-27B initially runs the pinned SGLang container unchanged so there is a
+fast, measurable service before native extraction. GLM Q2 executes ds4 directly
+because replacing its complete C/CUDA graph and server with Rust adds risk but
+no demonstrated performance benefit. Rust may later wrap ds4 for admission and
+fair scheduling without taking ownership of its model kernels.
 
 The kernel ABI is versioned independently from the Rust crate. Every argument
 struct carries `struct_size` and `abi_version`, so an old runtime fails before a
@@ -24,20 +48,20 @@ new library can reinterpret fields. Kernel discovery is allocation-free: shape,
 padding, scale layout, device capability, workspace, availability, and source
 revision can be queried before weights are mapped.
 
-The runtime has five components:
+The native Flash-Next runtime has five components:
 
-- **Model IR:** a small set of operations covering GDN, QSA, KDA, DSA/MLA,
-  hyper-connections, top-k MoE, sparse PLE lookup, MTP, and quantized linears.
+- **Compiled model graph:** the fixed Flash-Next sequence covering GDN, QSA,
+  mHC, top-k MoE, sparse PLE lookup, MTP, and quantized linears.
 - **Spark Weight Fabric:** explicit resident, sparse-row, and block-paged stores.
 - **Graph scheduler:** fixed-address CUDA graphs for decode and bounded prefill
   shapes, with a single latency-oriented request lane first.
-- **Kernel registry:** GB10/SM121 implementations selected by shape and format.
+- **Kernel bindings:** compile-time GB10/SM121 implementations for exact shapes.
 - **State manager:** paged KV, recurrent GDN state, radix-prefix state, and MTP
   draft state with one memory budget.
 
-The Rust binary is statically specialized by model family. It does not implement
-a dynamic operator graph or a plugin system in milestone one. Every abstraction
-must either remove duplicated format/model code or disappear from the decode path.
+The Rust binary is statically specialized for Flash-Next. It does not implement
+a dynamic operator graph or a plugin system. Every abstraction must either
+remove duplicated code inside that capsule or disappear from the decode path.
 
 The control-plane boundary also follows the reuse rule. Hugging Face
 `tokenizers` 0.23.1 supplies the checkpoint's byte-level BPE, added-token, and

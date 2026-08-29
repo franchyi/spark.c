@@ -1,0 +1,34 @@
+schema = 1
+id = "glm53-q2"
+display_name = "GLM-5.3-Flash Q2"
+model_family = "glm-5.3-flash"
+checkpoint_format = "gguf-q2"
+stage = "accepted"
+default_port = 8010
+
+[checkpoint]
+default = "antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf"
+bytes = 96505816384
+sha256 = "e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32"
+
+[runtime]
+shipping_backend = "ds4-c-cuda-pinned"
+cuda_arch = "sm_121"
+context = 2048
+max_output_tokens = 128
+
+[capabilities]
+models = true
+chat_completions = true
+chat_sse = true
+responses = true
+vision = false
+reasoning = false
+tool_calling = false
+
+[[sources]]
+role = "shipping-engine"
+name = "antirez/ds4"
+url = "https://github.com/antirez/ds4.git"
+revision = "a60a2a0d25137a849a101e04e86ea830a346073a"
+license = "MIT"

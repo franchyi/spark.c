@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_void};
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use sparkserve_runtime::checkpoint::{FlashNextCheckpoint, load_flash_next_checkpoint};
@@ -178,7 +178,6 @@ struct QwenDecodeArena {
     shared_gate_up: CoherentRegionOwner,
     shared_activated: CoherentRegionOwner,
     shared_output: CoherentRegionOwner,
-    ple_cache: CoherentRegionOwner,
     ple_fragments: CoherentRegionOwner,
     ple_embedding: CoherentRegionOwner,
     ple_key: CoherentRegionOwner,
@@ -274,7 +273,6 @@ impl QwenDecodeArena {
             shared_gate_up: slab(2 * INTERMEDIATE * 2)?,
             shared_activated: slab(INTERMEDIATE * 2)?,
             shared_output: slab(HIDDEN * 2)?,
-            ple_cache: slab(4 * 1024 * 1024)?,
             ple_fragments: slab(u64::try_from(std::mem::size_of::<PleRowFragment>() * 16)?)?,
             ple_embedding: slab(HIDDEN * 2)?,
             ple_key: slab(HYPER * 2)?,
@@ -286,6 +284,64 @@ impl QwenDecodeArena {
             final_hidden: slab(HIDDEN * 2)?,
             final_combined: slab(HYPER * 2)?,
             logits: slab(VOCABULARY * 4)?,
+        })
+    }
+}
+
+/// One sequence-independent PLE storage owner. Field order is intentional:
+/// the fixed reader and its registered `io_uring` are dropped before the
+/// coherent region that backs their stable host/device aliases.
+struct QwenPleRuntime {
+    cache: FixedPleCache<'static>,
+    index: PleIndex,
+    multipliers: [i64; 3],
+    sizes: [i64; 16],
+    offsets: [i64; 16],
+    _region: Box<CoherentRegionOwner>,
+}
+
+impl QwenPleRuntime {
+    fn create(
+        checkpoint: &FlashNextCheckpoint,
+        model_root: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let index = PleIndex::decode(&std::fs::read(
+            model_root.join(".sparkserve/ple.ssple"),
+        )?)?;
+        let multipliers = read_checkpoint_i64(
+            checkpoint,
+            "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
+        )?
+        .try_into()
+        .map_err(|_| "bad PLE multipliers")?;
+        let sizes = read_checkpoint_i64(
+            checkpoint,
+            "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes",
+        )?
+        .try_into()
+        .map_err(|_| "bad PLE sizes")?;
+        let offsets = read_checkpoint_i64(
+            checkpoint,
+            "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets",
+        )?
+        .try_into()
+        .map_err(|_| "bad PLE offsets")?;
+
+        let region = Box::new(slab(4 * 1024 * 1024)?);
+        // SAFETY: `region` is boxed before this reference is formed, so the
+        // native mapping and the embedded view remain at stable addresses.
+        // `_region` is declared after `cache`, which guarantees that the ring
+        // and its borrowed fixed buffer are destroyed before the mapping.
+        let view: &'static sparkserve_runtime::ffi::CoherentRegionView =
+            unsafe { &*(region.view() as *const _) };
+        let cache = unsafe { FixedPleCache::open_coherent(&index, model_root, view, 32)? };
+        Ok(Self {
+            cache,
+            index,
+            multipliers,
+            sizes,
+            offsets,
+            _region: region,
         })
     }
 }
@@ -486,9 +542,7 @@ pub struct QwenNativeEngine {
     stream: CudaStreamOwner,
     blas: CudaBlasOwner,
     caps: DeviceCaps,
-    checkpoint: FlashNextCheckpoint,
     weight_maps: FlashNextWeightMaps,
-    model_root: PathBuf,
     resident: QwenResidentWeights,
     hidden: CoherentRegionOwner,
     hyper_a: CoherentRegionOwner,
@@ -496,6 +550,7 @@ pub struct QwenNativeEngine {
     gdn_conv_states: CoherentRegionOwner,
     gdn_temporal_states: CoherentRegionOwner,
     ple_state: CoherentRegionOwner,
+    ple: QwenPleRuntime,
     qsa_index_key_states: CoherentRegionOwner,
     qsa_rope_positions: CoherentRegionOwner,
     qsa_compressed_keys: CoherentRegionOwner,
@@ -511,6 +566,7 @@ pub struct QwenNativeEngine {
 impl QwenNativeEngine {
     pub fn create(model_root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let checkpoint = load_flash_next_checkpoint(model_root)?;
+        let ple = QwenPleRuntime::create(&checkpoint, model_root)?;
         let expert_loader = QwenExpertFileLoader::new(&checkpoint);
         let weight_maps = FlashNextWeightMaps::new(&checkpoint, 0);
         let mut hot_experts = QwenExpertHotCache::create(0)?;
@@ -525,9 +581,7 @@ impl QwenNativeEngine {
             stream: CudaStreamOwner::create()?,
             blas: CudaBlasOwner::create()?,
             caps: DeviceCaps::gb10(QSA_WORKSPACE),
-            checkpoint,
             weight_maps,
-            model_root: model_root.to_path_buf(),
             resident: QwenResidentWeights::new(),
             hidden: slab(PREFILL_CHUNK_TOKENS * HIDDEN * 2)?,
             hyper_a: slab(PREFILL_CHUNK_TOKENS * HYPER * 2)?,
@@ -535,6 +589,7 @@ impl QwenNativeEngine {
             gdn_conv_states: slab(36 * GDN_CONV_WIDTH * 3 * 2)?,
             gdn_temporal_states: slab(36 * VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2)?,
             ple_state: slab(HYPER * 9 * 2)?,
+            ple,
             qsa_index_key_states: slab(
                 QSA_LAYERS
                     * u64::try_from(QWEN_MODEL_MAX_LENGTH)?
@@ -672,10 +727,9 @@ impl QwenNativeEngine {
             if layer == 1 {
                 for token_offset in 0..input_tokens.len() {
                     run_ple(
-                        &self.checkpoint,
                         &mut self.weight_maps,
                         &mut self.resident,
-                        &self.model_root,
+                        &mut self.ple,
                         &self.token_history[..start_position + token_offset + 1],
                         current.device_address() + u64::try_from(token_offset)? * HYPER * 2,
                         &self.ple_state,
@@ -1549,25 +1603,29 @@ fn run_moe_token(
 
 #[allow(clippy::too_many_arguments)]
 fn run_ple(
-    checkpoint: &FlashNextCheckpoint, maps: &mut FlashNextWeightMaps,
+    maps: &mut FlashNextWeightMaps,
     resident: &mut QwenResidentWeights,
-    model_root: &Path, token_history: &[u32],
+    ple_runtime: &mut QwenPleRuntime,
+    token_history: &[u32],
     hyper: u64, state: &CoherentRegionOwner,
     arena: &mut QwenDecodeArena,
     stream: &mut CudaStreamOwner, blas: &CudaBlasOwner, caps: &DeviceCaps,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let multipliers: [i64; 3] = read_checkpoint_i64(checkpoint, "model.language_model.layers.1.ple.ple_embedding.layer_multipliers")?.try_into().map_err(|_| "bad PLE multipliers")?;
-    let sizes: [i64; 16] = read_checkpoint_i64(checkpoint, "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes")?.try_into().map_err(|_| "bad PLE sizes")?;
-    let offsets: [i64; 16] = read_checkpoint_i64(checkpoint, "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets")?.try_into().map_err(|_| "bad PLE offsets")?;
+    let QwenPleRuntime {
+        cache,
+        index,
+        multipliers,
+        sizes,
+        offsets,
+        ..
+    } = ple_runtime;
     let history = token_history
         .iter()
         .copied()
         .map(i64::from)
         .collect::<Vec<_>>();
-    let rows = decode_row_ids(&history, 248_044, multipliers, sizes, offsets)?;
-    let index = PleIndex::decode(&std::fs::read(model_root.join(".sparkserve/ple.ssple"))?)?;
-    let mut cache = unsafe { FixedPleCache::open_coherent(&index, model_root, arena.ple_cache.view(), 32)? };
-    let batch = cache.fetch_rows(&index, &rows)?;
+    let rows = decode_row_ids(&history, 248_044, *multipliers, *sizes, *offsets)?;
+    let batch = cache.fetch_rows(index, &rows)?;
     let mut fragments = [PleRowFragment { first_offset_bytes: 0, second_offset_bytes: 0, first_bytes: 0, second_bytes: 0 }; 16];
     batch.write_kernel_fragments(&mut fragments)?;
     let bytes = unsafe { std::slice::from_raw_parts(fragments.as_ptr().cast::<u8>(), std::mem::size_of_val(&fragments)) };

@@ -16,6 +16,24 @@ The ordered model targets are:
 4. `unsloth/GLM-5.3-Flash-GGUF:UD-IQ3_XXS` as the explicitly paged 3-bit MoE
    profile; `UD-Q3_K_XL` follows as a higher-quality stretch target.
 
+## Three engines, one operational contract
+
+The first product layout is now under [`engines/`](engines/README.md):
+
+- [`qwen38-27b`](engines/qwen38-27b/README.md) pins the MiaAI-Lab SGLang Spark
+  recipe as the fast 27B oracle and isolates later native extraction.
+- [`qwen38-flash-next`](engines/qwen38-flash-next/README.md) owns the existing
+  SparkServe Rust/CUDA graph and pins the Blazux vLLM mmap deployment as an
+  independent oracle.
+- [`glm53-q2`](engines/glm53-q2/README.md) ships the accepted pristine ds4
+  C/CUDA service; Rust admission/scheduling can be added around its long-lived
+  model context only after measurement.
+
+The engines intentionally do not share a model abstraction or tensor registry.
+They share only the small build/serve/smoke/bench contract documented in
+[`engines/CONTRACT.md`](engines/CONTRACT.md). Run it through the optional thin
+dispatcher, for example `./engines/bin/spark-engine glm53-q2 provenance`.
+
 SparkServe intentionally has two checkpoint-format families: ModelOpt NVFP4 in
 safetensors and quantized GGUF blocks. Qwen4-exp and GLM5Next are model graphs
 inside the same runtime, not separate serving stacks.

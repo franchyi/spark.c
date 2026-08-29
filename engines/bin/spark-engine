@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+ENGINES_DIR="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+usage: spark-engine list
+       spark-engine ENGINE {build|serve|smoke|bench|stop|provenance}
+
+engines:
+  qwen38-27b
+  qwen38-flash-next
+  glm53-q2
+EOF
+}
+
+if [[ $# -eq 1 && "$1" == "list" ]]; then
+  printf '%s\n' qwen38-27b qwen38-flash-next glm53-q2
+  exit 0
+fi
+
+if [[ $# -ne 2 ]]; then
+  usage >&2
+  exit 64
+fi
+
+engine="$1"
+action="$2"
+case "${engine}" in
+  qwen38-27b|qwen38-flash-next|glm53-q2) ;;
+  *)
+    echo "unknown engine: ${engine}" >&2
+    usage >&2
+    exit 64
+    ;;
+esac
+case "${action}" in
+  build|serve|smoke|bench|stop|provenance) ;;
+  *)
+    echo "unknown action: ${action}" >&2
+    usage >&2
+    exit 64
+    ;;
+esac
+
+exec make --no-print-directory -C "${ENGINES_DIR}/${engine}" "${action}"

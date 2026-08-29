@@ -1,9 +1,10 @@
-# Standalone acceptance contract
+# Model-specific acceptance contract
 
-The Qwen native runtime remains a Rust binary plus linked CUDA code. The first
-complete GLM release is the separately pinned ds4 Q2 service described below.
-Python, Torch, SGLang, llama.cpp, Triton, and TVM-FFI may generate fixtures or
-supply build-time source, but none may be loaded by either serving process.
+The first release contains three independently accepted capsules. Qwen3.8-27B
+initially ships a pinned SGLang Spark recipe, Qwen3.8 Flash-Next remains a Rust
+binary plus linked CUDA code, and GLM-5.3 Q2 ships the separately pinned ds4
+service. A framework-free-process requirement applies to native capsules, not
+to an explicitly identified oracle-backed first release.
 
 ## Shared gates
 
@@ -11,17 +12,42 @@ supply build-time source, but none may be loaded by either serving process.
    layout, tokenizer, architecture, or quantization contract before GPU launch.
 2. `/v1/models`, non-streaming `/v1/chat/completions`, and SSE streaming are
    compatible with the OpenAI request/response shapes used by the smoke suite.
-3. Admission control has a measured hard unified-memory ceiling. Allocation,
-   mapped-file residency, cache occupancy, evictions, NVMe bytes, and OOM
-   rejections are observable per request.
-4. Decode is CUDA-graph safe. Storage misses execute outside captured graphs and
+3. Each launch profile has a measured hard unified-memory ceiling. In a native
+   engine, allocation, mapped-file residency, cache occupancy, evictions, NVMe
+   bytes, and OOM rejections are observable per request.
+4. Native decode is CUDA-graph safe. Storage misses execute outside captured graphs and
    re-enter only after all GPU addresses are stable.
-5. Every arithmetic donor is locked by repository commit and license, exposed
-   through the C ABI, and covered by isolated parity plus continuation fixtures.
+5. Every native arithmetic donor is locked by repository commit and license,
+   exposed through the C ABI, and covered by isolated parity plus continuation
+   fixtures.
 6. A release build and container are reproducible from the repository and pinned
-   source checkouts. `ldd` and process inspection show no oracle framework.
+   source checkouts. For a native capsule, `ldd` and process inspection show no
+   oracle framework; an oracle-backed capsule records that dependency directly.
 7. Benchmarks report cold/warm prefill, decode, time-to-first-token, peak unified
    memory, and NVMe bytes per token on the same prompts and thermal state.
+
+## Qwen3.8-27B NVFP4
+
+Locked recipe: `MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark` at revision
+`751e29eb6a3057ccfd8f992f87dfc260787e05a1`.
+
+- Default checkpoint is `RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead`; the packed
+  NVFP4 lm-head variant is an explicit alternate profile.
+- The accepted baseline keeps FlashInfer attention for SM121, FP8 E4M3 KV,
+  BF16 GDN state, 8192-token chunked prefill, disabled prefill CUDA graphs, and
+  the measured four-state-slot-per-request pool.
+- Resident MTP `3/1/4` is accepted before optional DFlash2. DFlash2 must retain
+  the measured `0.90` memory fraction and must never repeat the `0.95` profile
+  that hard-rebooted the reference Spark.
+- `/v1/models`, Chat Completions, SSE, reasoning control, and tool calls are
+  accepted against the pinned SGLang service on port 8888.
+- The upstream code/prose single-stream and concurrency sweeps are recorded
+  before any native extraction, so each borrowed boundary has a real baseline.
+
+The recipe's Linux/arm64 container is locked to
+`sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6`.
+The capsule is not promoted from `pinned-oracle` to `accepted` until its image
+configuration/SBOM and actual Spark service results are recorded.
 
 ## Qwen3.8 Flash-Next NVFP4
 

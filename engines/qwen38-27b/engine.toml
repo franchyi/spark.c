@@ -1,0 +1,40 @@
+schema = 1
+id = "qwen38-27b"
+display_name = "Qwen3.8-27B NVFP4"
+model_family = "qwen3.8"
+checkpoint_format = "modelopt-nvfp4-safetensors"
+stage = "pinned-oracle"
+default_port = 8888
+
+[checkpoint]
+default = "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
+alternative = "RadixArk/Qwen3.8-27B-NVFP4"
+
+[runtime]
+shipping_backend = "sglang-pinned-recipe"
+attention = "flashinfer"
+kv_cache_dtype = "fp8_e4m3"
+gdn_state_dtype = "bfloat16"
+
+[capabilities]
+models = true
+chat_completions = true
+chat_sse = true
+responses = false
+vision = true
+reasoning = true
+tool_calling = true
+
+[[sources]]
+role = "oracle"
+name = "MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark"
+url = "https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark.git"
+revision = "751e29eb6a3057ccfd8f992f87dfc260787e05a1"
+license = "MIT"
+
+[[sources]]
+role = "oracle-container"
+name = "lmsysorg/sglang:qwen38-27b"
+revision = "sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6"
+platform = "linux/arm64"
+license = "mixed; see image SBOM"
