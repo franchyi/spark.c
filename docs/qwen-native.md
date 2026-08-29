@@ -20,7 +20,6 @@ Outputs are placed under `build/`:
 
 - `libsparkserve-fabric.so`
 - `libsparkserve-qwen-runtime.so`
-- `libsparkserve-qsa.so`
 - `libtvm_ffi.so`
 - `bin/qwen_first_token`
 - `bin/qwen_decode`

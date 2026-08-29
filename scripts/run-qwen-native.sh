@@ -12,7 +12,6 @@ for required in \
   "$binary" \
   "$repo_root/build/libsparkserve-fabric.so" \
   "$repo_root/build/libsparkserve-qwen-runtime.so" \
-  "$repo_root/build/libsparkserve-qsa.so" \
   "$repo_root/build/libtvm_ffi.so" \
   "$model_root/config.json" \
   "$model_root/tokenizer.json" \

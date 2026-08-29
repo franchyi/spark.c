@@ -692,7 +692,7 @@ $(CUDA_QWEN_DECODE_GLUE_SHARED): csrc/cuda/qwen_decode_glue.cu csrc/include/spar
 		csrc/cuda/qwen_decode_glue.cu -lcublas -lcudart \
 		-o $(CUDA_QWEN_DECODE_GLUE_SHARED)
 
-$(CUDA_QWEN_RUNTIME_SHARED): csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc csrc/cuda/gdn_decode.cu csrc/cuda/gdn_decode_flashinfer_cute.cc csrc/cuda/gdn_block_sglang.cu csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/cuda/moe_gate_sglang.cu csrc/cuda/shared_expert_sglang.cu csrc/cuda/moe_join_sglang.cu csrc/cuda/mhc_sglang.cu csrc/cuda/ple_gather.cu csrc/cuda/qwen_expert_pack.cu csrc/cuda/qwen_gdn_aux.cu csrc/cuda/qwen_qsa_block.cu csrc/cuda/qwen_ple_block.cu csrc/cuda/qwen_decode_glue.cu csrc/include/sparkserve/kernel_api.h csrc/include/sparkserve/qwen_runtime_api.h
+$(CUDA_QWEN_RUNTIME_SHARED): $(CUDA_QSA_DECODE_XQA_MHA_OBJECT) $(CUDA_QSA_SCORE_OBJECT) csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc csrc/cuda/gdn_decode.cu csrc/cuda/gdn_decode_flashinfer_cute.cc csrc/cuda/gdn_block_sglang.cu csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/cuda/moe_gate_sglang.cu csrc/cuda/shared_expert_sglang.cu csrc/cuda/moe_join_sglang.cu csrc/cuda/mhc_sglang.cu csrc/cuda/ple_gather.cu csrc/cuda/qsa_index_prep_sglang.cu csrc/cuda/qsa_topk_sglang.cu csrc/cuda/qsa_expand_sglang.cu csrc/cuda/qsa_kv_pack_sglang.cu csrc/cuda/qsa_decode_xqa_flashinfer.cu csrc/cuda/qwen_expert_pack.cu csrc/cuda/qwen_gdn_aux.cu csrc/cuda/qwen_qsa_block.cu csrc/cuda/qwen_ple_block.cu csrc/cuda/qwen_decode_glue.cu csrc/include/sparkserve/kernel_api.h csrc/include/sparkserve/qwen_runtime_api.h
 	test -n "$(GDN_AOT_OBJECT)"
 	test -n "$(GDN_PREFILL_AOT_OBJECTS)"
 	test -n "$(CUTE_NVFP4_OBJECT)"
@@ -704,7 +704,7 @@ $(CUDA_QWEN_RUNTIME_SHARED): csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc
 	test -f "$(CUTE_NVFP4_OBJECT)"
 	test -f "$(CUTE_NVFP4_QUANTIZE_OBJECT)"
 	mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) --use_fast_math $(FLASHINFER_ARCH_FLAGS) -diag-suppress 177 \
+	$(NVCC) $(NVCCFLAGS) $(QWEN_XQA_FLAGS) --use_fast_math $(FLASHINFER_ARCH_FLAGS) -diag-suppress 177 \
 		-diag-suppress 549 -shared -Xcompiler=-fPIC \
 		-DSPARKSERVE_WITH_CUDA \
 		-DSPARKSERVE_WITH_FLASHINFER_GDN_AOT \
@@ -719,7 +719,13 @@ $(CUDA_QWEN_RUNTIME_SHARED): csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc
 		-DSPARKSERVE_WITH_SGLANG_FUSED_MOE_JOIN \
 		-DSPARKSERVE_WITH_SGLANG_CUBLAS_MHC \
 		-DSPARKSERVE_WITH_SGLANG_PLE_GATHER \
-		-Icsrc/include -Icsrc $(FLASHINFER_INCLUDES) -I$(TVM_FFI_ROOT)/include \
+		-DSPARKSERVE_WITH_SGLANG_QSA_INDEX_PREP \
+		-DSPARKSERVE_WITH_SGLANG_QSA_TOPK \
+		-DSPARKSERVE_WITH_SGLANG_QSA_EXPAND \
+		-DSPARKSERVE_WITH_TILELANG_QSA_SCORE \
+		-DSPARKSERVE_WITH_SGLANG_QSA_KV_PACK \
+		-DSPARKSERVE_WITH_FLASHINFER_XQA_DECODE \
+		-Icsrc/include -Icsrc $(FLASHINFER_INCLUDES) $(FLASHINFER_XQA_INCLUDE) -I$(TVM_FFI_ROOT)/include \
 		csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc \
 		csrc/cuda/gdn_decode.cu \
 		csrc/cuda/gdn_decode_flashinfer_cute.cc csrc/cuda/gdn_block_sglang.cu \
@@ -727,11 +733,15 @@ $(CUDA_QWEN_RUNTIME_SHARED): csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc
 		csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu \
 		csrc/cuda/moe_gate_sglang.cu csrc/cuda/shared_expert_sglang.cu \
 		csrc/cuda/moe_join_sglang.cu csrc/cuda/mhc_sglang.cu \
-		csrc/cuda/ple_gather.cu csrc/cuda/qwen_expert_pack.cu \
+		csrc/cuda/ple_gather.cu csrc/cuda/qsa_index_prep_sglang.cu \
+		csrc/cuda/qsa_topk_sglang.cu csrc/cuda/qsa_expand_sglang.cu \
+		csrc/cuda/qsa_kv_pack_sglang.cu csrc/cuda/qsa_decode_xqa_flashinfer.cu \
+		csrc/cuda/qwen_expert_pack.cu \
 		csrc/cuda/qwen_gdn_aux.cu csrc/cuda/qwen_qsa_block.cu \
 		csrc/cuda/qwen_ple_block.cu csrc/cuda/qwen_decode_glue.cu \
 		"$(GDN_AOT_OBJECT)" "$(CUTE_NVFP4_OBJECT)" \
 		$(GDN_PREFILL_AOT_OBJECTS) \
+		$(CUDA_QSA_DECODE_XQA_MHA_OBJECT) $(CUDA_QSA_SCORE_OBJECT) \
 		"$(CUTE_NVFP4_QUANTIZE_OBJECT)" \
 		$(CUTE_DSL_ROOT)/lib/libcuda_dialect_runtime_static.a \
 		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lcublas -lcuda -lcudart -ldl \

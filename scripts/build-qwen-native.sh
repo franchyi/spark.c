@@ -52,7 +52,7 @@ docker run --rm --gpus all --network host --user "$user_id:$group_id" \
       CUTE_NVFP4_OBJECT=/work/build/aot-qwen/silu/swizzled_bfloat16_k640_sf0_pdl0_silu.o \
       CUTE_NVFP4_QUANTIZE_OBJECT=/work/build/aot-qwen/quantize/swizzled_bfloat16_k2560_sf0_pdl0.o \
       TVM_FFI_ROOT="$tvm_root" CUTE_DSL_ROOT="$cute_root" \
-      fabric-shared qsa-shared qwen-runtime-shared
+      fabric-shared qwen-runtime-shared
     cp -Lf "$tvm_lib" build/libtvm_ffi.so
   '
 
@@ -65,7 +65,7 @@ docker run --rm --network host --user "$user_id:$group_id" \
   -e HOME=/tmp/sparkserve-rust-home \
   -e CARGO_HOME=/cargo-home \
   -e CARGO_TARGET_DIR=/cargo-target \
-  -e RUSTFLAGS='-L native=/work/build -l dylib=sparkserve-fabric -l dylib=sparkserve-qwen-runtime -l dylib=sparkserve-qsa -C link-arg=-Wl,-rpath-link,/work/build -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
+  -e RUSTFLAGS='-L native=/work/build -l dylib=sparkserve-fabric -l dylib=sparkserve-qwen-runtime -C link-arg=-Wl,-rpath-link,/work/build -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
   "$rust_image" \
   cargo build --release -p sparkserve-runtime --features native-fabric-smoke \
     --example qwen_first_token --example qwen_decode --example qwen_serve
