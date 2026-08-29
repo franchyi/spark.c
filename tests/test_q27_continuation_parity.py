@@ -1,4 +1,6 @@
 from array import array
+from pathlib import Path
+import tempfile
 import unittest
 
 from scripts import q27_continuation_parity as parity
@@ -53,6 +55,42 @@ class TopFiveValidationTest(unittest.TestCase):
                 logits,
                 "cutoff-tie",
             )
+
+
+class NativeOutputParsingTest(unittest.TestCase):
+    def _write(self, payload: str) -> Path:
+        temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
+        self.addCleanup(Path(temporary.name).unlink, missing_ok=True)
+        with temporary:
+            temporary.write(payload)
+        return Path(temporary.name)
+
+    def test_accepts_one_or_multiple_fields_per_line(self) -> None:
+        path = self._write(
+            "q27_eager=native\n"
+            "input_token=248045\n"
+            "top1_token=8678 top1_logit=23.064886093\n"
+        )
+
+        self.assertEqual(
+            parity._parse_native_output(path),
+            {
+                "q27_eager": "native",
+                "input_token": "248045",
+                "top1_token": "8678",
+                "top1_logit": "23.064886093",
+            },
+        )
+
+    def test_rejects_duplicate_field_across_compound_line(self) -> None:
+        path = self._write(
+            "q27_eager=native\n"
+            "top1_token=8678 top1_logit=23.0\n"
+            "top1_token=846\n"
+        )
+
+        with self.assertRaisesRegex(parity.InputError, "duplicate native output key"):
+            parity._parse_native_output(path)
 
 
 if __name__ == "__main__":

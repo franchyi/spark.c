@@ -238,7 +238,7 @@ def _validate_oracle(manifest_path: Path) -> tuple[dict[str, Any], list[Path]]:
     return manifest, logit_paths
 
 
-_KEY_VALUE = re.compile(r"^([A-Za-z][A-Za-z0-9_]*)=(.*)$")
+_KEY_VALUE = re.compile(r"^([A-Za-z][A-Za-z0-9_]*)=(\S*)$")
 
 
 def _parse_native_output(path: Path) -> dict[str, str]:
@@ -248,12 +248,15 @@ def _parse_native_output(path: Path) -> dict[str, str]:
         raise InputError(f"cannot read native output {path}: {error}") from error
     fields: dict[str, str] = {}
     for line in lines:
-        match = _KEY_VALUE.fullmatch(line.strip())
-        if not match:
+        parts = line.strip().split()
+        matches = [_KEY_VALUE.fullmatch(part) for part in parts]
+        if not matches or any(match is None for match in matches):
             continue
-        key, value = match.groups()
-        _require(key not in fields, f"duplicate native output key {key}: {path}")
-        fields[key] = value
+        for match in matches:
+            assert match is not None
+            key, value = match.groups()
+            _require(key not in fields, f"duplicate native output key {key}: {path}")
+            fields[key] = value
     _require(fields.get("q27_eager") == "native", f"not q27-eager output: {path}")
     return fields
 
