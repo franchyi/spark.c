@@ -92,6 +92,15 @@ pub trait TokenGenerator: Send + Sync + 'static {
         DEFAULT_MAX_IN_FLIGHT_REQUESTS
     }
 
+    /// Model-specific admission policy evaluated after tokenization and before
+    /// the request is assigned an ID or enters a backend queue.
+    fn validate_generation(
+        &self,
+        _request: &GenerationRequest,
+    ) -> Result<(), GenerationError> {
+        Ok(())
+    }
+
     fn generate(
         &self,
         request: GenerationRequest,
@@ -420,19 +429,23 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
                 Some("max_tokens"),
             ));
         }
+        let generation = GenerationRequest {
+            prompt_token_ids,
+            max_new_tokens,
+            temperature,
+            top_p,
+            seed: request.seed,
+            stop_token_ids: self.tokenizer.stop_token_ids(),
+        };
+        self.backend
+            .validate_generation(&generation)
+            .map_err(|error| ApiError::invalid(error.to_string(), None))?;
         let id = NEXT_COMPLETION_ID.fetch_add(1, Ordering::Relaxed);
         Ok(PreparedCompletion {
             completion_id: format!("chatcmpl-spark-{id:016x}"),
             created: unix_seconds(),
             model: request.model,
-            generation: GenerationRequest {
-                prompt_token_ids,
-                max_new_tokens,
-                temperature,
-                top_p,
-                seed: request.seed,
-                stop_token_ids: self.tokenizer.stop_token_ids(),
-            },
+            generation,
         })
     }
 
@@ -1522,6 +1535,39 @@ mod tests {
         }
     }
 
+    struct AdmissionBackend;
+
+    impl TokenGenerator for AdmissionBackend {
+        fn model_id(&self) -> &str {
+            "qwen3.8-27b-admission"
+        }
+
+        fn default_temperature(&self) -> f32 {
+            0.0
+        }
+
+        fn validate_generation(
+            &self,
+            request: &GenerationRequest,
+        ) -> Result<(), GenerationError> {
+            if request.temperature != 0.0 || request.top_p != 1.0 {
+                return Err(GenerationError::new("backend is greedy-only"));
+            }
+            if request.max_new_tokens > 1 {
+                return Err(GenerationError::new("backend slot capacity exceeded"));
+            }
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _request: GenerationRequest,
+            _emit: &mut dyn FnMut(u32) -> Result<(), GenerationError>,
+        ) -> Result<FinishReason, GenerationError> {
+            unreachable!("admission-only test backend")
+        }
+    }
+
     fn tokenizer() -> Arc<NativeQwenTokenizer> {
         let model = WordLevel::builder()
             .vocab(
@@ -1576,6 +1622,34 @@ mod tests {
             service.prepare(explicit).expect("prepared").generation.temperature,
             0.25
         );
+    }
+
+    #[test]
+    fn backend_generation_policy_maps_to_prequeue_http_400() {
+        let service = OpenAiServer::new(tokenizer(), Arc::new(AdmissionBackend));
+        let request = |temperature: Option<f32>, max_tokens: u32| {
+            serde_json::from_value(json!({
+                "model": "qwen3.8-27b-admission",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "chat_template_kwargs": {"enable_thinking": false}
+            }))
+            .expect("wire request")
+        };
+
+        assert!(service.prepare(request(None, 1)).is_ok());
+        for (wire, expected) in [
+            (request(Some(0.25), 1), "greedy-only"),
+            (request(None, 2), "slot capacity"),
+        ] {
+            let error = match service.prepare(wire) {
+                Err(error) => error,
+                Ok(_) => panic!("backend policy rejection was admitted"),
+            };
+            assert_eq!(error.status, 400);
+            assert!(error.message.contains(expected));
+        }
     }
 
     #[test]
