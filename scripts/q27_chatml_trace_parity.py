@@ -23,6 +23,7 @@ from typing import Any
 
 SUITE_SCHEMA = "sparkserve.q27.chatml-parity-suite.v1"
 ORACLE_SCHEMA = "sparkserve.q27.chatml-oracle.v1"
+PINNED_ORACLE_SCHEMA = "sparkserve.q27.real-chatml-oracle.v1"
 TRACE_SCHEMA = "sparkserve.q27.token-trace.v1"
 REPORT_SCHEMA = "sparkserve.q27.chatml-parity-report.v1"
 MAX_TRACE_RECORDS = 1_024
@@ -30,6 +31,27 @@ MAX_TRACE_BYTES = 64 * 1024 * 1024
 MAX_CONTROL_BYTES = 16 * 1024 * 1024
 U32_MAX = (1 << 32) - 1
 VOCABULARY = 248_320
+EXPECTED_PINNED_ORACLE = {
+    "image_tag": "lmsysorg/sglang:qwen38-27b",
+    "image_id": "sha256:0076dffa60b76b7bf033c04d05e0cc69d46f2b8cd60aa2468827782afe9bc38f",
+    "sglang_commit": "c4271c3fe1262fc2adbd162c33b25de5255251c5",
+    "flashinfer_commit": "906181e3f4cf4bcc81835fb480db4011bbd80b62",
+    "checkpoint": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+    "checkpoint_revision": "009632fef96dd349150baa780c984e62e70e91fe",
+    "speculative_decoding": False,
+}
+EXPECTED_PINNED_REQUEST = {
+    "temperature": 0,
+    "top_p": 1,
+    "max_tokens": 8,
+    "stream": False,
+    "chat_template_kwargs": {"enable_thinking": False},
+    "logprobs": True,
+    "top_logprobs": 5,
+    "return_token_ids": True,
+    "return_prompt_token_ids": True,
+    "return_meta_info": True,
+}
 
 
 class InputError(Exception):
@@ -53,7 +75,7 @@ def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 _DECODER = json.JSONDecoder(object_pairs_hook=_strict_object)
 
 
-def _decode_exact_json(payload: bytes, label: str) -> Any:
+def _decode_exact_json(payload: bytes, label: str, *, allow_final_whitespace: bool = False) -> Any:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -62,7 +84,11 @@ def _decode_exact_json(payload: bytes, label: str) -> Any:
         value, end = _DECODER.raw_decode(text)
     except (json.JSONDecodeError, ValueError) as error:
         raise InputError(f"invalid JSON in {label}: {error}") from error
-    _require(end == len(text), f"{label} has trailing data")
+    remainder = text[end:]
+    _require(
+        not remainder or (allow_final_whitespace and remainder.isspace()),
+        f"{label} has trailing data",
+    )
     return value
 
 
@@ -74,7 +100,7 @@ def _read_control_json(path: Path, label: str) -> dict[str, Any]:
     except OSError as error:
         raise InputError(f"cannot read {label} {path}: {error}") from error
     _require(len(payload) == size, f"{label} changed while it was read: {path}")
-    value = _decode_exact_json(payload, f"{label} {path}")
+    value = _decode_exact_json(payload, f"{label} {path}", allow_final_whitespace=True)
     _require(isinstance(value, dict), f"{label} root must be an object: {path}")
     return value
 
@@ -83,6 +109,14 @@ def _resolve(base: Path, value: Any, label: str) -> Path:
     _require(isinstance(value, str) and value, f"{label} must be a non-empty path")
     path = Path(value)
     return path if path.is_absolute() else base / path
+
+
+def _artifact_path(base: Path, value: Any, label: str) -> Path:
+    _require(isinstance(value, str) and value, f"{label} must be a non-empty path")
+    relative = Path(value)
+    _require(not relative.is_absolute(), f"{label} must be relative")
+    _require(".." not in relative.parts, f"{label} cannot escape the oracle directory")
+    return base / relative
 
 
 def _is_integer(value: Any) -> bool:
@@ -226,9 +260,9 @@ def _validate_oracle_case(value: Any, index: int) -> dict[str, Any]:
     return result
 
 
-def _read_oracle(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    oracle = _read_control_json(path, "oracle artifact")
-    _require(oracle.get("schema") == ORACLE_SCHEMA, "wrong oracle artifact schema")
+def _read_normalized_oracle(
+    path: Path, oracle: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     _require(set(oracle).issubset({"schema", "cases", "provenance"}),
              "oracle artifact has unknown root fields")
     if "provenance" in oracle:
@@ -240,6 +274,136 @@ def _read_oracle(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     names = [case["name"] for case in cases]
     _require(len(names) == len(set(names)), "oracle case names must be unique")
     return cases, oracle.get("provenance", {})
+
+
+def _crosscheck_pinned_response(
+    oracle_path: Path,
+    raw_case: dict[str, Any],
+    normalized: dict[str, Any],
+    index: int,
+) -> None:
+    label = f"pinned oracle case {index}"
+    request_path = _artifact_path(oracle_path.parent, raw_case["request"], f"{label} request")
+    response_path = _artifact_path(oracle_path.parent, raw_case["response"], f"{label} response")
+    request = _read_control_json(request_path, f"{label} request")
+    for key, expected in EXPECTED_PINNED_REQUEST.items():
+        _require(request.get(key) == expected, f"{label} request {key} differs from contract")
+    response = _read_control_json(response_path, f"{label} response")
+    _require(response.get("id") == raw_case["id"], f"{label} response id differs")
+    choices = response.get("choices")
+    _require(isinstance(choices, list) and len(choices) == 1, f"{label} response needs one choice")
+    choice = choices[0]
+    _require(isinstance(choice, dict), f"{label} response choice must be an object")
+    _require(choice.get("prompt_token_ids") == normalized["prompt_token_ids"],
+             f"{label} response prompt ids differ from manifest")
+    _require(choice.get("token_ids") == normalized["generated_token_ids"],
+             f"{label} response output ids differ from manifest")
+    _require(choice.get("finish_reason") == normalized["finish_reason"],
+             f"{label} response finish differs from manifest")
+    _require(choice.get("matched_stop") == raw_case["matched_stop"],
+             f"{label} response matched_stop differs from manifest")
+    meta = choice.get("meta_info")
+    _require(isinstance(meta, dict), f"{label} response lacks meta_info")
+    selected = meta.get("output_token_logprobs")
+    top = meta.get("output_top_logprobs")
+    generated = normalized["generated_token_ids"]
+    _require(isinstance(selected, list) and len(selected) == len(generated),
+             f"{label} selected-token metadata length differs")
+    _require(isinstance(top, list) and len(top) == len(generated),
+             f"{label} top-token metadata length differs")
+    for token_index, token_id in enumerate(generated):
+        selected_item = selected[token_index]
+        top_items = top[token_index]
+        _require(
+            isinstance(selected_item, list)
+            and len(selected_item) >= 2
+            and selected_item[1] == token_id,
+            f"{label} selected-token metadata differs at {token_index}",
+        )
+        _require(
+            isinstance(top_items, list)
+            and top_items
+            and isinstance(top_items[0], list)
+            and len(top_items[0]) >= 2
+            and top_items[0][1] == token_id,
+            f"{label} top-token winner differs at {token_index}",
+        )
+
+
+def _read_pinned_oracle(
+    path: Path, oracle: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    _require(
+        set(oracle) == {"schema", "captured_at_utc", "oracle", "common_request", "cases"},
+        "pinned oracle root fields differ from the locked schema",
+    )
+    provenance = oracle["oracle"]
+    _require(isinstance(provenance, dict), "pinned oracle provenance must be an object")
+    for key, expected in EXPECTED_PINNED_ORACLE.items():
+        _require(provenance.get(key) == expected, f"pinned oracle provenance {key} differs")
+    _require(oracle["common_request"] == EXPECTED_PINNED_REQUEST,
+             "pinned oracle request contract differs")
+    raw_cases = oracle["cases"]
+    _require(isinstance(raw_cases, list) and len(raw_cases) == 3,
+             "pinned real-ChatML oracle must contain exactly three cases")
+    expected_fields = {
+        "name",
+        "request",
+        "response",
+        "id",
+        "prompt_token_ids",
+        "output_token_ids",
+        "text",
+        "finish_reason",
+        "matched_stop",
+    }
+    cases: list[dict[str, Any]] = []
+    for index, raw_case in enumerate(raw_cases):
+        label = f"pinned oracle case {index}"
+        _require(isinstance(raw_case, dict) and set(raw_case) == expected_fields,
+                 f"{label} fields differ from the locked schema")
+        _require(isinstance(raw_case["name"], str) and raw_case["name"],
+                 f"{label} name must be non-empty")
+        _require(isinstance(raw_case["id"], str) and raw_case["id"],
+                 f"{label} id must be non-empty")
+        prompt = _token_array(raw_case["prompt_token_ids"], f"{label} prompt_token_ids", nonempty=True)
+        generated = _token_array(
+            raw_case["output_token_ids"], f"{label} output_token_ids", nonempty=False
+        )
+        finish = _finish(raw_case["finish_reason"], f"{label} finish_reason")
+        matched_stop = raw_case["matched_stop"]
+        normalized = {
+            "name": raw_case["name"],
+            "prompt_token_ids": prompt,
+            "generated_token_ids": generated,
+            "finish_reason": finish,
+        }
+        if finish == "length":
+            _require(matched_stop is None, f"{label} length finish has matched_stop")
+            normalized["terminal_stop_token_id"] = None
+        else:
+            _require(_is_integer(matched_stop),
+                     f"{label} stop finish lacks a numeric matched_stop token id")
+            normalized["terminal_stop_token_id"] = _u32(
+                matched_stop, f"{label} matched_stop"
+            )
+        _crosscheck_pinned_response(path, raw_case, normalized, index)
+        cases.append(normalized)
+    names = [case["name"] for case in cases]
+    _require(len(names) == len(set(names)), "pinned oracle case names must be unique")
+    summary = {key: provenance[key] for key in EXPECTED_PINNED_ORACLE}
+    summary["captured_at_utc"] = oracle["captured_at_utc"]
+    return cases, summary
+
+
+def _read_oracle(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    oracle = _read_control_json(path, "oracle artifact")
+    schema = oracle.get("schema")
+    if schema == ORACLE_SCHEMA:
+        return _read_normalized_oracle(path, oracle)
+    if schema == PINNED_ORACLE_SCHEMA:
+        return _read_pinned_oracle(path, oracle)
+    raise InputError(f"wrong oracle artifact schema: {schema!r}")
 
 
 def _token_hash(tokens: list[int]) -> str:
