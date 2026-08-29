@@ -56,7 +56,8 @@ use sparkserve_runtime::kernel::{
 };
 use sparkserve_runtime::fabric::{ExpertKey, ExpertLoad, ExpertSlotAddress};
 use sparkserve_runtime::qwen_expert_cache::{
-    QwenExpertFileLoader, QwenExpertHotCache, QwenPreparedExpertStats,
+    QwenExpertFileLoader, QwenExpertHotCache, QwenPreparedExpertCache,
+    QwenPreparedExpertStats,
 };
 use sparkserve_runtime::qwen_ple::decode_row_ids;
 use sparkserve_runtime::qwen_weights::{FlashNextWeightMaps, QwenTensorView};
@@ -93,6 +94,10 @@ const PREFILL_CHUNK_TOKENS: u64 = 16;
 // present. Ten slots still preserve zero-copy hits: misses overwrite experts
 // that are not selected by the current token.
 const LAYER_EXPERT_SLOTS: u32 = ACTIVE_EXPERTS;
+// A private prepared range per layer keeps likely follow-on routes in the
+// unified-memory tier while the donor grouped-GEMM ABI remains ten groups.
+const PREPARED_SLOTS_PER_LAYER: u32 = 32;
+const PREPARED_EXPERT_SLOTS: u32 = LAYERS * PREPARED_SLOTS_PER_LAYER;
 const WORKSPACE: u64 = 32 * 1024 * 1024;
 const QSA_WORKSPACE: u64 = 128 * 1024 * 1024;
 const VOCABULARY: u64 = 248_320;
@@ -557,6 +562,7 @@ pub struct QwenNativeEngine {
     qsa_full_key_states: CoherentRegionOwner,
     qsa_full_value_states: CoherentRegionOwner,
     hot_experts: QwenExpertHotCache,
+    prepared_experts: QwenPreparedExpertCache,
     expert_loader: QwenExpertFileLoader,
     expert_packs: u64,
     arena: QwenDecodeArena,
@@ -570,8 +576,12 @@ impl QwenNativeEngine {
         let expert_loader = QwenExpertFileLoader::new(&checkpoint);
         let weight_maps = FlashNextWeightMaps::new(&checkpoint, 0);
         let mut hot_experts = QwenExpertHotCache::create(0)?;
+        let mut prepared_experts = QwenPreparedExpertCache::create(PREPARED_EXPERT_SLOTS, 0)?;
         let prefault_started = Instant::now();
-        let prefault_bytes = hot_experts.prefault()?;
+        let prefault_bytes = hot_experts
+            .prefault()?
+            .checked_add(prepared_experts.prefault()?)
+            .ok_or("Qwen expert prefault byte count overflow")?;
         eprintln!(
             "Qwen expert arena prefault: {:.3} GiB in {:.3} s",
             prefault_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
@@ -615,6 +625,7 @@ impl QwenNativeEngine {
                     * 2,
             )?,
             hot_experts,
+            prepared_experts,
             expert_loader,
             expert_packs: 0,
             arena: QwenDecodeArena::create()?,
@@ -716,7 +727,7 @@ impl QwenNativeEngine {
             )?;
         }
 
-        let expert_packs_before = self.expert_packs;
+        let expert_stats_before = self.prepared_experts.stats();
         let started = Instant::now();
         for layer in 0..LAYERS {
             let (current, next) = if layer.is_multiple_of(2) {
@@ -756,6 +767,7 @@ impl QwenNativeEngine {
                 u32::try_from(start_position)?,
                 num_tokens,
                 &mut self.hot_experts,
+                &mut self.prepared_experts,
                 &mut self.expert_loader,
                 &mut self.expert_packs,
                 &mut self.arena,
@@ -789,16 +801,13 @@ impl QwenNativeEngine {
             &self.caps,
         )?;
         let elapsed_seconds = started.elapsed().as_secs_f64();
-        let expert_misses = self.expert_packs - expert_packs_before;
-        let expert_routes =
-            u64::from(num_tokens) * u64::from(LAYERS) * u64::from(ACTIVE_EXPERTS);
-        let initial_fills = u64::from(LAYERS) * u64::from(ACTIVE_EXPERTS);
+        let expert_stats_after = self.prepared_experts.stats();
         Ok(QwenNativeStep {
             token,
             elapsed_seconds,
-            expert_hits: expert_routes.saturating_sub(expert_misses),
-            expert_misses,
-            expert_evictions: expert_misses.saturating_sub(initial_fills),
+            expert_hits: expert_stats_after.hits - expert_stats_before.hits,
+            expert_misses: expert_stats_after.misses - expert_stats_before.misses,
+            expert_evictions: expert_stats_after.evictions - expert_stats_before.evictions,
         })
     }
 
@@ -811,13 +820,7 @@ impl QwenNativeEngine {
     }
 
     pub fn expert_stats(&self) -> QwenPreparedExpertStats {
-        QwenPreparedExpertStats {
-            capacity: LAYER_EXPERT_SLOTS,
-            resident: 0,
-            hits: 0,
-            misses: self.expert_packs,
-            evictions: 0,
-        }
+        self.prepared_experts.stats()
     }
 }
 
@@ -884,6 +887,7 @@ fn run_layer(
     start_position: u32,
     num_tokens: u32,
     hot_experts: &mut QwenExpertHotCache,
+    prepared_experts: &mut QwenPreparedExpertCache,
     expert_loader: &mut QwenExpertFileLoader,
     expert_packs: &mut u64,
     arena: &mut QwenDecodeArena,
@@ -984,6 +988,7 @@ fn run_layer(
         arena.moe_output.device_address(),
         arena,
         hot_experts,
+        prepared_experts,
         expert_loader,
         expert_packs,
         stream,
@@ -1409,6 +1414,7 @@ fn run_moe(
     layer: u32, num_tokens: u32, hidden_states: u64, moe_output: u64,
     arena: &mut QwenDecodeArena,
     hot_experts: &mut QwenExpertHotCache,
+    prepared_experts: &mut QwenPreparedExpertCache,
     expert_loader: &mut QwenExpertFileLoader,
     expert_packs: &mut u64,
     stream: &mut CudaStreamOwner, blas: &CudaBlasOwner, caps: &DeviceCaps,
@@ -1470,6 +1476,8 @@ fn run_moe(
             &slot_plan.loads,
             arena,
             hot_experts,
+            prepared_experts,
+            expert_loader,
             expert_packs,
             stream,
             blas,
@@ -1486,6 +1494,8 @@ fn run_moe_token(
     layer: u32, hidden_states: u64, moe_output: u64, route_weights: u64,
     physical: &[u32], loads: &[ExpertLoad], arena: &mut QwenDecodeArena,
     hot_experts: &mut QwenExpertHotCache,
+    prepared_experts: &mut QwenPreparedExpertCache,
+    expert_loader: &mut QwenExpertFileLoader,
     expert_packs: &mut u64,
     stream: &mut CudaStreamOwner, blas: &CudaBlasOwner, caps: &DeviceCaps,
     trace: bool,
@@ -1493,17 +1503,29 @@ fn run_moe_token(
     let moe_started = Instant::now();
     let prefix = format!("model.language_model.layers.{layer}.mlp");
     let pack_started = Instant::now();
-    hot_experts.pack_misses(maps, loads, stream)?;
+    let misses_before = prepared_experts.stats().misses;
+    unsafe {
+        prepared_experts.prepare_and_promote_layer(
+            expert_loader,
+            hot_experts,
+            loads,
+            PREPARED_SLOTS_PER_LAYER,
+        )?;
+    }
+    let prepared_fills = prepared_experts.stats().misses - misses_before;
     *expert_packs = expert_packs
-        .checked_add(loads.len() as u64)
+        .checked_add(prepared_fills)
         .ok_or("Qwen GPU expert pack counter overflow")?;
     if trace {
-        eprintln!("Qwen trace layer {layer} MoE: GPU expert pack submitted");
+        eprintln!(
+            "Qwen trace layer {layer} MoE: {prepared_fills} prepared fills, {} promotions",
+            loads.len(),
+        );
     }
     let pack_submit_seconds = pack_started.elapsed().as_secs_f64();
     if pack_submit_seconds >= 0.25 {
         eprintln!(
-            "Qwen layer {layer} GPU expert pack submit: {:.3} s for {} experts",
+            "Qwen layer {layer} prepared expert fill/promote: {:.3} s for {} experts",
             pack_submit_seconds,
             loads.len(),
         );
