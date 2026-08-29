@@ -72,11 +72,12 @@ The first end-to-end Spark acceptance input, token 248045, produces greedy
 token 8678 and the same ordered top-5 token IDs as SGLang:
 `8678, 846, 1156, 1785, 2244`. Full-logit cosine is 0.999481 (maximum absolute
 error 0.584895); the remaining drift is the pinned FlashInfer-decode versus
-Triton-prefill recurrence rounding accumulated over 64 layers. An eight-step
-eager run measures 0.1072 seconds per warm step (9.33 token/s), with 17.056 GiB
-resident promoted weights, 75.062 MiB state at context capacity eight, and
-129.344 MiB scratch. This is a correctness baseline, not the graph-captured
-performance target.
+Triton-prefill recurrence rounding accumulated over 64 layers. The first eight
+raw greedy tokens match SGLang exactly:
+`8678, 198, 2, 13455, 271, 2523, 599, 2528`. That eager run measures 0.1072
+seconds per warm step (9.33 token/s), with 17.056 GiB resident promoted
+weights, 75.062 MiB state at context capacity eight, and 129.344 MiB scratch.
+This is a correctness baseline, not the graph-captured performance target.
 
 `q27-pack-scales` converts all 192 checkpoint E4M3 scale matrices into the
 CUTLASS 128x4 order once. Its revision-bound sidecar also stores each
