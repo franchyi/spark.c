@@ -94,6 +94,13 @@ OpenAI prompt plus one completion completed in 5.136 seconds. The native ABI
 rejects stale diagnostic-logit reads after reset or consume, and the service
 bounds the sole-slot command and SSE event queues to one buffered item each.
 
+Real-ChatML promotion capture is explicitly opt-in. Setting
+`SPARK_ENGINE_TOKEN_TRACE_PATH` makes the single GPU-owner thread append and
+flush one `sparkserve.q27.token-trace.v1` JSONL record per completed request,
+containing only exact prompt token IDs, emitted generated token IDs, and the
+finish reason. With the variable unset, no trace file is opened and no prompt
+or generated IDs are retained; user text is never written by this hook.
+
 The opt-in `Q27_PROFILE_STAGES=1` CUDA-event path profiles only the first warm
 token and is disabled by default. On Spark it measured 105.010 ms wall time
 and 104.300 ms of staged GPU work: MLP 50.651 ms, GDN blocks 29.660 ms,

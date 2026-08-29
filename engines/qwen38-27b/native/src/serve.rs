@@ -21,9 +21,12 @@ use model_plan::{EagerWeightPlan, MODEL_ABI_VERSION, ModelWeights};
 use openai_server::{
     FinishReason, GenerationError, GenerationRequest, OpenAiServer, TokenGenerator,
 };
+use serde::Serialize;
 use std::env;
 use std::error::Error;
 use std::ffi::{CStr, c_char};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::{Arc, mpsc};
@@ -34,6 +37,7 @@ use tokenizer::NativeQwenTokenizer;
 const DEFAULT_BIND: &str = "0.0.0.0:30000";
 const DEFAULT_MODEL_ID: &str = "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead";
 const DEFAULT_CONTEXT_CAPACITY: u32 = 4096;
+const TOKEN_TRACE_PATH_ENV: &str = "SPARK_ENGINE_TOKEN_TRACE_PATH";
 
 #[repr(C)]
 struct ModelStatus {
@@ -107,6 +111,62 @@ struct EngineCommand {
     events: mpsc::SyncSender<EngineEvent>,
 }
 
+#[derive(Serialize)]
+struct TokenTraceRecord<'a> {
+    schema: &'static str,
+    prompt_token_ids: &'a [u32],
+    generated_token_ids: &'a [u32],
+    finish_reason: &'static str,
+}
+
+struct TokenTrace {
+    output: BufWriter<File>,
+}
+
+impl TokenTrace {
+    fn open(path: &Path) -> Result<Self, String> {
+        let output = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| format!("cannot open q27 token trace {}: {error}", path.display()))?;
+        Ok(Self {
+            output: BufWriter::new(output),
+        })
+    }
+
+    fn write_completed(
+        &mut self,
+        prompt_token_ids: &[u32],
+        generated_token_ids: &[u32],
+        finish_reason: FinishReason,
+    ) -> Result<(), String> {
+        let line = format_token_trace(prompt_token_ids, generated_token_ids, finish_reason)
+            .map_err(|error| format!("cannot encode q27 token trace: {error}"))?;
+        self.output
+            .write_all(line.as_bytes())
+            .and_then(|()| self.output.write_all(b"\n"))
+            .and_then(|()| self.output.flush())
+            .map_err(|error| format!("cannot write q27 token trace: {error}"))
+    }
+}
+
+fn format_token_trace(
+    prompt_token_ids: &[u32],
+    generated_token_ids: &[u32],
+    finish_reason: FinishReason,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&TokenTraceRecord {
+        schema: "sparkserve.q27.token-trace.v1",
+        prompt_token_ids,
+        generated_token_ids,
+        finish_reason: match finish_reason {
+            FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+        },
+    })
+}
+
 /// Clone-free backend handle shared by the small HTTP worker threads. CUDA,
 /// mmaps, recurrent state, and KV cache never leave the single owner thread.
 struct Q27Backend {
@@ -121,12 +181,27 @@ impl Q27Backend {
         sidecar: PathBuf,
         model_id: String,
         context_capacity: u32,
+        token_trace_path: Option<PathBuf>,
     ) -> Result<Self, GenerationError> {
         let (commands, receiver) = mpsc::sync_channel::<EngineCommand>(1);
         let (ready_sender, ready_receiver) = mpsc::sync_channel::<Result<(), String>>(1);
         thread::Builder::new()
             .name("q27-gpu-owner".to_owned())
             .spawn(move || {
+                // The sole GPU-owner thread is also the sole trace writer.
+                // When the opt-in path is absent, no file is opened and no
+                // prompt or generated token IDs are retained.
+                let mut token_trace = match token_trace_path
+                    .as_deref()
+                    .map(TokenTrace::open)
+                    .transpose()
+                {
+                    Ok(trace) => trace,
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error));
+                        return;
+                    }
+                };
                 let plan = match EagerWeightPlan::open(&checkpoint, &sidecar) {
                     Ok(plan) => plan,
                     Err(error) => {
@@ -165,7 +240,12 @@ impl Q27Backend {
                 }
 
                 while let Ok(command) = receiver.recv() {
-                    run_generation(&model, context_capacity, command);
+                    run_generation(
+                        &model,
+                        context_capacity,
+                        command,
+                        token_trace.as_mut(),
+                    );
                 }
                 drop(model);
                 drop(plan);
@@ -241,10 +321,20 @@ impl TokenGenerator for Q27Backend {
     }
 }
 
-fn run_generation(model: &ModelGuard, context_capacity: u32, command: EngineCommand) {
+fn run_generation(
+    model: &ModelGuard,
+    context_capacity: u32,
+    command: EngineCommand,
+    mut token_trace: Option<&mut TokenTrace>,
+) {
     let EngineCommand { request, events } = command;
     let prompt_tokens = request.prompt_token_ids.len();
     let max_new_tokens = request.max_new_tokens;
+    let prompt_token_ids = token_trace
+        .as_ref()
+        .map(|_| request.prompt_token_ids.clone());
+    let trace_enabled = token_trace.is_some();
+    let mut generated_token_ids = Vec::new();
     let started = Instant::now();
     let result = drive_greedy(
         request,
@@ -266,6 +356,9 @@ fn run_generation(model: &ModelGuard, context_capacity: u32, command: EngineComm
             Ok(output)
         },
         |token| {
+            if trace_enabled {
+                generated_token_ids.push(token);
+            }
             events
                 .send(EngineEvent::Token(token))
                 .map_err(|_| "q27 request receiver closed".to_owned())
@@ -273,6 +366,15 @@ fn run_generation(model: &ModelGuard, context_capacity: u32, command: EngineComm
     );
     match result {
         Ok(reason) => {
+            if let (Some(trace), Some(prompt_token_ids)) =
+                (token_trace.as_mut(), prompt_token_ids.as_deref())
+            {
+                if let Err(error) =
+                    trace.write_completed(prompt_token_ids, &generated_token_ids, reason)
+                {
+                    eprintln!("q27 token trace failed: {error}");
+                }
+            }
             eprintln!(
                 "q27 request prompt_tokens={prompt_tokens} max_new_tokens={max_new_tokens} elapsed_seconds={:.3} finish={reason:?}",
                 started.elapsed().as_secs_f64(),
@@ -370,12 +472,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let checkpoint = PathBuf::from(checkpoint);
+    let token_trace_path = env::var_os(TOKEN_TRACE_PATH_ENV)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
     let tokenizer = Arc::new(NativeQwenTokenizer::from_model_root(&checkpoint)?);
     let backend = Arc::new(Q27Backend::start(
         checkpoint,
         PathBuf::from(sidecar),
         model_id.clone(),
         context_capacity,
+        token_trace_path,
     )?);
     println!(
         "q27 service ready model={model_id} bind=http://{bind} context_capacity={context_capacity} slot_count=1"
@@ -543,5 +649,21 @@ mod tests {
         assert_eq!(error, "consume failed");
         assert!(!decoded);
         assert!(!emitted);
+    }
+
+    #[test]
+    fn token_trace_is_one_stable_jsonl_record_without_prompt_text() {
+        let line = format_token_trace(
+            &[248_045, 9707, 151_644],
+            &[8678, 198],
+            FinishReason::Length,
+        )
+        .expect("token trace");
+        assert_eq!(
+            line,
+            r#"{"schema":"sparkserve.q27.token-trace.v1","prompt_token_ids":[248045,9707,151644],"generated_token_ids":[8678,198],"finish_reason":"length"}"#
+        );
+        assert!(!line.contains("content"));
+        assert!(!line.contains('\n'));
     }
 }
