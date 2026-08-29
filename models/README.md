@@ -13,15 +13,15 @@ models/
 │   ├── native/{src,kernels,examples,tests,tools}
 │   └── scripts/                 # native service + vLLM oracle
 └── glm-5.3-flash-q2/
-    ├── scripts/                     # pristine ds4 build/service
-    └── tools/                       # pinned source fetch
+    ├── native/{ds4.c,ds4_cuda.cu,cuda/mmq,...}
+    └── scripts/                 # standalone build/service
 ```
 
 | Model | Implementation | Status | Port |
 | --- | --- | --- | --- |
 | Qwen3.8-27B | native Rust/CUDA NVFP4 | functional MVP | `30000` |
 | Qwen3.8-Flash-Next | native Rust/CUDA NVFP4 + sparse PLE | first-token/greedy | `8020` |
-| GLM-5.3-Flash Q2 | pinned ds4 C/CUDA GGUF | accepted | `8010` |
+| GLM-5.3-Flash Q2 | embedded ds4 C/CUDA GGUF | accepted | `8010` |
 
 Each model exposes `build`, `serve`, `smoke`, `bench`, `stop`, and
 `provenance` through its Makefile. From the root, use `make qwen27-*`,

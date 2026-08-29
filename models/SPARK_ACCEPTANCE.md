@@ -50,6 +50,7 @@ The Blazux/vLLM deployment remains a separate oracle under the model Makefile's
 Ensure at least 110 GiB is available before loading the model:
 
 ```bash
+make -C models/glm-5.3-flash-q2/native verify
 make glm-build
 make glm-download
 GLM53_Q2_VERIFY_SHA=1 make glm-serve

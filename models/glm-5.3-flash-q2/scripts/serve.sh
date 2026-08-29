@@ -5,10 +5,9 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../.." && pwd)
 engine_dir=$(cd "$script_dir/.." && pwd)
 pid_file="$engine_dir/.server.pid"
-source_root=${DS4_GLM53_Q2_ROOT:-"$repo_root/vendor/_deps/ds4-glm53-q2"}
 model=${1:-${SPARK_ENGINE_MODEL:-${GLM53_Q2_MODEL:-/home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf}}}
 
-server="$source_root/ds4-server"
+server="$repo_root/build/glm-5.3-flash-q2/ds4-server"
 if [[ ! -x "$server" ]]; then
   echo "missing $server; run 'make build' in the GLM model directory" >&2
   exit 1

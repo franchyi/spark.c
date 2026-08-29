@@ -15,7 +15,7 @@ machine-readable pins, source paths, licenses, and hashes live in
 | Flash-Next | NVFP4 routed MoE | FlashInfer/CUTLASS + SGLang routing/join | fixed cache-slot route owned by Rust |
 | Flash-Next | mHC | SGLang reductions + cuBLAS | fixed hidden/rank geometry |
 | Flash-Next | FP8 PLE gather | SGLang arithmetic contract | Rust-owned NVMe row cache and descriptors |
-| GLM Q2 | complete graph and quantized MMQ | ds4 | pristine pinned model-specific executable |
+| GLM Q2 | complete graph and quantized MMQ | ds4 | embedded pinned model-specific C/CUDA source |
 
 ## Adoption rule
 

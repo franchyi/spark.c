@@ -8,7 +8,7 @@ Spark.C supports exactly three model products on one DGX Spark:
 | --- | --- | --- | --- |
 | Qwen3.8-27B | `models/qwen3.8-27b` | Rust + CUDA | ModelOpt NVFP4 safetensors |
 | Qwen3.8-Flash-Next | `models/qwen3.8-flash-next` | Rust + CUDA | ModelOpt NVFP4 safetensors + FP8 PLE |
-| GLM-5.3-Flash Q2 | pinned ds4 under `models/glm-5.3-flash-q2` | C + CUDA | GGUF Q2 |
+| GLM-5.3-Flash Q2 | embedded ds4 under `models/glm-5.3-flash-q2/native` | C + CUDA | GGUF Q2 |
 
 The model directories share an operational contract, not an inference
 framework. Each owns its tensor layout, state, CUDA launch sequence, memory
@@ -30,9 +30,11 @@ For the two Qwen programs:
 - Python/Torch may appear in offline export or oracle scripts, never in the
   native serving process.
 
-GLM is intentionally different. The pinned ds4 program already owns the loader,
+GLM is intentionally different. The pinned ds4 source closure is embedded in
+the model capsule and already owns the loader,
 tokenizer, KDA, DSA/MLA, mHC, MoE, MTP, sampling, APIs, and CUDA graphs. The
-first release builds and runs it intact. A later Rust admission front is useful
+first release builds and runs that source directly, without fetching or linking
+an external ds4 checkout. A later Rust admission front is useful
 only if a benchmark demonstrates an operational advantage; it must not rewrite
 the GLM graph or quantized kernels.
 

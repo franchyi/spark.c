@@ -14,7 +14,7 @@ spark.c/
 ├── models/
 │   ├── qwen3.8-27b/                # native Rust/CUDA NVFP4 engine
 │   ├── qwen3.8-flash-next/         # native Rust/CUDA sparse engine
-│   └── glm-5.3-flash-q2/           # pinned ds4 C/CUDA GGUF engine
+│   └── glm-5.3-flash-q2/           # embedded ds4 C/CUDA GGUF engine
 ├── vendor/                         # locked kernel/source provenance
 ├── docs/                           # architecture and measured baselines
 └── handoff/                        # review material and pinned reference repos
@@ -31,7 +31,7 @@ program rather than recreating its graph in Rust.
 | --- | --- | --- | --- |
 | `qwen3.8-27b` | ModelOpt NVFP4 safetensors | native Rust/CUDA; FlashInfer/CUTLASS/cuBLAS donors | functional native MVP; optimize prefill/decode |
 | `qwen3.8-flash-next` | ModelOpt NVFP4 safetensors + FP8 PLE | native Rust/CUDA; model-local GDN/QSA/MoE/PLE graph | first-token/greedy continuation |
-| `glm-5.3-flash-q2` | ds4 Q2 GGUF | pinned ds4 C/CUDA server | accepted OpenAI service and benchmark |
+| `glm-5.3-flash-q2` | ds4 Q2 GGUF | embedded pinned ds4 C/CUDA server | accepted OpenAI service and benchmark |
 
 SGLang and vLLM recipes are explicit Qwen oracles, never serving dependencies.
 GLM IQ3 paging is later work and is not part of these three shipping engines.

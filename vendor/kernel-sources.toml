@@ -196,10 +196,10 @@ id = "ds4-glm53-source-engine"
 repository = "https://github.com/antirez/ds4"
 revision = "a60a2a0d25137a849a101e04e86ea830a346073a"
 license = "MIT"
-mode = "pinned-model-engine"
+mode = "embedded-pinned-model-engine"
 status = "source-hashed-sm121-service-and-benchmark-passed"
-entrypoint = "vendor/ds4-glm53/VENDOR.md"
-notes = "The complete GLM-5.3 Q2 tokenizer, graph, CUDA/MMQ kernels, OpenAI server, and session runtime ship together as the pinned ds4 executable. No duplicate Rust GLM graph or adapter is maintained here."
+entrypoint = "models/glm-5.3-flash-q2/VENDOR.md"
+notes = "The complete GLM-5.3 Q2 tokenizer, graph, CUDA/MMQ kernels, OpenAI server, and session runtime are embedded in the model capsule and build without an external ds4 checkout. No duplicate Rust GLM graph or adapter is maintained here."
 
 [[source]]
 id = "cutlass-sm121-nvfp4"

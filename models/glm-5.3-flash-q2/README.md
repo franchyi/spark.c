@@ -1,9 +1,11 @@
 # GLM-5.3-Flash Q2
 
-This capsule ships the complete pinned ds4 GLM-5.3 path. That is the shortest
-route to a correct C/CUDA service: ds4 already owns the GGUF loader, KDA,
+This capsule embeds the complete pinned ds4 GLM-5.3 source closure under
+`native/`. That is the shortest route to a correct standalone C/CUDA service:
+the embedded engine owns the GGUF loader, KDA,
 DSA/MLA, mHC, top-8 MoE graph, MTP, tokenizer, sampling, OpenAI endpoints, and
-SSE. Spark.C does not rebuild those pieces in Rust for the first release.
+SSE. It has no source-checkout or external ds4 runtime dependency. Spark.C does
+not rebuild those pieces in Rust for the first release.
 
 The Q2 checkpoint is the mainline. Unsloth `UD-IQ3_XXS` expert paging remains an
 independent later engine/format optimization and cannot block this service.
@@ -33,7 +35,7 @@ the exact locked revision.
 
 ## Accepted Spark baseline
 
-The pristine pinned source and exact 96,505,816,384-byte model passed models,
+The pinned embedded source and exact 96,505,816,384-byte model passed models,
 Chat Completions, Responses, and Chat SSE. Its exact ds4 2048/128 benchmark on
 the measured Spark produced 523.02 prefill and 14.52 generation tok/s. Those are
 the release baseline; later Rust scheduling must preserve correctness and show a
@@ -44,4 +46,5 @@ measured operational benefit before replacing ds4's control path.
 A future Rust front-end may own admission, batching, cancellation, metrics, and
 multi-client fairness while calling a long-lived ds4 model context through a
 narrow ABI. It must not fork one ds4 process per request or rewrite GLM kernels.
-Until that boundary is benchmarked, the ds4 server remains the shipping engine.
+Until that boundary is benchmarked, the embedded native server remains the
+shipping engine.
