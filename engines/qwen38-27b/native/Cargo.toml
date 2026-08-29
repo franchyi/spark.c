@@ -1,0 +1,13 @@
+[package]
+name = "sparkserve-q27"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Lightweight model-specific Qwen3.8-27B control plane for DGX Spark"
+
+[[bin]]
+name = "q27-inspect"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

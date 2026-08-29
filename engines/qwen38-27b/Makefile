@@ -1,14 +1,20 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: build serve smoke bench stop provenance fetch-oracle
+.PHONY: build inspect serve smoke bench stop provenance fetch-oracle \
+	oracle-serve oracle-smoke oracle-bench oracle-stop
 
-build: fetch-oracle
+build:
+	@./scripts/build-native.sh
+
+inspect:
+	@./scripts/inspect-native.sh
 
 fetch-oracle:
 	@./scripts/fetch-oracle.sh
 
 serve:
-	@./scripts/serve.sh
+	@echo "q27 native serving is not promoted yet; use oracle-serve only for parity" >&2
+	@exit 1
 
 smoke:
 	@./scripts/smoke.sh
@@ -17,6 +23,18 @@ bench:
 	@./scripts/bench.sh
 
 stop:
+	@./scripts/stop.sh
+
+oracle-serve: fetch-oracle
+	@./scripts/serve.sh
+
+oracle-smoke:
+	@./scripts/smoke.sh
+
+oracle-bench:
+	@./scripts/bench.sh
+
+oracle-stop:
 	@./scripts/stop.sh
 
 provenance:

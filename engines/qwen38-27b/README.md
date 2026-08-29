@@ -1,10 +1,10 @@
 # Qwen3.8-27B
 
-This capsule gets a correct, fast 27B service onto Spark first by pinning the
-MiaAI-Lab SGLang recipe. It does not pretend that the launch repository contains
-model kernels: SGLang and FlashInfer supply the execution path today. Native
-extraction stays isolated here and begins only after the pinned oracle has been
-accepted on our Spark.
+This is a lightweight, model-specific Rust/CUDA capsule. The MiaAI-Lab SGLang
+recipe is retained only as a correctness and performance oracle; it is never a
+shipping dependency. FlashInfer, FlashAttention, CUTLASS/CuTe, and cuBLASLt may
+supply pinned, shape-specialized kernels without bringing their framework
+schedulers or Python runtimes into the serving process.
 
 The linked checkpoint and repository call the model **Qwen3.8-27B**. The capsule
 therefore uses that exact identity even if “Qwen3.9” is used informally.
@@ -27,11 +27,12 @@ default because it is the simpler acceptance baseline.
 ## Operations
 
 ```bash
-make build       # fetch and verify the pinned recipe
-make serve       # start the resident MTP profile on :8888
-make smoke
-make bench
-make stop
+make build       # build the native q27 tools
+SPARK_ENGINE_MODEL=/path/to/snapshot make inspect
+make oracle-serve # explicit parity oracle only
+make oracle-smoke
+make oracle-bench
+make oracle-stop
 make provenance
 ```
 
@@ -42,10 +43,12 @@ the Linux/arm64 image is locked to digest `sha256:3c0abdf4...d1fc6`. The
 current upstream launcher fixes port
 `8888`, so this first adapter rejects a different `SPARK_ENGINE_PORT`.
 
-## Native extraction boundary
+## Native boundary
 
-The native version will borrow proven arithmetic behind raw C ABIs rather than
-port the whole SGLang server. Its model-local milestones are: checkpoint/tensor
-plan, GDN state pool, full-attention KV pool, dense NVFP4 projections, vision
-policy, then MTP. Nothing from Flash-Next PLE/QSA or GLM GGUF is generalized into
-this graph merely for reuse.
+The native version borrows proven arithmetic behind raw C ABIs rather than
+porting the SGLang server. `native/MODEL.md` freezes its graph and physical
+tensor contract. `native/include/q27.h` is the model-level runtime ABI: Rust
+chooses slots and requests, while one fixed-address CUDA context owns the
+64-layer launch list, graph replay, KV/GDN state, and MTP verification. Nothing
+from Flash-Next PLE/QSA or GLM GGUF is generalized into this graph merely for
+reuse.
