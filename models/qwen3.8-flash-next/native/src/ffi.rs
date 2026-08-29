@@ -20,6 +20,48 @@ pub const QWEN_W13_WEIGHT_BYTES: u64 = 1_638_400;
 pub const QWEN_W2_WEIGHT_BYTES: u64 = 819_200;
 pub const QWEN_W13_SCALE_BYTES: u64 = 204_800;
 pub const QWEN_W2_SCALE_BYTES: u64 = 102_400;
+pub const QWEN_FUSED_MOE_SUCCESS: i32 = 0;
+pub const QWEN_FUSED_MOE_BACKEND_ERROR: i32 = 3;
+
+#[repr(C)]
+pub struct QwenFusedMoeRunner {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenFusedMoeOptions {
+    pub device_id: i32,
+    pub use_fused_finalize: u8,
+    pub enable_pdl: u8,
+    pub reserved: [u8; 2],
+}
+
+impl QwenFusedMoeOptions {
+    pub const fn gb10() -> Self {
+        Self {
+            device_id: 0,
+            use_fused_finalize: 1,
+            enable_pdl: 1,
+            reserved: [0; 2],
+        }
+    }
+}
+
+/// Full-bank SoA-v2 view for one layer. The owner of the CUDA-visible backing
+/// mapping must outlive every launch that consumes this descriptor.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenFusedMoeLayer {
+    pub w13_weight: *const c_void,
+    pub w2_weight: *const c_void,
+    pub w13_weight_scale: *const c_void,
+    pub w2_weight_scale: *const c_void,
+    pub w13_input_scale_quant: *const f32,
+    pub w13_alpha: *const f32,
+    pub w2_input_scale_quant: *const f32,
+    pub w2_alpha: *const f32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -1690,6 +1732,40 @@ unsafe extern "C" {
         caps: *const DeviceCaps,
         args: *const PleGatherArgs,
     ) -> Status;
+    pub fn flash_qwen_runtime_fused_moe_available() -> i32;
+    pub fn flash_qwen_runtime_fused_moe_create(
+        options: *const QwenFusedMoeOptions,
+        out_runner: *mut *mut QwenFusedMoeRunner,
+    ) -> i32;
+    pub fn flash_qwen_runtime_fused_moe_destroy(runner: *mut QwenFusedMoeRunner);
+    pub fn flash_qwen_runtime_fused_moe_tactic_counts(
+        runner: *mut QwenFusedMoeRunner,
+        out_gemm1_count: *mut u32,
+        out_gemm2_count: *mut u32,
+    ) -> i32;
+    pub fn flash_qwen_runtime_fused_moe_select_tactics(
+        runner: *mut QwenFusedMoeRunner,
+        gemm1_tactic_id: i32,
+        gemm2_tactic_id: i32,
+    ) -> i32;
+    pub fn flash_qwen_runtime_fused_moe_workspace_bytes(
+        runner: *mut QwenFusedMoeRunner,
+        num_tokens: u32,
+        out_bytes: *mut usize,
+    ) -> i32;
+    pub fn flash_qwen_runtime_fused_moe_launch(
+        runner: *mut QwenFusedMoeRunner,
+        input_bf16: *const c_void,
+        topk_ids_i32: *const i32,
+        topk_weights_f32: *const f32,
+        layer: *const QwenFusedMoeLayer,
+        num_tokens: u32,
+        workspace: *mut c_void,
+        workspace_bytes: usize,
+        output_bf16: *mut c_void,
+        cuda_stream: *mut c_void,
+    ) -> i32;
+    pub fn flash_qwen_runtime_fused_moe_last_error() -> *const c_char;
     pub fn flash_kernel_abi_version() -> u32;
     pub fn flash_dense_nvfp4_validate(plan: *const DenseNvfp4Plan) -> Status;
     pub fn flash_dense_nvfp4_query(

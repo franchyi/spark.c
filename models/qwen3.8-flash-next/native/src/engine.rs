@@ -31,6 +31,9 @@ use crate::ffi::{
     flash_qwen_add_hyper_launch, flash_qwen_argmax_launch, flash_qwen_lm_head_launch,
     flash_qwen_ple_block_launch, flash_qwen_qsa_finish_launch, flash_qwen_qsa_project_launch,
     flash_qwen_repeat_embedding_launch,
+    flash_qwen_runtime_fused_moe_available, flash_qwen_runtime_fused_moe_create,
+    flash_qwen_runtime_fused_moe_destroy, flash_qwen_runtime_fused_moe_last_error,
+    flash_qwen_runtime_fused_moe_launch, flash_qwen_runtime_fused_moe_workspace_bytes,
     flash_qwen_runtime_bf16_to_f32 as flash_qwen_bf16_to_f32_launch,
     flash_qwen_runtime_gdn_decode as flash_gdn_decode_launch,
     flash_qwen_runtime_gdn_finish as flash_gdn_block_finish_launch,
@@ -47,14 +50,23 @@ use crate::ffi::{
     flash_qwen_runtime_segmented_quantize as flash_segmented_nvfp4_quantize_launch,
     flash_qwen_runtime_segmented_silu as flash_segmented_silu_nvfp4_launch,
     flash_qwen_runtime_shared_expert as flash_shared_expert_launch,
+    QWEN_FUSED_MOE_SUCCESS, QwenFusedMoeLayer, QwenFusedMoeOptions, QwenFusedMoeRunner,
 };
 use crate::kernel::{
     GroupedNvfp4Spec, IndexedGroupedNvfp4Spec, KERNEL_ABI_VERSION,
+    QWEN_FUSED_MOE_LAYERS, QwenFusedMoeLayerSpec, QwenFusedMoeSpec,
     SegmentedNvfp4QuantizeSpec, SegmentedSiluNvfp4Spec,
 };
 use crate::qwen_expert_cache::{
     QwenExpertFileLoader, QwenExpertHotCache, QwenPreparedExpertCache, QwenPreparedExpertStats,
     QwenResidentExpertScalarOutputs, QwenResidentExpertSidecar,
+};
+use crate::qwen_expert_sidecar_v2::{
+    EXPERT_SIDECAR_V2_LAYER_BYTES, EXPERT_SIDECAR_V2_W13_ALPHA_OFFSET,
+    EXPERT_SIDECAR_V2_W13_INPUT_SCALE_QUANT_OFFSET, EXPERT_SIDECAR_V2_W13_SCALE_OFFSET,
+    EXPERT_SIDECAR_V2_W13_WEIGHT_OFFSET, EXPERT_SIDECAR_V2_W2_ALPHA_OFFSET,
+    EXPERT_SIDECAR_V2_W2_INPUT_SCALE_QUANT_OFFSET, EXPERT_SIDECAR_V2_W2_SCALE_OFFSET,
+    EXPERT_SIDECAR_V2_W2_WEIGHT_OFFSET, validate_expert_sidecar_v2_for_checkpoint,
 };
 use crate::qwen_ple::{QWEN_PLE_HEADS, decode_row_ids};
 use crate::qwen_weights::{FlashNextWeightMaps, QwenTensorView};
@@ -84,6 +96,10 @@ const ROTARY_DIM: u32 = 64;
 const INTERMEDIATE: u64 = 640;
 const TOP_K: u32 = 10;
 const ACTIVE_EXPERTS: u32 = 10;
+const _: () = assert!(HIDDEN == crate::kernel::QWEN_FUSED_MOE_HIDDEN as u64);
+const _: () = assert!(INTERMEDIATE == crate::kernel::QWEN_FUSED_MOE_INTERMEDIATE as u64);
+const _: () = assert!(TOP_K == crate::kernel::QWEN_FUSED_MOE_TOP_K);
+const _: () = assert!(512 == crate::kernel::QWEN_FUSED_MOE_EXPERTS);
 const DECODE_COMPACT_IDS: [i32; TOP_K as usize] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 const DECODE_ACTIVE_ROWS: [i32; TOP_K as usize] = [1; TOP_K as usize];
 const PREFILL_CHUNK_TOKENS: u64 = 16;
@@ -316,6 +332,179 @@ impl QwenDecodeArena {
             next_token: slab(4)?,
         })
     }
+}
+
+/// Rust owner for the full-bank FlashInfer runner and its CUDA-visible SoA-v2
+/// mapping. AoS-v1 views are never accepted.
+struct QwenFusedMoeRuntime {
+    runner: QwenFusedMoeRunnerOwner,
+    layers: [QwenFusedMoeLayer; QWEN_FUSED_MOE_LAYERS],
+    workspace: CoherentRegionOwner,
+    // Declared after `runner`, so Rust destroys the backend before unmapping
+    // the weight views it was configured to consume.
+    _sidecar: CoherentRegionOwner,
+}
+
+struct QwenFusedMoeRunnerOwner(*mut QwenFusedMoeRunner);
+
+impl Drop for QwenFusedMoeRunnerOwner {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { flash_qwen_runtime_fused_moe_destroy(self.0) };
+        }
+    }
+}
+
+impl QwenFusedMoeRuntime {
+    fn create_from_sidecar(
+        checkpoint: &FlashNextCheckpoint,
+        path: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let header = validate_expert_sidecar_v2_for_checkpoint(checkpoint, path)?;
+        let sidecar_bytes = header.layers_bytes()?;
+        let sidecar = CoherentRegionOwner::file_read_only(
+            path,
+            header.layers_offset,
+            sidecar_bytes,
+            4096,
+            0,
+        )?;
+        if sidecar.view().payload_bytes != sidecar_bytes || sidecar.device_address() % 4096 != 0 {
+            return Err("Qwen fused MoE SoA-v2 mapping has an invalid size or alignment".into());
+        }
+        let base = sidecar.device_address();
+        let layer_specs: [QwenFusedMoeLayerSpec; QWEN_FUSED_MOE_LAYERS] =
+            std::array::from_fn(|layer| {
+                let layer_base = base + layer as u64 * EXPERT_SIDECAR_V2_LAYER_BYTES;
+                QwenFusedMoeLayerSpec {
+                    w13_weight: layer_base + EXPERT_SIDECAR_V2_W13_WEIGHT_OFFSET,
+                    w2_weight: layer_base + EXPERT_SIDECAR_V2_W2_WEIGHT_OFFSET,
+                    w13_weight_scale: layer_base + EXPERT_SIDECAR_V2_W13_SCALE_OFFSET,
+                    w2_weight_scale: layer_base + EXPERT_SIDECAR_V2_W2_SCALE_OFFSET,
+                    w13_input_scale_quant: layer_base
+                        + EXPERT_SIDECAR_V2_W13_INPUT_SCALE_QUANT_OFFSET,
+                    w13_alpha: layer_base + EXPERT_SIDECAR_V2_W13_ALPHA_OFFSET,
+                    w2_input_scale_quant: layer_base
+                        + EXPERT_SIDECAR_V2_W2_INPUT_SCALE_QUANT_OFFSET,
+                    w2_alpha: layer_base + EXPERT_SIDECAR_V2_W2_ALPHA_OFFSET,
+                }
+            });
+        let layers: [QwenFusedMoeLayer; QWEN_FUSED_MOE_LAYERS] = layer_specs
+            .into_iter()
+            .map(|layer| {
+                layer.validate()?;
+                Ok(QwenFusedMoeLayer {
+                    w13_weight: ptr(layer.w13_weight),
+                    w2_weight: ptr(layer.w2_weight),
+                    w13_weight_scale: ptr(layer.w13_weight_scale),
+                    w2_weight_scale: ptr(layer.w2_weight_scale),
+                    w13_input_scale_quant: ptr(layer.w13_input_scale_quant).cast::<f32>(),
+                    w13_alpha: ptr(layer.w13_alpha).cast::<f32>(),
+                    w2_input_scale_quant: ptr(layer.w2_input_scale_quant).cast::<f32>(),
+                    w2_alpha: ptr(layer.w2_alpha).cast::<f32>(),
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
+            .try_into()
+            .map_err(|_| "Qwen fused MoE layer count changed during conversion")?;
+        let options = QwenFusedMoeOptions::gb10();
+        let mut runner = std::ptr::null_mut();
+        fused_moe_native("create", unsafe {
+            flash_qwen_runtime_fused_moe_create(&options, &mut runner)
+        })?;
+        if runner.is_null() {
+            return Err("Qwen fused MoE create returned a null runner".into());
+        }
+        let runner = QwenFusedMoeRunnerOwner(runner);
+        let mut workspace_bytes = 0_usize;
+        fused_moe_native("workspace query", unsafe {
+            flash_qwen_runtime_fused_moe_workspace_bytes(
+                runner.0,
+                u32::try_from(PREFILL_CHUNK_TOKENS)?,
+                &mut workspace_bytes,
+            )
+        })?;
+        if workspace_bytes == 0 {
+            return Err("Qwen fused MoE returned an empty workspace".into());
+        }
+        let prefault_started = Instant::now();
+        let bytes = unsafe { sidecar.host_payload()? };
+        let mut observed = 0_u8;
+        for offset in (0..bytes.len()).step_by(4096) {
+            observed ^= unsafe { std::ptr::read_volatile(bytes.as_ptr().add(offset)) };
+        }
+        if let Some(last) = bytes.last() {
+            observed ^= unsafe { std::ptr::read_volatile(last) };
+        }
+        std::hint::black_box(observed);
+        eprintln!(
+            "Qwen fused MoE SoA-v2 sidecar: {:.3} GiB prefaulted in {:.3} s ({})",
+            sidecar_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+            prefault_started.elapsed().as_secs_f64(),
+            path.display(),
+        );
+        Ok(Self {
+            runner,
+            layers,
+            workspace: slab(u64::try_from(workspace_bytes)?)?,
+            _sidecar: sidecar,
+        })
+    }
+
+    fn launch(
+        &mut self,
+        layer: u32,
+        num_tokens: u32,
+        hidden_states: u64,
+        route_ids: u64,
+        route_weights: u64,
+        output: u64,
+        stream: &CudaStreamOwner,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let spec = QwenFusedMoeSpec::new(num_tokens)?;
+        let layer = self
+            .layers
+            .get(usize::try_from(layer)?)
+            .ok_or("Qwen fused MoE layer is out of range")?;
+        fused_moe_native("launch", unsafe {
+            flash_qwen_runtime_fused_moe_launch(
+                self.runner.0,
+                ptr(hidden_states),
+                ptr(route_ids).cast::<i32>(),
+                ptr(route_weights).cast::<f32>(),
+                layer,
+                spec.num_tokens,
+                ptr_mut(self.workspace.device_address()),
+                usize::try_from(self.workspace.view().payload_bytes)?,
+                ptr_mut(output),
+                stream.raw(),
+            )
+        })
+    }
+}
+
+fn configure_fused_moe(
+    requested: bool,
+    checkpoint: &FlashNextCheckpoint,
+) -> Result<Option<QwenFusedMoeRuntime>, Box<dyn std::error::Error>> {
+    if !requested {
+        return Ok(None);
+    }
+    if unsafe { flash_qwen_runtime_fused_moe_available() } == 0 {
+        return Err(
+            "FLASH_QWEN_FUSED_MOE=1 requested, but the FlashInfer fused-MoE backend is not linked"
+                .into(),
+        );
+    }
+    let path = std::env::var_os("FLASH_QWEN_FUSED_MOE_SIDECAR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or(
+            "FLASH_QWEN_FUSED_MOE=1 requires FLASH_QWEN_FUSED_MOE_SIDECAR=<SoA-v2 path>",
+        )?;
+    Ok(Some(QwenFusedMoeRuntime::create_from_sidecar(
+        checkpoint, &path,
+    )?))
 }
 
 /// One sequence-independent PLE storage owner. Field order is intentional:
@@ -707,6 +896,7 @@ pub struct QwenNativeEngine {
     qsa_compressed_keys: CoherentRegionOwner,
     qsa_full_key_states: CoherentRegionOwner,
     qsa_full_value_states: CoherentRegionOwner,
+    fused_moe: Option<QwenFusedMoeRuntime>,
     resident_experts: Option<QwenResidentExpertSidecar>,
     hot_experts: Vec<QwenExpertHotCache>,
     expert_slots: Vec<QwenLayerExpertSlots>,
@@ -723,9 +913,17 @@ impl QwenNativeEngine {
     pub fn create(model_root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let checkpoint = load_flash_next_checkpoint(model_root)?;
         let ple = QwenPleRuntime::create(&checkpoint, model_root)?;
-        let resident_sidecar_path = std::env::var_os("FLASH_QWEN_RESIDENT_SIDECAR")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from);
+        let fused_moe = configure_fused_moe(
+            matches!(std::env::var("FLASH_QWEN_FUSED_MOE").as_deref(), Ok("1")),
+            &checkpoint,
+        )?;
+        let resident_sidecar_path = if fused_moe.is_some() {
+            None
+        } else {
+            std::env::var_os("FLASH_QWEN_RESIDENT_SIDECAR")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        };
         let resident_experts = if let Some(path) = resident_sidecar_path.as_deref() {
             let started = Instant::now();
             let sidecar = QwenResidentExpertSidecar::open(&checkpoint, path, 0, true)?;
@@ -739,14 +937,15 @@ impl QwenNativeEngine {
         } else {
             None
         };
-        let resident_sidecar = resident_experts.is_some();
-        let mut expert_loader = (!resident_sidecar).then(|| QwenExpertFileLoader::new(&checkpoint));
+        let resident_expert_bank = resident_experts.is_some() || fused_moe.is_some();
+        let mut expert_loader =
+            (!resident_expert_bank).then(|| QwenExpertFileLoader::new(&checkpoint));
         let mut weight_maps = FlashNextWeightMaps::new(&checkpoint, 0);
         let direct_expert_pack = matches!(
             std::env::var("FLASH_QWEN_DIRECT_EXPERT_PACK").as_deref(),
             Ok("1")
         );
-        let hot_expert_banks = if resident_sidecar {
+        let hot_expert_banks = if resident_expert_bank {
             0
         } else if direct_expert_pack {
             LAYERS
@@ -757,14 +956,14 @@ impl QwenNativeEngine {
         for _ in 0..hot_expert_banks {
             hot_experts.push(QwenExpertHotCache::create(0)?);
         }
-        let expert_slots = if resident_sidecar {
+        let expert_slots = if resident_expert_bank {
             Vec::new()
         } else {
             (0..LAYERS)
                 .map(|_| QwenLayerExpertSlots::new())
                 .collect::<Vec<_>>()
         };
-        let mut prepared_experts = if resident_sidecar {
+        let mut prepared_experts = if resident_expert_bank {
             None
         } else {
             Some(QwenPreparedExpertCache::create(PREPARED_EXPERT_SLOTS, 0)?)
@@ -787,15 +986,19 @@ impl QwenNativeEngine {
             "Qwen expert arena prefault: {:.3} GiB in {:.3} s ({})",
             prefault_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
             prefault_started.elapsed().as_secs_f64(),
-            if resident_sidecar {
-                "resident indexed sidecar"
+            if resident_expert_bank {
+                if fused_moe.is_some() {
+                    "full-bank fused SoA-v2 sidecar"
+                } else {
+                    "resident indexed sidecar"
+                }
             } else if direct_expert_pack {
                 "persistent per-layer direct source-to-hot packing"
             } else {
                 "prepared cache"
             },
         );
-        if !resident_sidecar && direct_expert_pack {
+        if !resident_expert_bank && direct_expert_pack {
             let started = Instant::now();
             let source_bytes = expert_loader
                 .as_mut()
@@ -849,6 +1052,7 @@ impl QwenNativeEngine {
             qsa_full_value_states: slab(
                 QSA_LAYERS * u64::try_from(QWEN_MODEL_MAX_LENGTH)? * KV_WIDTH * 2,
             )?,
+            fused_moe,
             resident_experts,
             hot_experts,
             expert_slots,
@@ -861,7 +1065,7 @@ impl QwenNativeEngine {
             direct_expert_pack,
         };
         engine.reset_sequence()?;
-        if !resident_sidecar
+        if !resident_expert_bank
             && !direct_expert_pack
             && std::env::var_os("FLASH_QWEN_WARM_EXPERT_SOURCE").is_some()
         {
@@ -1035,14 +1239,14 @@ impl QwenNativeEngine {
                 )?;
             }
             let layer_index = usize::try_from(layer)?;
-            let resident_sidecar = self.resident_experts.is_some();
+            let resident_expert_bank = self.resident_experts.is_some() || self.fused_moe.is_some();
             let hot_expert_index = if direct_expert_pack { layer_index } else { 0 };
-            let hot_experts = if resident_sidecar {
+            let hot_experts = if resident_expert_bank {
                 None
             } else {
                 Some(&mut self.hot_experts[hot_expert_index])
             };
-            let expert_slots = if resident_sidecar {
+            let expert_slots = if resident_expert_bank {
                 None
             } else {
                 Some(&mut self.expert_slots[layer_index])
@@ -1062,6 +1266,7 @@ impl QwenNativeEngine {
                 &self.qsa_full_value_states,
                 u32::try_from(start_position)?,
                 num_tokens,
+                self.fused_moe.as_mut(),
                 self.resident_experts.as_ref(),
                 hot_experts,
                 expert_slots,
@@ -1201,6 +1406,7 @@ fn run_layer(
     qsa_full_value_states: &CoherentRegionOwner,
     start_position: u32,
     num_tokens: u32,
+    fused_moe: Option<&mut QwenFusedMoeRuntime>,
     resident_experts: Option<&QwenResidentExpertSidecar>,
     hot_experts: Option<&mut QwenExpertHotCache>,
     expert_slots: Option<&mut QwenLayerExpertSlots>,
@@ -1305,6 +1511,7 @@ fn run_layer(
         arena.mixed.device_address(),
         arena.moe_output.device_address(),
         arena,
+        fused_moe,
         resident_experts,
         hot_experts,
         expert_slots,
@@ -1986,6 +2193,7 @@ fn run_moe(
     hidden_states: u64,
     moe_output: u64,
     arena: &mut QwenDecodeArena,
+    fused_moe: Option<&mut QwenFusedMoeRuntime>,
     resident_experts: Option<&QwenResidentExpertSidecar>,
     hot_experts: Option<&mut QwenExpertHotCache>,
     expert_slots: Option<&mut QwenLayerExpertSlots>,
@@ -2022,6 +2230,32 @@ fn run_moe(
     };
     let router_started = Instant::now();
     native("Qwen router", unsafe { flash_moe_gate_launch(caps, &gate) })?;
+    if let Some(fused_moe) = fused_moe {
+        fused_moe.launch(
+            layer,
+            num_tokens,
+            hidden_states,
+            arena.route_ids.device_address(),
+            arena.route_weights.device_address(),
+            moe_output,
+            stream,
+        )?;
+        trace_stage(stream, trace, layer, "fused MoE routed branch")?;
+        return run_shared_expert_and_join(
+            maps,
+            resident,
+            layer,
+            num_tokens,
+            hidden_states,
+            moe_output,
+            arena,
+            stream,
+            blas,
+            caps,
+            trace,
+            fast_decode,
+        );
+    }
     // The SGLang top-k donor emits ten distinct IDs for T=1. Treat each rank
     // as one compact group and let the indexed FlashInfer argument preparer
     // read those IDs on the same CUDA stream. The fixed host IDs below validate
@@ -2428,6 +2662,37 @@ fn run_moe_batch(
     })?;
     trace_stage(stream, trace, layer, "resident MoE route finalize")?;
 
+    run_shared_expert_and_join(
+        maps,
+        resident,
+        layer,
+        num_tokens,
+        hidden_states,
+        moe_output,
+        arena,
+        stream,
+        blas,
+        caps,
+        trace,
+        fast_decode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_shared_expert_and_join(
+    maps: &mut FlashNextWeightMaps,
+    resident: &mut QwenResidentWeights,
+    layer: u32,
+    num_tokens: u32,
+    hidden_states: u64,
+    moe_output: u64,
+    arena: &mut QwenDecodeArena,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
+    caps: &DeviceCaps,
+    trace: bool,
+    fast_decode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let prefix = format!("model.language_model.layers.{layer}.mlp");
     let shared_gate_up = resident.merged_bf16_pair(
         maps,
@@ -2469,10 +2734,10 @@ fn run_moe_batch(
         cublas_handle: blas.raw(),
         cuda_stream: stream.raw(),
     };
-    native("Qwen resident shared expert", unsafe {
+    native("Qwen shared expert", unsafe {
         flash_shared_expert_launch(caps, &shared)
     })?;
-    trace_stage(stream, trace, layer, "resident MoE shared expert")?;
+    trace_stage(stream, trace, layer, "MoE shared expert")?;
     let join = MoeJoinArgs {
         struct_size: size::<MoeJoinArgs>(),
         abi_version: KERNEL_ABI_VERSION,
@@ -2483,10 +2748,10 @@ fn run_moe_batch(
         routed_output: ptr_mut(moe_output),
         cuda_stream: stream.raw(),
     };
-    native("Qwen resident MoE join", unsafe {
+    native("Qwen MoE join", unsafe {
         flash_moe_join_launch(caps, &join)
     })?;
-    trace_stage(stream, trace, layer, "resident MoE join")?;
+    trace_stage(stream, trace, layer, "MoE join")?;
     if !fast_decode || trace {
         stream.synchronize()?;
     }
@@ -3270,4 +3535,19 @@ fn native(stage: &str, status: Status) -> Result<(), Box<dyn std::error::Error>>
             .into_owned()
     };
     Err(format!("{stage}: {message} (status {})", status.code).into())
+}
+
+fn fused_moe_native(stage: &str, status: i32) -> Result<(), Box<dyn std::error::Error>> {
+    if status == QWEN_FUSED_MOE_SUCCESS {
+        return Ok(());
+    }
+    let message = unsafe {
+        let raw = flash_qwen_runtime_fused_moe_last_error();
+        if raw.is_null() {
+            "native fused-MoE error".to_owned()
+        } else {
+            CStr::from_ptr(raw).to_string_lossy().into_owned()
+        }
+    };
+    Err(format!("Qwen fused MoE {stage}: {message} (status {status})").into())
 }

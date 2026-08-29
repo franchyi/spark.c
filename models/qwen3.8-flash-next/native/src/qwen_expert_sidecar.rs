@@ -338,6 +338,16 @@ pub fn validate_expert_sidecar_for_checkpoint(
     Ok(header)
 }
 
+/// Stable source identity shared by immutable expert-sidecar layouts.  A new
+/// physical layout can retain checkpoint validation without accepting a v1
+/// AoS artifact or duplicating the fingerprint contract.
+pub fn expert_sidecar_source_fingerprint(
+    checkpoint: &FlashNextCheckpoint,
+) -> Result<[u8; 32], ExpertSidecarError> {
+    validate_checkpoint_geometry(checkpoint)?;
+    source_fingerprint(checkpoint)
+}
+
 fn validate_checkpoint_geometry(
     checkpoint: &FlashNextCheckpoint,
 ) -> Result<(), ExpertSidecarError> {

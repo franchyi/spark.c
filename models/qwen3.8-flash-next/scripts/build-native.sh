@@ -61,10 +61,11 @@ docker run --rm --network host --user "$user_id:$group_id" \
   -e RUSTFLAGS='-L native=/work/build/flash-next -l dylib=flash-fabric -l dylib=flash-qwen-runtime -C link-arg=-Wl,-rpath-link,/work/build/flash-next -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
   "$rust_image" \
   cargo build --release -p spark-flash-next --features native-fabric-smoke \
-    --example qwen_first_token --example qwen_decode --example qwen_serve
+    --example qwen_first_token --example qwen_decode --example qwen_serve \
+    --example qwen_expert_sidecar_v2
 
 mkdir -p "$repo_root/build/bin"
-for binary in qwen_first_token qwen_decode qwen_serve; do
+for binary in qwen_first_token qwen_decode qwen_serve qwen_expert_sidecar_v2; do
   cp "$target_host/release/examples/$binary" \
     "$repo_root/build/bin/$binary"
 done

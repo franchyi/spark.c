@@ -5,6 +5,58 @@ pub const NVFP4_GROUP_SIZE: u32 = 16;
 pub const WEIGHT_N_ALIGNMENT: u64 = 32;
 pub const WEIGHT_K_ALIGNMENT: u64 = 64;
 pub const WEIGHT_SCALE_N_ALIGNMENT: u64 = 128;
+pub const QWEN_FUSED_MOE_LAYERS: usize = 48;
+pub const QWEN_FUSED_MOE_EXPERTS: u32 = 512;
+pub const QWEN_FUSED_MOE_TOP_K: u32 = 10;
+pub const QWEN_FUSED_MOE_HIDDEN: u32 = 2560;
+pub const QWEN_FUSED_MOE_INTERMEDIATE: u32 = 640;
+
+/// Device addresses for the eight planes in one full-bank SoA-v2 layer.
+/// These are deliberately independent of the legacy strided AoS-v1 sidecar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QwenFusedMoeLayerSpec {
+    pub w13_weight: u64,
+    pub w2_weight: u64,
+    pub w13_weight_scale: u64,
+    pub w2_weight_scale: u64,
+    pub w13_input_scale_quant: u64,
+    pub w13_alpha: u64,
+    pub w2_input_scale_quant: u64,
+    pub w2_alpha: u64,
+}
+
+impl QwenFusedMoeLayerSpec {
+    pub fn validate(self) -> Result<(), KernelContractError> {
+        let planes = [
+            self.w13_weight,
+            self.w2_weight,
+            self.w13_weight_scale,
+            self.w2_weight_scale,
+            self.w13_input_scale_quant,
+            self.w13_alpha,
+            self.w2_input_scale_quant,
+            self.w2_alpha,
+        ];
+        if planes.contains(&0) {
+            return Err(KernelContractError::MissingFusedMoeLayerPlane);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QwenFusedMoeSpec {
+    pub num_tokens: u32,
+}
+
+impl QwenFusedMoeSpec {
+    pub fn new(num_tokens: u32) -> Result<Self, KernelContractError> {
+        if num_tokens == 0 {
+            return Err(KernelContractError::ZeroDimension);
+        }
+        Ok(Self { num_tokens })
+    }
+}
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -778,6 +830,7 @@ pub enum KernelContractError {
     InvalidLogicalGroupIds,
     UnsupportedInputType,
     UnsupportedFusedTactic,
+    MissingFusedMoeLayerPlane,
 }
 
 impl fmt::Display for KernelContractError {
@@ -853,6 +906,9 @@ impl fmt::Display for KernelContractError {
             Self::UnsupportedInputType => write!(formatter, "expected BF16 input"),
             Self::UnsupportedFusedTactic => {
                 write!(formatter, "expected the FlashInfer CuTe fused NVFP4 donor")
+            }
+            Self::MissingFusedMoeLayerPlane => {
+                write!(formatter, "fused Qwen MoE requires all eight SoA-v2 planes")
             }
         }
     }

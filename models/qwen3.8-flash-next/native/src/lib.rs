@@ -13,6 +13,7 @@ pub mod openai_server;
 #[cfg(feature = "native-fabric")]
 pub mod qwen_expert_cache;
 pub mod qwen_expert_sidecar;
+pub mod qwen_expert_sidecar_v2;
 pub mod qwen_ple;
 #[cfg(feature = "native-fabric")]
 pub mod qwen_weights;

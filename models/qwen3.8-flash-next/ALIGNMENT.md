@@ -14,6 +14,24 @@ sidecar and FlashInfer's complete generated SM120 fused-MoE instantiation set.
 The legacy AoS sidecar orders W13 as `[gate; up]`; SoA-v2 must swap it to
 `[up; gate]` for the SGLang/FlashInfer contract.
 
+SoA-v2 is a 4-KiB header, 48 CRC64 values, padding to offset 8,192, then 48
+fixed 1,415,585,792-byte layer records. Each layer record contains these
+contiguous planes (offsets are relative to the layer):
+
+| Plane | Offset | Bytes | Physical shape/order |
+| --- | ---: | ---: | --- |
+| W13 weight | 0 | 838,860,800 | U8 `[512,1280,1280]`, expert-major `[up;gate]` |
+| W2 weight | 838,860,800 | 419,430,400 | U8 `[512,2560,320]` |
+| W13 scale | 1,258,291,200 | 104,857,600 | swizzled U8 `[512,1280,160]`, `[up;gate]` |
+| W2 scale | 1,363,148,800 | 52,428,800 | swizzled U8 `[512,2560,40]` |
+| W13 input-scale-quant | 1,415,577,600 | 2,048 | F32 `[512]` |
+| W13 alpha | 1,415,579,648 | 2,048 | F32 `[512]` |
+| W2 input-scale-quant | 1,415,581,696 | 2,048 | F32 `[512]` |
+| W2 alpha | 1,415,583,744 | 2,048 | F32 `[512]` |
+
+The resulting file is 67,948,126,208 bytes. Build progress and CRC durability
+are layer-granular; the v1 AoS schema and serving fallback remain independent.
+
 ## Current graph and fixed shapes
 
 - `native/src/engine.rs::QwenNativeEngine::forward_tokens` owns 48 layers: 36
