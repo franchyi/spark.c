@@ -3,8 +3,9 @@
 
 This is a development-only SGLang fixture.  Mount it as ``sitecustomize.py``
 inside the pinned oracle container and set ``Q27_GREEDY_TRACE_OUTPUT_DIR``.
-Submit exactly one request whose prompt is ``input_ids=[248045]`` with greedy
+Submit exactly one request whose prompt is ``input_ids=[TOKEN]`` with greedy
 sampling, eight new tokens, and speculative decoding disabled at server start.
+``Q27_GREEDY_TRACE_INITIAL_TOKEN_ID`` selects ``TOKEN`` and defaults to 248045.
 The hook records the complete FP32 logits and BF16 final hidden state for each
 of the eight decisions.  It does not belong in the shipping runtime.
 """
@@ -19,10 +20,28 @@ import tempfile
 from typing import Any
 
 
-INITIAL_TOKEN_ID = 248045
+DEFAULT_INITIAL_TOKEN_ID = 248045
+VOCABULARY = 248320
 NUM_DECISIONS = 8
 TOP_K = 5
 _OUTPUT_ENV = "Q27_GREEDY_TRACE_OUTPUT_DIR"
+_INITIAL_TOKEN_ENV = "Q27_GREEDY_TRACE_INITIAL_TOKEN_ID"
+
+
+def _initial_token_id() -> int:
+    raw = os.environ.get(_INITIAL_TOKEN_ENV, str(DEFAULT_INITIAL_TOKEN_ID))
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise SystemExit(
+            f"{_INITIAL_TOKEN_ENV} must be an unsigned decimal token id"
+        )
+    value = int(raw)
+    if value > 0xFFFF_FFFF:
+        raise SystemExit(f"{_INITIAL_TOKEN_ENV} must fit in u32")
+    if value >= VOCABULARY:
+        raise SystemExit(
+            f"{_INITIAL_TOKEN_ENV} must be smaller than vocabulary {VOCABULARY}"
+        )
+    return value
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
@@ -42,13 +61,13 @@ def _optional_tensor_list(value: Any) -> list[int] | None:
     return [int(x) for x in value.detach().reshape(-1).cpu().tolist()]
 
 
-def _install_capture_hook(output_dir: Path) -> None:
+def _install_capture_hook(output_dir: Path, initial_token_id: int) -> None:
     import torch
     from sglang.srt.layers.logits_processor import LogitsProcessor
 
     original_forward = LogitsProcessor.forward
     steps: list[dict[str, Any]] = []
-    expected_input_id = INITIAL_TOKEN_ID
+    expected_input_id = initial_token_id
     complete = False
 
     def capture_forward(
@@ -80,7 +99,7 @@ def _install_capture_hook(output_dir: Path) -> None:
         # input to equal the preceding greedy token so unrelated requests can
         # never be spliced into the trace.
         if not steps:
-            if ids != [INITIAL_TOKEN_ID]:
+            if ids != [initial_token_id]:
                 return result
         elif ids != [expected_input_id]:
             return result
@@ -91,14 +110,21 @@ def _install_capture_hook(output_dir: Path) -> None:
         hidden_bytes = hidden_cpu.view(torch.uint16).numpy().tobytes(order="C")
         logits_bytes = logits_cpu.numpy().astype("<f4", copy=False).tobytes(order="C")
 
-        top_values, top_indices = torch.topk(
-            logits_cpu.reshape(-1), k=TOP_K, largest=True, sorted=True
-        )
+        flat_logits = logits_cpu.reshape(-1)
+        # Stable full ordering is intentional for this development fixture.
+        # It makes every tie, including a tie spanning the rank-five cutoff,
+        # deterministic by preserving ascending token ID within equal logits.
+        top_indices = torch.argsort(flat_logits, descending=True, stable=True)[:TOP_K]
+        top_values = flat_logits[top_indices]
         top5 = [
             {"token_id": int(token_id), "logit_fp32": float(value)}
             for token_id, value in zip(top_indices.tolist(), top_values.tolist())
         ]
-        greedy_token_id = top5[0]["token_id"]
+        # SGLang all-greedy sampling uses torch.argmax, whose exact-tie choice
+        # is the lowest token ID.  The stable ordering above has the same rule.
+        greedy_token_id = int(torch.argmax(flat_logits).item())
+        if top5[0]["token_id"] != greedy_token_id:
+            raise RuntimeError("stable oracle top-five disagrees with torch.argmax")
         index = len(steps)
         hidden_file = f"step{index:02d}.hidden.bf16le"
         logits_file = f"step{index:02d}.logits.f32le"
@@ -137,7 +163,7 @@ def _install_capture_hook(output_dir: Path) -> None:
             "schema": "sparkserve.q27.sglang-greedy-trace.v1",
             "contract": {
                 "batch_size": 1,
-                "initial_input_ids": [INITIAL_TOKEN_ID],
+                "initial_input_ids": [initial_token_id],
                 "num_new_tokens": NUM_DECISIONS,
                 "temperature": 0,
                 "speculative_decoding": False,
@@ -190,7 +216,7 @@ def _main() -> None:
         raise SystemExit(f"Set {_OUTPUT_ENV} when mounting this fixture.")
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _install_capture_hook(output_dir)
+    _install_capture_hook(output_dir, _initial_token_id())
 
 
 if os.environ.get(_OUTPUT_ENV):

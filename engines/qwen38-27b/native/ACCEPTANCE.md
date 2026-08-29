@@ -5,6 +5,11 @@ model-specific eager engine. It uses only the Python standard library and is
 never imported, linked, or packaged by the serving runtime. SGLang and Torch
 are needed only when creating a new oracle trace, not when validating one.
 
+The development-only capture hook defaults to raw input token `248045`. Set
+`Q27_GREEDY_TRACE_INITIAL_TOKEN_ID` to a different decimal token ID when
+capturing another case; the hook rejects malformed, non-u32, and out-of-vocab
+values before installing itself.
+
 The comparator rejects an incomplete or stale oracle before looking at native
 results. It verifies the locked checkpoint, image, SGLang and FlashInfer
 revisions; the raw-token/no-chat/no-spec contract; every greedy input/output
@@ -72,3 +77,29 @@ The numerical limits bracket the retained position-zero reference
 (`cosine=0.999481`, `mean_abs=0.077730`, `max_abs=0.584895`) while leaving only
 a small regression margin. Threshold overrides are command-line diagnostics;
 milestone reports should use the defaults.
+
+## Three-case raw-start diagnostic
+
+The default non-smoke comparator was run on Spark on 2026-08-29 with raw starts
+`248045`, `9707`, and `151644`, eight decisions per case, and one complete
+native FP32 logit vector per case. The suite is retained at
+`/home/chaoyi/.cache/sparkserve-q27-continuation-suite/run-20260829-v1/suite.json`
+and its report is the sibling `report.json`. The overall result is **FAIL**, not
+a passing promotion gate:
+
+- `248045`: exact eight-token continuation and ordered top five; cosine
+  `0.999477846`, mean absolute error `0.077730029`, maximum absolute error
+  `0.584894180`.
+- `9707`: first decision differs; cosine `0.994970632`, mean absolute error
+  `0.279548504`, maximum absolute error `2.002514422`.
+- `151644`: first decision agrees and the chain first differs at decision one;
+  cosine `0.978850851`, mean absolute error `0.279888856`, maximum absolute
+  error `2.263875246`.
+
+This is an arbitrary raw-token/zero-state diagnostic, not the required valid
+ChatML service-prefix acceptance. Tokens `9707` and `151644` are not ChatML
+prefixes, and `248045` is only `<|im_start|>`, not a complete rendered prompt.
+The failures prove that the current native initial-token arithmetic is not
+generally identical to the Triton oracle; they do not by themselves determine
+whether a complete tokenizer-rendered ChatML prompt diverges. Promotion still
+requires retained real ChatML prompt cases through the same prefill boundary.
