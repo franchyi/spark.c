@@ -23,11 +23,11 @@ architecture revision plan for exactly three model-specific services:
 
 This is an edge-device project, not a general inference framework. Optimize for
 small code, predictable memory, fast startup, debuggability, and GB10
-performance. Prefer a **C-like design**: fixed model graphs, explicit state,
-static shapes where useful, direct data structures, narrow raw C/CUDA ABIs, and
-few dependencies. Rust should be a small online control plane for admission,
-batching, cancellation, state, NVMe I/O, metrics, and HTTP/SSE—not another graph
-framework.
+performance. Prefer a **C/Rust-like lightweight, high-performance design**:
+fixed model graphs, explicit state, static shapes where useful, direct data
+structures, narrow raw C/CUDA ABIs, and few dependencies. Rust should be a small
+online control plane for admission, batching, cancellation, state, NVMe I/O,
+metrics, and HTTP/SSE—not another graph framework.
 
 Start from the runnable SGLang/vLLM/ds4 implementations. Use them as correctness
 and performance oracles and reuse proven kernels or model code when licensing
