@@ -73,14 +73,14 @@ fn status(status: NativeStatus) -> Result<(), MappingError> {
     Err(MappingError::Native(message))
 }
 
-struct ShardMapping {
+pub struct MappedFile {
     handle: NonNull<NativeMapping>,
     device_base: usize,
     bytes: u64,
 }
 
-impl ShardMapping {
-    fn open(path: &Path) -> Result<Self, MappingError> {
+impl MappedFile {
+    pub fn open(path: &Path) -> Result<Self, MappingError> {
         let path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| MappingError::Invalid("q27 shard path contains NUL".into()))?;
         let mut raw = std::ptr::null_mut();
@@ -111,9 +111,21 @@ impl ShardMapping {
         }
         Ok(Self { handle, device_base: view.device_base as usize, bytes: view.bytes })
     }
+
+    pub fn bytes(&self) -> u64 { self.bytes }
+
+    pub fn device_address(&self, offset: u64, bytes: u64) -> Result<usize, MappingError> {
+        let end = offset.checked_add(bytes)
+            .ok_or_else(|| MappingError::Invalid("q27 mapped-file offset overflow".into()))?;
+        if end > self.bytes {
+            return Err(MappingError::Invalid("q27 view exceeds mapped file".into()));
+        }
+        self.device_base.checked_add(offset as usize)
+            .ok_or_else(|| MappingError::Invalid("q27 device address overflow".into()))
+    }
 }
 
-impl Drop for ShardMapping {
+impl Drop for MappedFile {
     fn drop(&mut self) {
         // SAFETY: the guard owns this handle exactly once.
         let _ = unsafe { q27_mapping_close(self.handle.as_ptr()) };
@@ -122,7 +134,7 @@ impl Drop for ShardMapping {
 
 pub struct MappedCheckpoint {
     checkpoint: Q27Checkpoint,
-    shards: BTreeMap<PathBuf, ShardMapping>,
+    shards: BTreeMap<PathBuf, MappedFile>,
 }
 
 impl MappedCheckpoint {
@@ -133,7 +145,7 @@ impl MappedCheckpoint {
             if shards.contains_key(&tensor.relative_file) {
                 continue;
             }
-            let mapping = ShardMapping::open(&checkpoint.plan().root.join(&tensor.relative_file))?;
+            let mapping = MappedFile::open(&checkpoint.plan().root.join(&tensor.relative_file))?;
             shards.insert(tensor.relative_file.clone(), mapping);
         }
         Ok(Self { checkpoint, shards })
@@ -148,12 +160,6 @@ impl MappedCheckpoint {
     pub fn device_address(&self, tensor: &TensorLocation) -> Result<usize, MappingError> {
         let shard = self.shards.get(&tensor.relative_file)
             .ok_or_else(|| MappingError::Invalid("q27 tensor shard is not mapped".into()))?;
-        let end = tensor.absolute_offset.checked_add(tensor.data_bytes)
-            .ok_or_else(|| MappingError::Invalid("q27 tensor offset overflow".into()))?;
-        if end > shard.bytes {
-            return Err(MappingError::Invalid("q27 tensor exceeds mapped shard".into()));
-        }
-        shard.device_base.checked_add(tensor.absolute_offset as usize)
-            .ok_or_else(|| MappingError::Invalid("q27 device address overflow".into()))
+        shard.device_address(tensor.absolute_offset, tensor.data_bytes)
     }
 }
