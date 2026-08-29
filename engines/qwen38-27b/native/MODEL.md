@@ -54,6 +54,9 @@ The decode GDN capsule reuses the pinned FlashInfer SM121 recurrence object and
 keeps its causal convolution and gated RMSNorm as fixed q27 CUDA kernels. The
 real-checkpoint fixture is byte-exact at all five oracle boundaries and takes
 40.781 microseconds per layer excluding projections.
+The two small BF16 A/B projections are likewise byte-exact against the real
+layer-0 SGLang result and take 40.169 microseconds together through one
+caller-owned cuBLAS handle.
 
 ## Lightweight dependency rule
 
