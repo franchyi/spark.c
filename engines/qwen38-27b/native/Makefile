@@ -7,26 +7,41 @@ REPO_ROOT := ../../..
 BUILD_DIR := $(REPO_ROOT)/build/q27
 INCLUDES := -Iinclude
 KERNEL_SHARED := $(BUILD_DIR)/libq27-kernels.so
+MAPPING_SHARED := $(BUILD_DIR)/libq27-mapping.so
 FP8_FIXTURE_TEST := $(BUILD_DIR)/q27-fp8-fixture-test
+CORE_FIXTURE_TEST := $(BUILD_DIR)/q27-core-fixture-test
 
-.PHONY: kernels test-fp8 clean
+.PHONY: kernels mapping test-core test-fp8 clean
 
 kernels: $(KERNEL_SHARED)
+
+mapping: $(MAPPING_SHARED)
 
 test-fp8: $(FP8_FIXTURE_TEST)
 	test -n "$(Q27_FP8_FIXTURE)"
 	LD_LIBRARY_PATH=$(BUILD_DIR):$$LD_LIBRARY_PATH \
 		$(FP8_FIXTURE_TEST) "$(Q27_FP8_FIXTURE)"
 
+test-core: $(CORE_FIXTURE_TEST)
+	LD_LIBRARY_PATH=$(BUILD_DIR):$$LD_LIBRARY_PATH $(CORE_FIXTURE_TEST)
+
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(KERNEL_SHARED): csrc/q27_fp8_decode.cu include/q27_kernels.h | $(BUILD_DIR)
+$(KERNEL_SHARED): csrc/q27_fp8_decode.cu csrc/q27_core.cu include/q27_kernels.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) --shared -Xcompiler -fPIC \
-		csrc/q27_fp8_decode.cu -o $@
+		csrc/q27_fp8_decode.cu csrc/q27_core.cu -lcublas -o $@
+
+$(MAPPING_SHARED): csrc/q27_mapping.cc include/q27_mapping.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) --shared -Xcompiler -fPIC \
+		csrc/q27_mapping.cc -o $@
 
 $(FP8_FIXTURE_TEST): fixtures/q27_fp8_fixture_test.cu include/q27_kernels.h $(KERNEL_SHARED) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) fixtures/q27_fp8_fixture_test.cu \
+		-L$(BUILD_DIR) -lq27-kernels -o $@
+
+$(CORE_FIXTURE_TEST): fixtures/q27_core_fixture_test.cu include/q27_kernels.h $(KERNEL_SHARED) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) fixtures/q27_core_fixture_test.cu \
 		-L$(BUILD_DIR) -lq27-kernels -o $@
 
 clean:

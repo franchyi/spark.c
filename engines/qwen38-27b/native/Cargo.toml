@@ -9,5 +9,9 @@ description = "Lightweight model-specific Qwen3.8-27B control plane for DGX Spar
 name = "q27-inspect"
 path = "src/main.rs"
 
+[[bin]]
+name = "q27-map-inspect"
+path = "src/map_main.rs"
+
 [dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

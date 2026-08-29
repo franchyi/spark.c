@@ -171,6 +171,10 @@ impl Q27Checkpoint {
     pub fn tensor(&self, name: &str) -> Result<&TensorLocation, Q27Error> {
         self.tensors.get(name).ok_or_else(|| invalid(format!("missing tensor {name}")))
     }
+
+    pub fn tensors(&self) -> impl Iterator<Item = (&str, &TensorLocation)> {
+        self.tensors.iter().map(|(name, location)| (name.as_str(), location))
+    }
 }
 
 #[derive(Debug)]

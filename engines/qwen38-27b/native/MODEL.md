@@ -35,6 +35,18 @@ block is intentionally excluded from quantization. The native runtime maps
 22,827,603,072 text/MTP bytes and does not materialize a framework tensor
 registry.
 
+On GB10 the q27-only mapping capsule registers the three original shard files
+directly with CUDA. The complete 22.118 GiB checkpoint address space maps in
+13.19 seconds without a payload copy; tensor device addresses are derived from
+the strict safetensors offsets. CUDA registration makes those file-backed pages
+resident (22.22 GiB maximum RSS in the measured startup), so this is one
+file-page copy, not an additional device allocation.
+
+The decode GDN capsule reuses the pinned FlashInfer SM121 recurrence object and
+keeps its causal convolution and gated RMSNorm as fixed q27 CUDA kernels. The
+real-checkpoint fixture is byte-exact at all five oracle boundaries and takes
+40.781 microseconds per layer excluding projections.
+
 ## Lightweight dependency rule
 
 The serving process may depend on CUDA, cuBLAS/cuBLASLt, and the tiny TVM-FFI C
