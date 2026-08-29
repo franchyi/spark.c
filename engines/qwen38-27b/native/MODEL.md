@@ -84,6 +84,19 @@ step (9.66 token/s), with
 eight, and 129.344 MiB scratch. This is a correctness baseline, not the
 graph-captured performance target.
 
+The opt-in `Q27_PROFILE_STAGES=1` CUDA-event path profiles only the first warm
+token and is disabled by default. On Spark it measured 105.010 ms wall time
+and 104.300 ms of staged GPU work: MLP 50.651 ms, GDN blocks 29.660 ms,
+streaming LM head 10.789 ms, attention blocks 8.912 ms, and all 129 norms
+4.246 ms. Exact-shape fixture timings attribute 28.620 ms to FP8 projections
+(21.606 ms in GDN and 7.014 ms in attention). NVFP4 gate/up/down GEMMs account
+for about 43.50 ms before activation quantization and SiLU overhead. The
+highest-leverage next optimization is therefore a borrowed or independently
+verified SM121 NVFP4 streaming specialization that improves the current
+180--215 GB/s toward the FP8 capsule's 247--263 GB/s. The 32 available
+FlashInfer tactics are already swept, so an unverified kernel rewrite is not
+part of this MVP.
+
 `q27-pack-scales` converts all 192 checkpoint E4M3 scale matrices into the
 CUTLASS 128x4 order once. Its revision-bound sidecar also stores each
 projection's `1/input_scale` and `input_scale*weight_scale_2`; decode maps those

@@ -220,6 +220,95 @@ struct q27_model {
 
 namespace {
 
+struct StageRecord {
+  const char* category;
+  cudaEvent_t begin;
+  cudaEvent_t end;
+};
+
+class StageProfiler {
+ public:
+  StageProfiler(cudaStream_t stream, bool enabled) : stream_(stream) {
+    if (!enabled) return;
+    events_.resize(520, nullptr);
+    for (cudaEvent_t& event : events_) {
+      if (cudaEventCreate(&event) != cudaSuccess) {
+        for (cudaEvent_t created : events_)
+          if (created != nullptr) cudaEventDestroy(created);
+        events_.clear();
+        return;
+      }
+    }
+    records_.reserve(260);
+    enabled_ = true;
+  }
+
+  ~StageProfiler() {
+    for (cudaEvent_t event : events_)
+      if (event != nullptr) cudaEventDestroy(event);
+  }
+
+  size_t Start(const char* category) {
+    if (!enabled_ || records_.size() * 2 + 1 >= events_.size())
+      return static_cast<size_t>(-1);
+    const size_t index = records_.size();
+    records_.push_back(
+        {category, events_[index * 2], events_[index * 2 + 1]});
+    if (cudaEventRecord(records_.back().begin, stream_) != cudaSuccess)
+      enabled_ = false;
+    return index;
+  }
+
+  void Stop(size_t index) {
+    if (!enabled_ || index == static_cast<size_t>(-1)) return;
+    if (cudaEventRecord(records_[index].end, stream_) != cudaSuccess)
+      enabled_ = false;
+  }
+
+  void Report(double wall_ms, uint32_t position) {
+    if (!enabled_) return;
+    struct Total {
+      const char* name;
+      double milliseconds;
+    };
+    Total totals[] = {{"embedding", 0.0}, {"norm", 0.0},
+                      {"gdn", 0.0},       {"attention", 0.0},
+                      {"mlp", 0.0},       {"lm_head", 0.0},
+                      {"argmax", 0.0}};
+    double sum = 0.0;
+    for (const StageRecord& record : records_) {
+      float milliseconds = 0.0F;
+      if (cudaEventElapsedTime(&milliseconds, record.begin, record.end) !=
+          cudaSuccess)
+        return;
+      sum += milliseconds;
+      for (Total& total : totals) {
+        if (std::strcmp(total.name, record.category) == 0) {
+          total.milliseconds += milliseconds;
+          break;
+        }
+      }
+    }
+    std::fprintf(
+        stderr,
+        "q27_profile position=%u embedding_ms=%.6f norm_ms=%.6f "
+        "gdn_ms=%.6f attention_ms=%.6f mlp_ms=%.6f lm_head_ms=%.6f "
+        "argmax_ms=%.6f stage_sum_ms=%.6f wall_ms=%.6f gap_ms=%.6f "
+        "spans=%zu\n",
+        position, totals[0].milliseconds, totals[1].milliseconds,
+        totals[2].milliseconds, totals[3].milliseconds,
+        totals[4].milliseconds, totals[5].milliseconds,
+        totals[6].milliseconds, sum, wall_ms, wall_ms - sum,
+        records_.size());
+  }
+
+ private:
+  cudaStream_t stream_ = nullptr;
+  bool enabled_ = false;
+  std::vector<cudaEvent_t> events_;
+  std::vector<StageRecord> records_;
+};
+
 q27_model_status DumpBoundary(q27_model* model, uint32_t layer,
                               const char* label, const void* device_pointer,
                               uint64_t bytes) {
@@ -924,6 +1013,9 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   if (model->position >= model->capacity)
     return Invalid("q27 context capacity exhausted");
   const auto begin = std::chrono::steady_clock::now();
+  StageProfiler profiler(
+      model->stream,
+      model->position == 1 && std::getenv("Q27_PROFILE_STAGES") != nullptr);
   const uint32_t sequence_length = model->position + 1;
   cudaError_t error = cudaMemcpyAsync(
       model->attention_sequence_length, &sequence_length,
@@ -939,7 +1031,9 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   embedding.weight_bf16 = model->weights.embedding_bf16;
   embedding.output_bf16 = model->hidden;
   embedding.cuda_stream = model->stream;
+  size_t profile_span = profiler.Start("embedding");
   q27_kernel_status kernel = q27_embedding(&embedding);
+  profiler.Stop(profile_span);
   if (kernel.code != Q27_KERNEL_OK)
     return Kernel("q27 embedding: ", kernel.message);
   q27_model_status status = DumpBoundary(
@@ -947,9 +1041,11 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   if (status.code != Q27_MODEL_OK) return status;
 
   for (uint32_t layer = 0; layer < Q27_MODEL_LAYERS; ++layer) {
+    profile_span = profiler.Start("norm");
     status = Norm(model, model->hidden, layer == 0 ? nullptr : model->residual,
                   model->layers[layer].input_norm_bf16, model->normalized,
                   model->residual, layer != 0);
+    profiler.Stop(profile_span);
     if (status.code != Q27_MODEL_OK) return status;
     status = DumpBoundary(model, layer, "input_norm", model->normalized,
                           kHiddenBytes);
@@ -957,8 +1053,10 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
     status = DumpBoundary(model, layer, "input_residual", model->residual,
                           kHiddenBytes);
     if (status.code != Q27_MODEL_OK) return status;
+    profile_span = profiler.Start(IsAttention(layer) ? "attention" : "gdn");
     status = IsAttention(layer) ? AttentionLayer(model, layer)
                                 : GdnLayer(model, layer);
+    profiler.Stop(profile_span);
     if (status.code != Q27_MODEL_OK) return status;
     if (!IsAttention(layer)) {
       status = DumpGdnInternals(model, layer);
@@ -967,9 +1065,11 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
     status = DumpBoundary(model, layer, "sublayer_output", model->hidden,
                           kHiddenBytes);
     if (status.code != Q27_MODEL_OK) return status;
+    profile_span = profiler.Start("norm");
     status = Norm(model, model->hidden, model->residual,
                   model->layers[layer].post_attention_norm_bf16,
                   model->normalized, model->residual, true);
+    profiler.Stop(profile_span);
     if (status.code != Q27_MODEL_OK) return status;
     status = DumpBoundary(model, layer, "post_norm", model->normalized,
                           kHiddenBytes);
@@ -977,16 +1077,20 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
     status = DumpBoundary(model, layer, "post_residual", model->residual,
                           kHiddenBytes);
     if (status.code != Q27_MODEL_OK) return status;
+    profile_span = profiler.Start("mlp");
     status = MlpLayer(model, layer);
+    profiler.Stop(profile_span);
     if (status.code != Q27_MODEL_OK) return status;
     status = DumpBoundary(model, layer, "mlp_output", model->hidden,
                           kHiddenBytes);
     if (status.code != Q27_MODEL_OK) return status;
   }
 
+  profile_span = profiler.Start("norm");
   status = Norm(model, model->hidden, model->residual,
                 model->weights.final_norm_bf16, model->normalized,
                 model->residual, true);
+  profiler.Stop(profile_span);
   if (status.code != Q27_MODEL_OK) return status;
   status = DumpBoundary(model, UINT32_MAX, "final_hidden", model->normalized,
                         kHiddenBytes);
@@ -1001,7 +1105,9 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   lm_head.logits_f32 = model->logits;
   lm_head.cublas_handle = model->cublas;
   lm_head.cuda_stream = model->stream;
+  profile_span = profiler.Start("lm_head");
   kernel = q27_lm_head_bf16_stream(&lm_head);
+  profiler.Stop(profile_span);
   if (kernel.code != Q27_KERNEL_OK)
     return Kernel("q27 streaming LM head: ", kernel.message);
 
@@ -1015,7 +1121,9 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   argmax.scratch_indices_i32 = model->argmax_indices;
   argmax.output_token_i32 = model->output_token;
   argmax.cuda_stream = model->stream;
+  profile_span = profiler.Start("argmax");
   kernel = q27_argmax(&argmax);
+  profiler.Stop(profile_span);
   if (kernel.code != Q27_KERNEL_OK)
     return Kernel("q27 greedy argmax: ", kernel.message);
   int32_t result = -1;
@@ -1026,12 +1134,14 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   if (error != cudaSuccess) return Cuda("q27 greedy decode sync: ", error);
   if (result < 0 || static_cast<uint32_t>(result) >= kVocabulary)
     return Kernel("q27 greedy argmax: ", "returned token is out of range");
-  *output_token = static_cast<uint32_t>(result);
-  ++model->position;
-  model->last_decode_us = static_cast<uint64_t>(
+  const uint64_t elapsed_us = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - begin)
           .count());
+  profiler.Report(static_cast<double>(elapsed_us) / 1000.0, model->position);
+  *output_token = static_cast<uint32_t>(result);
+  ++model->position;
+  model->last_decode_us = elapsed_us;
   return Ok();
 }
 
