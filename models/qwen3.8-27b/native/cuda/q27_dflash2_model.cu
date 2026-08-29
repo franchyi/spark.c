@@ -3,6 +3,7 @@
 
 #include "q27_dflash2_model.h"
 #include "q27_dflash2_attention.h"
+#include "q27_dflash2_mlp.h"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -24,10 +25,6 @@ q27_dflash2_status Ok() { return {Q27_DFLASH2_OK, "ok"}; }
 
 q27_dflash2_status Invalid(const char* message) {
   return {Q27_DFLASH2_INVALID_ARGUMENT, message};
-}
-
-q27_dflash2_status Unimplemented(const char* message) {
-  return {Q27_DFLASH2_UNIMPLEMENTED, message};
 }
 
 q27_dflash2_status CudaError(const char* operation, cudaError_t error) {
@@ -342,16 +339,13 @@ extern "C" q27_dflash2_status q27_dflash2_forward(
     const q27_dflash2_forward_args* args) {
   q27_dflash2_status status = ValidateHeader(args);
   if (status.code != Q27_DFLASH2_OK) return status;
-  if (args->mlp == nullptr) {
-    return Unimplemented(
-        "DFlash2 forward requires the fixed MLP dependency");
-  }
   if (args->weights == nullptr || args->input_embeddings_bf16 == nullptr ||
       args->positions_u64 == nullptr || args->normalized_bf16 == nullptr ||
       args->residual_bf16 == nullptr || args->sublayer_output_bf16 == nullptr ||
       args->final_hidden_bf16 == nullptr || args->state == nullptr ||
       args->cublas_handle == nullptr || args->batch_size == 0 ||
       args->batch_size > Q27_DFLASH2_MAX_BATCH ||
+      (args->mlp == nullptr && args->mlp_user_data != nullptr) ||
       !std::isfinite(args->rms_epsilon) || args->rms_epsilon < 0.0F ||
       !DistinctForwardBuffers(args)) {
     return Invalid("invalid DFlash2 forward arguments");
@@ -400,7 +394,9 @@ extern "C" q27_dflash2_status q27_dflash2_forward(
 
     call.input_bf16 = args->normalized_bf16;
     call.output_bf16 = args->sublayer_output_bf16;
-    status = args->mlp(&call, args->mlp_user_data);
+    status = args->mlp != nullptr
+                 ? args->mlp(&call, args->mlp_user_data)
+                 : q27_dflash2_mlp_sublayer(&call, nullptr);
     if (status.code != Q27_DFLASH2_OK) return status;
 
     norm_input = args->sublayer_output_bf16;

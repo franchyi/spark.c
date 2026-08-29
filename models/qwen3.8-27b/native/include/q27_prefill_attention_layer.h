@@ -60,6 +60,50 @@ extern "C" {
   (Q27_PREFILL_ATTENTION_LAYER_QUANTIZED_OFFSET + \
    Q27_PREFILL_ATTENTION_LAYER_QUANTIZED_BYTES)
 
+/* M=512 lane storage. All row-major scratch tensors are exactly 4x M=128. */
+#define Q27_PREFILL_ATTENTION_LAYER_M512_HIDDEN_BYTES \
+  (512ULL * 5120ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_Q_GATE_BYTES \
+  (512ULL * 12288ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_KV_BYTES \
+  (512ULL * 1024ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_HEADS_BYTES \
+  (512ULL * 6144ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_QUANTIZED_BYTES \
+  (512ULL * 6144ULL)
+
+#define Q27_PREFILL_ATTENTION_LAYER_M512_NORMALIZED_OFFSET 0ULL
+#define Q27_PREFILL_ATTENTION_LAYER_M512_INPUT_RESIDUAL_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_NORMALIZED_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_HIDDEN_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_Q_GATE_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_INPUT_RESIDUAL_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_HIDDEN_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_KEY_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_Q_GATE_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_Q_GATE_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_VALUE_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_KEY_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_KV_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_QUERY_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_VALUE_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_KV_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_GATE_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_QUERY_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_HEADS_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_CONTEXT_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_GATE_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_HEADS_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_PROJECTED_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_CONTEXT_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_HEADS_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_QUANTIZED_OFFSET \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_PROJECTED_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_HIDDEN_BYTES)
+#define Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES \
+  (Q27_PREFILL_ATTENTION_LAYER_M512_QUANTIZED_OFFSET + \
+   Q27_PREFILL_ATTENTION_LAYER_M512_QUANTIZED_BYTES)
+
 typedef enum q27_prefill_attention_layer_status_code {
   Q27_PREFILL_ATTENTION_LAYER_OK = 0,
   Q27_PREFILL_ATTENTION_LAYER_INVALID_ARGUMENT = 1,
@@ -105,7 +149,10 @@ typedef struct q27_prefill_attention_layer_weights {
   const void* k_norm_bf16;               /* [256] */
 } q27_prefill_attention_layer_weights;
 
-/* Typed view of caller-owned scratch; no storage is allocated. */
+/*
+ * Typed view of caller-owned scratch; no storage is allocated. Shapes are
+ * [128,...] or [512,...] according to the scratch helper used.
+ */
 typedef struct q27_prefill_attention_layer_scratch_view {
   void* normalized_bf16;       /* [128,5120] */
   void* input_residual_bf16;   /* [128,5120] */
@@ -162,14 +209,23 @@ typedef struct q27_prefill_attention_layer_args {
 q27_prefill_attention_layer_status q27_prefill_attention_layer_plan_create(
     const q27_prefill_attention_layer_plan_config* config,
     q27_prefill_attention_layer_plan** output);
+q27_prefill_attention_layer_status q27_prefill_attention_layer_plan_create_m512(
+    const q27_prefill_attention_layer_plan_config* config,
+    q27_prefill_attention_layer_plan** output);
 void q27_prefill_attention_layer_plan_destroy(
     q27_prefill_attention_layer_plan* plan);
 
 q27_prefill_attention_layer_status q27_prefill_attention_layer_scratch(
     void* scratch, uint64_t scratch_bytes,
     q27_prefill_attention_layer_scratch_view* output);
+q27_prefill_attention_layer_status q27_prefill_attention_layer_scratch_m512(
+    void* scratch, uint64_t scratch_bytes,
+    q27_prefill_attention_layer_scratch_view* output);
 
 q27_prefill_attention_layer_status q27_prefill_attention_layer_forward(
+    q27_prefill_attention_layer_plan* plan,
+    const q27_prefill_attention_layer_args* args);
+q27_prefill_attention_layer_status q27_prefill_attention_layer_forward_m512(
     q27_prefill_attention_layer_plan* plan,
     const q27_prefill_attention_layer_args* args);
 

@@ -134,8 +134,8 @@ extern "C" q27_prefill_mlp_status q27_prefill_mlp_query(
   return Ok();
 }
 
-extern "C" q27_prefill_mlp_status q27_prefill_mlp_forward(
-    const q27_prefill_mlp_args* args) {
+static q27_prefill_mlp_status ForwardImpl(
+    const q27_prefill_mlp_args* args, bool fused_silu_quantize) {
   if (args == nullptr || args->struct_size < sizeof(*args) ||
       args->abi_version != Q27_PREFILL_MLP_ABI_VERSION) {
     return Invalid("invalid Q27 prefill MLP ABI header");
@@ -205,6 +205,52 @@ extern "C" q27_prefill_mlp_status q27_prefill_mlp_forward(
     return Nvfp4("Q27 prefill merged gate/up", status);
   }
 
+  if (fused_silu_quantize) {
+    q27_prefill_nvfp4_silu_mul_quantize_args fused{};
+    fused.struct_size = sizeof(fused);
+    fused.abi_version = Q27_PREFILL_NVFP4_ABI_VERSION;
+    fused.m = args->tokens;
+    fused.input_gate_up_bf16 = gate_up_output;
+    fused.input_gate_up_bytes = gate_up.output_bf16_bytes;
+    fused.input_global_scale_inv = args->activated_global_scale_inv;
+    /* Reuse the otherwise idle fallback activation tile for the donor's
+     * required one-element, device-resident expert row-count mask. */
+    fused.single_expert_mask_i32 = static_cast<int32_t*>(activated);
+    fused.packed_output_fp4_e2m1 = packed_input;
+    fused.packed_output_bytes = down.packed_input_bytes;
+    fused.output_scales_e4m3_128x4 = input_scales;
+    fused.output_scale_bytes = down.input_scale_bytes;
+    fused.cuda_stream = args->cuda_stream;
+    status = q27_prefill_nvfp4_silu_mul_quantize(&fused);
+    if (status.code != Q27_PREFILL_NVFP4_OK)
+      return Nvfp4("Q27 fused prefill SiLU/quantize", status);
+
+    q27_prefill_nvfp4_gemm_args down_gemm{};
+    down_gemm.struct_size = sizeof(down_gemm);
+    down_gemm.abi_version = Q27_PREFILL_NVFP4_ABI_VERSION;
+    down_gemm.m = args->tokens;
+    down_gemm.projection = Q27_PREFILL_NVFP4_DOWN;
+    down_gemm.packed_input_fp4_e2m1 = packed_input;
+    down_gemm.packed_input_bytes = down.packed_input_bytes;
+    down_gemm.input_scales_e4m3_128x4 = input_scales;
+    down_gemm.input_scale_bytes = down.input_scale_bytes;
+    down_gemm.weight_fp4_e2m1 = args->down_weight_fp4_e2m1;
+    down_gemm.packed_weight_bytes = down.packed_weight_bytes;
+    down_gemm.weight_scales_e4m3_128x4 =
+        args->down_weight_scales_e4m3_128x4;
+    down_gemm.weight_scale_bytes = down.weight_scale_bytes;
+    down_gemm.alpha = args->down_alpha;
+    down_gemm.output_bf16 = args->output_bf16;
+    down_gemm.output_bf16_bytes = down.output_bf16_bytes;
+    down_gemm.workspace = args->workspace;
+    down_gemm.workspace_bytes = args->workspace_bytes;
+    down_gemm.cuda_stream = args->cuda_stream;
+    status = q27_prefill_nvfp4_down_packed(&down_gemm);
+    return status.code == Q27_PREFILL_NVFP4_OK
+               ? Ok()
+               : Nvfp4("Q27 fused prefill packed down projection", status);
+  }
+
   const uint64_t activated_elements =
       static_cast<uint64_t>(args->tokens) * kIntermediate;
   SiluMultiplyMerged<<<kBlocks, kThreads, 0,
@@ -234,4 +280,14 @@ extern "C" q27_prefill_mlp_status q27_prefill_mlp_forward(
   return status.code == Q27_PREFILL_NVFP4_OK
              ? Ok()
              : Nvfp4("Q27 prefill down projection", status);
+}
+
+extern "C" q27_prefill_mlp_status q27_prefill_mlp_forward(
+    const q27_prefill_mlp_args* args) {
+  return ForwardImpl(args, false);
+}
+
+extern "C" q27_prefill_mlp_status q27_prefill_mlp_forward_fused(
+    const q27_prefill_mlp_args* args) {
+  return ForwardImpl(args, true);
 }

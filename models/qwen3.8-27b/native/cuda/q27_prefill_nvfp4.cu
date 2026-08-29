@@ -451,3 +451,20 @@ extern "C" q27_prefill_nvfp4_status q27_prefill_nvfp4_project(
   if (status.code != Q27_PREFILL_NVFP4_OK) return status;
   return q27_prefill_nvfp4_gemm(&gemm);
 }
+
+extern "C" q27_prefill_nvfp4_status q27_prefill_nvfp4_silu_mul_quantize(
+    const q27_prefill_nvfp4_silu_mul_quantize_args* args) {
+  if (args == nullptr || args->struct_size < sizeof(*args) ||
+      args->abi_version != Q27_PREFILL_NVFP4_ABI_VERSION)
+    return Invalid("Q27 fused SiLU NVFP4 quantize ABI mismatch");
+  return Unimplemented(
+      "TensorRT-LLM fused SiLU NVFP4 donor emits unsupported e2m1x2 PTX "
+      "for GB10 sm_121; shipping Q27 keeps the AOT quantizer fallback");
+}
+
+extern "C" q27_prefill_nvfp4_status q27_prefill_nvfp4_down_packed(
+    const q27_prefill_nvfp4_gemm_args* args) {
+  if (args == nullptr || args->projection != Q27_PREFILL_NVFP4_DOWN)
+    return Invalid("Q27 packed down entry requires DOWN projection");
+  return q27_prefill_nvfp4_gemm(args);
+}

@@ -117,14 +117,11 @@ bool DistinctNormBuffers(const q27_prefill_norm_args* args) {
            args->residual_bf16 != args->residual_output_bf16));
 }
 
-}  // namespace
-
-extern "C" q27_prefill_core_status q27_prefill_embedding(
-    const q27_prefill_embedding_args* args) {
+q27_prefill_core_status Embedding(const q27_prefill_embedding_args* args,
+                                  uint32_t tile_tokens) {
   if (args == nullptr || args->struct_size < sizeof(*args) ||
       args->abi_version != Q27_PREFILL_CORE_ABI_VERSION ||
-      args->valid_tokens == 0 ||
-      args->valid_tokens > Q27_PREFILL_CORE_TOKENS ||
+      args->valid_tokens == 0 || args->valid_tokens > tile_tokens ||
       args->token_ids_u32 == nullptr || args->embedding_bf16 == nullptr ||
       args->output_bf16 == nullptr ||
       args->invalid_token_count_u32 == nullptr) {
@@ -137,7 +134,7 @@ extern "C" q27_prefill_core_status q27_prefill_embedding(
   if (error != cudaSuccess) {
     return CudaError("clear Q27 invalid-token counter", error);
   }
-  GatherEmbedding<<<Q27_PREFILL_CORE_TOKENS, kThreads, 0, stream>>>(
+  GatherEmbedding<<<tile_tokens, kThreads, 0, stream>>>(
       args->token_ids_u32,
       static_cast<const __nv_bfloat16*>(args->embedding_bf16),
       static_cast<__nv_bfloat16*>(args->output_bf16), args->valid_tokens,
@@ -147,12 +144,11 @@ extern "C" q27_prefill_core_status q27_prefill_embedding(
                               : CudaError("Q27 batched embedding", error);
 }
 
-extern "C" q27_prefill_core_status q27_prefill_norm(
-    const q27_prefill_norm_args* args) {
+q27_prefill_core_status Norm(const q27_prefill_norm_args* args,
+                             uint32_t tile_tokens) {
   if (args == nullptr || args->struct_size < sizeof(*args) ||
       args->abi_version != Q27_PREFILL_CORE_ABI_VERSION ||
-      args->valid_tokens == 0 ||
-      args->valid_tokens > Q27_PREFILL_CORE_TOKENS ||
+      args->valid_tokens == 0 || args->valid_tokens > tile_tokens ||
       args->has_residual > 1 || args->input_bf16 == nullptr ||
       args->checkpoint_weight_bf16 == nullptr || args->output_bf16 == nullptr ||
       args->residual_output_bf16 == nullptr ||
@@ -161,7 +157,7 @@ extern "C" q27_prefill_core_status q27_prefill_norm(
       args->epsilon <= 0.0F) {
     return Invalid("invalid Q27 batched Gemma RMSNorm arguments");
   }
-  GemmaNormRows<<<Q27_PREFILL_CORE_TOKENS, kThreads, 0,
+  GemmaNormRows<<<tile_tokens, kThreads, 0,
                   static_cast<cudaStream_t>(args->cuda_stream)>>>(
       static_cast<const __nv_bfloat16*>(args->input_bf16),
       static_cast<const __nv_bfloat16*>(args->residual_bf16),
@@ -172,4 +168,26 @@ extern "C" q27_prefill_core_status q27_prefill_norm(
   const cudaError_t error = cudaPeekAtLastError();
   return error == cudaSuccess ? Ok()
                               : CudaError("Q27 batched Gemma RMSNorm", error);
+}
+
+}  // namespace
+
+extern "C" q27_prefill_core_status q27_prefill_embedding(
+    const q27_prefill_embedding_args* args) {
+  return Embedding(args, Q27_PREFILL_CORE_TOKENS);
+}
+
+extern "C" q27_prefill_core_status q27_prefill_norm(
+    const q27_prefill_norm_args* args) {
+  return Norm(args, Q27_PREFILL_CORE_TOKENS);
+}
+
+extern "C" q27_prefill_core_status q27_prefill_embedding_m512(
+    const q27_prefill_embedding_args* args) {
+  return Embedding(args, Q27_PREFILL_CORE_M512_TOKENS);
+}
+
+extern "C" q27_prefill_core_status q27_prefill_norm_m512(
+    const q27_prefill_norm_args* args) {
+  return Norm(args, Q27_PREFILL_CORE_M512_TOKENS);
 }

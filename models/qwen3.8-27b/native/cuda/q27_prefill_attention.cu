@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Fixed Qwen3.8 target M=128 paged-FP8 causal prefill attention.
+// Fixed Qwen3.8 target M=128/M=512 paged-FP8 causal prefill attention.
 
 #include "q27_prefill_attention.h"
 
@@ -20,7 +20,6 @@
 
 namespace {
 
-constexpr uint32_t kTileTokens = Q27_PREFILL_ATTENTION_TILE_TOKENS;
 constexpr uint32_t kQHeads = Q27_ATTENTION_QUERY_HEADS;
 constexpr uint32_t kKvHeads = Q27_ATTENTION_KV_HEADS;
 constexpr uint32_t kHeadDim = Q27_ATTENTION_HEAD_DIM;
@@ -29,13 +28,9 @@ constexpr uint32_t kRotaryHalf = kRotaryDim / 2;
 constexpr uint32_t kGroupSize = kQHeads / kKvHeads;
 constexpr uint32_t kQColumns = kQHeads * kHeadDim;
 constexpr uint32_t kKvColumns = kKvHeads * kHeadDim;
-constexpr uint32_t kMaxPlanTiles = 12;
 constexpr float kEpsilon = 1.0e-6F;
 constexpr float kAttentionScale = 0.0625F;
 
-constexpr uint64_t kQGateBytes = Q27_PREFILL_ATTENTION_Q_GATE_BYTES;
-constexpr uint64_t kKvInputBytes = Q27_PREFILL_ATTENTION_KV_INPUT_BYTES;
-constexpr uint64_t kQueryBytes = Q27_PREFILL_ATTENTION_QUERY_BYTES;
 constexpr uint64_t kNormBytes = kHeadDim * 2ULL;
 
 constexpr uint64_t kQIndptrOffset = 0;
@@ -44,11 +39,49 @@ constexpr uint64_t kLastPageLenOffset = 16;
 constexpr uint64_t kOIndptrOffset = 20;
 constexpr uint64_t kKvChunkSizeOffset = 28;
 constexpr uint64_t kInvalidCountOffset = 32;
-constexpr uint64_t kRequestIndicesOffset = 48;
-constexpr uint64_t kQoTileIndicesOffset = 96;
-constexpr uint64_t kKvTileIndicesOffset = 144;
-constexpr uint64_t kSanitizedIndicesOffset =
-    Q27_PREFILL_ATTENTION_METADATA_BYTES;
+
+struct AttentionLayout {
+  uint32_t tile_tokens;
+  uint32_t max_plan_tiles;
+  uint64_t q_gate_bytes;
+  uint64_t kv_input_bytes;
+  uint64_t query_bytes;
+  uint64_t metadata_bytes;
+  uint64_t request_indices_offset;
+  uint64_t qo_tile_indices_offset;
+  uint64_t kv_tile_indices_offset;
+  uint64_t sanitized_indices_offset;
+};
+
+constexpr AttentionLayout kM128Layout{
+    Q27_PREFILL_ATTENTION_TILE_TOKENS,
+    12,
+    Q27_PREFILL_ATTENTION_Q_GATE_BYTES,
+    Q27_PREFILL_ATTENTION_KV_INPUT_BYTES,
+    Q27_PREFILL_ATTENTION_QUERY_BYTES,
+    Q27_PREFILL_ATTENTION_METADATA_BYTES,
+    48,
+    96,
+    144,
+    Q27_PREFILL_ATTENTION_METADATA_BYTES,
+};
+
+constexpr AttentionLayout kM512Layout{
+    Q27_PREFILL_ATTENTION_M512_TOKENS,
+    48,
+    Q27_PREFILL_ATTENTION_M512_Q_GATE_BYTES,
+    Q27_PREFILL_ATTENTION_M512_KV_INPUT_BYTES,
+    Q27_PREFILL_ATTENTION_M512_QUERY_BYTES,
+    Q27_PREFILL_ATTENTION_M512_METADATA_BYTES,
+    48,
+    240,
+    432,
+    Q27_PREFILL_ATTENTION_M512_METADATA_BYTES,
+};
+static_assert(144ULL + 12ULL * sizeof(int32_t) <=
+              Q27_PREFILL_ATTENTION_METADATA_BYTES);
+static_assert(432ULL + 48ULL * sizeof(int32_t) <=
+              Q27_PREFILL_ATTENTION_M512_METADATA_BYTES);
 
 thread_local std::string g_error;
 
@@ -125,6 +158,8 @@ __device__ __forceinline__ float Bf16Round(float value) {
 __global__ void PrepareMetadataAndIndices(
     const int32_t* block_table, uint32_t cache_capacity,
     uint32_t committed_tokens, uint32_t valid_tokens, uint32_t cta_tile_q,
+    uint64_t request_indices_offset, uint64_t qo_tile_indices_offset,
+    uint64_t kv_tile_indices_offset, uint64_t sanitized_indices_offset,
     uint8_t* workspace) {
   auto* q_indptr = reinterpret_cast<int32_t*>(workspace + kQIndptrOffset);
   auto* kv_indptr = reinterpret_cast<int32_t*>(workspace + kKvIndptrOffset);
@@ -136,13 +171,13 @@ __global__ void PrepareMetadataAndIndices(
   auto* invalid_count =
       reinterpret_cast<uint32_t*>(workspace + kInvalidCountOffset);
   auto* request_indices =
-      reinterpret_cast<int32_t*>(workspace + kRequestIndicesOffset);
+      reinterpret_cast<int32_t*>(workspace + request_indices_offset);
   auto* qo_tile_indices =
-      reinterpret_cast<int32_t*>(workspace + kQoTileIndicesOffset);
+      reinterpret_cast<int32_t*>(workspace + qo_tile_indices_offset);
   auto* kv_tile_indices =
-      reinterpret_cast<int32_t*>(workspace + kKvTileIndicesOffset);
+      reinterpret_cast<int32_t*>(workspace + kv_tile_indices_offset);
   auto* sanitized_indices =
-      reinterpret_cast<int32_t*>(workspace + kSanitizedIndicesOffset);
+      reinterpret_cast<int32_t*>(workspace + sanitized_indices_offset);
 
   const uint32_t kv_tokens = committed_tokens + valid_tokens;
   const uint32_t plan_tiles =
@@ -285,12 +320,13 @@ cudaError_t LaunchFlashInfer(TargetPagedParams params, cudaStream_t stream) {
 }
 
 bool Validate(const q27_prefill_attention_args* args,
-              uint64_t* required_workspace) {
+              const AttentionLayout& layout, uint64_t* required_workspace) {
   if (args == nullptr || args->struct_size < sizeof(*args) ||
       args->abi_version != Q27_PREFILL_ATTENTION_ABI_VERSION ||
-      args->valid_tokens == 0 || args->valid_tokens > kTileTokens ||
+      args->valid_tokens == 0 || args->valid_tokens > layout.tile_tokens ||
       args->cache_capacity == 0 ||
       args->cache_capacity > Q27_PREFILL_ATTENTION_MAX_CAPACITY ||
+      args->cache_capacity < args->valid_tokens ||
       args->committed_tokens > args->cache_capacity - args->valid_tokens ||
       args->block_table_entries < args->cache_capacity ||
       args->rope_row_stride_elements < kRotaryDim ||
@@ -301,7 +337,9 @@ bool Validate(const q27_prefill_attention_args* args,
     return false;
   }
   *required_workspace =
-      Q27_PREFILL_ATTENTION_WORKSPACE_BYTES(args->cache_capacity);
+      (layout.metadata_bytes +
+       static_cast<uint64_t>(args->cache_capacity) * sizeof(int32_t) + 255ULL) &
+      ~255ULL;
   if (args->workspace_bytes < *required_workspace) return false;
   const uint64_t rope_bytes =
       static_cast<uint64_t>(args->rope_position_capacity) *
@@ -311,18 +349,18 @@ bool Validate(const q27_prefill_attention_args* args,
   const uint64_t block_table_bytes =
       static_cast<uint64_t>(args->block_table_entries) * sizeof(int32_t);
   const std::array<BufferRange, 13> buffers{{
-      {args->q_gate_bf16, kQGateBytes, 2},
-      {args->key_bf16, kKvInputBytes, 2},
-      {args->value_bf16, kKvInputBytes, 2},
+      {args->q_gate_bf16, layout.q_gate_bytes, 2},
+      {args->key_bf16, layout.kv_input_bytes, 2},
+      {args->value_bf16, layout.kv_input_bytes, 2},
       {args->q_norm_weight_bf16, kNormBytes, 2},
       {args->k_norm_weight_bf16, kNormBytes, 2},
       {args->rope_cos_sin_f32, rope_bytes, 4},
       {args->block_table_i32, block_table_bytes, 4},
       {args->key_cache_fp8_e4m3, cache_bytes, 1},
       {args->value_cache_fp8_e4m3, cache_bytes, 1},
-      {args->query_bf16, kQueryBytes, 2},
-      {args->gate_bf16, kQueryBytes, 2},
-      {args->output_bf16, kQueryBytes, 2},
+      {args->query_bf16, layout.query_bytes, 2},
+      {args->gate_bf16, layout.query_bytes, 2},
+      {args->output_bf16, layout.query_bytes, 2},
       {args->workspace, *required_workspace, 256},
   }};
   for (uint32_t left = 0; left < buffers.size(); ++left) {
@@ -347,30 +385,34 @@ extern "C" uint32_t* q27_prefill_attention_invalid_count(
       static_cast<uint8_t*>(workspace) + kInvalidCountOffset);
 }
 
-extern "C" q27_prefill_attention_status q27_prefill_attention(
-    const q27_prefill_attention_args* args) {
+namespace {
+
+q27_prefill_attention_status Run(const q27_prefill_attention_args* args,
+                                 const AttentionLayout& layout) {
   uint64_t required_workspace = 0;
-  if (!Validate(args, &required_workspace)) {
+  if (!Validate(args, layout, &required_workspace)) {
     return Invalid("invalid Q27 target prefill attention call");
   }
   auto* workspace = static_cast<uint8_t*>(args->workspace);
   const uint32_t cta_tile_q = args->valid_tokens * kGroupSize > 16 ? 64 : 16;
   const uint32_t plan_tiles =
       (args->valid_tokens * kGroupSize + cta_tile_q - 1) / cta_tile_q;
-  if (plan_tiles == 0 || plan_tiles > kMaxPlanTiles) {
+  if (plan_tiles == 0 || plan_tiles > layout.max_plan_tiles) {
     return Invalid("invalid Q27 target prefill attention plan tile count");
   }
   const cudaStream_t stream = static_cast<cudaStream_t>(args->cuda_stream);
   PrepareMetadataAndIndices<<<1, 256, 0, stream>>>(
       args->block_table_i32, args->cache_capacity, args->committed_tokens,
-      args->valid_tokens, cta_tile_q, workspace);
+      args->valid_tokens, cta_tile_q, layout.request_indices_offset,
+      layout.qo_tile_indices_offset, layout.kv_tile_indices_offset,
+      layout.sanitized_indices_offset, workspace);
   cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) {
     return CudaError("Q27 prefill attention metadata", error);
   }
 
   const auto* sanitized_indices = reinterpret_cast<const int32_t*>(
-      workspace + kSanitizedIndicesOffset);
+      workspace + layout.sanitized_indices_offset);
   PrepareQkv<<<args->valid_tokens * (kQHeads + kKvHeads), kHeadDim, 0,
                stream>>>(
       static_cast<const __nv_bfloat16*>(args->q_gate_bf16),
@@ -399,11 +441,11 @@ extern "C" q27_prefill_attention_status q27_prefill_attention(
   auto* kv_chunk_size =
       reinterpret_cast<int32_t*>(workspace + kKvChunkSizeOffset);
   auto* request_indices =
-      reinterpret_cast<int32_t*>(workspace + kRequestIndicesOffset);
+      reinterpret_cast<int32_t*>(workspace + layout.request_indices_offset);
   auto* qo_tile_indices =
-      reinterpret_cast<int32_t*>(workspace + kQoTileIndicesOffset);
+      reinterpret_cast<int32_t*>(workspace + layout.qo_tile_indices_offset);
   auto* kv_tile_indices =
-      reinterpret_cast<int32_t*>(workspace + kKvTileIndicesOffset);
+      reinterpret_cast<int32_t*>(workspace + layout.kv_tile_indices_offset);
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv(
       kKvHeads, Q27_ATTENTION_PAGE_SIZE, kHeadDim, /*batch_size=*/1,
       flashinfer::QKVLayout::kNHD,
@@ -466,4 +508,16 @@ extern "C" q27_prefill_attention_status q27_prefill_attention(
   return error == cudaSuccess
              ? Ok()
              : CudaError("Q27 prefill attention sigmoid gate", error);
+}
+
+}  // namespace
+
+extern "C" q27_prefill_attention_status q27_prefill_attention(
+    const q27_prefill_attention_args* args) {
+  return Run(args, kM128Layout);
+}
+
+extern "C" q27_prefill_attention_status q27_prefill_attention_m512(
+    const q27_prefill_attention_args* args) {
+  return Run(args, kM512Layout);
 }

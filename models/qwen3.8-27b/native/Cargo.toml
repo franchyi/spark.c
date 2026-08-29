@@ -33,6 +33,14 @@ path = "src/serve.rs"
 name = "q27-consume-equivalence"
 path = "src/consume_equivalence.rs"
 
+[[bin]]
+name = "q27-dflash2-inspect"
+path = "src/dflash2_inspect.rs"
+
+[[bin]]
+name = "q27-serve-dflash2"
+path = "src/serve_dflash2.rs"
+
 [dependencies]
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

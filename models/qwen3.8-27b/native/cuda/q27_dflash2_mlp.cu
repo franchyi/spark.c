@@ -3,9 +3,11 @@
 // Fixed-shape raw-C translation of the dense MLP semantics in SGLang
 // c14312a66420b75ca9a11bf1817c4db1fa26b097, Apache-2.0:
 // DFlashMLP.forward = gate/up projections -> SiluAndMul -> down projection.
-// Dynamic grouped convolution is deliberately supplied through explicit hooks.
+// Production dynamic grouped convolution is linked through the model-specific
+// q27_dflash2_conv capsule. Explicit hooks remain a development seam.
 
 #include "q27_dflash2_mlp.h"
+#include "q27_dflash2_conv.h"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -173,6 +175,46 @@ q27_dflash2_status ValidateDenseArgs(
   return Ok();
 }
 
+q27_dflash2_status FixedConvPrepare(
+    const q27_dflash2_sublayer_call* call, const void* input_bf16,
+    void* prepared_bf16, void* conv_workspace, uint64_t conv_workspace_bytes,
+    void* user_data) {
+  if (user_data != nullptr || call == nullptr || call->weights == nullptr ||
+      conv_workspace_bytes < Q27_DFLASH2_MLP_MIN_CONV_WORKSPACE_BYTES) {
+    return Invalid("invalid fixed DFlash2 MLP conv-prepare arguments");
+  }
+  q27_dflash2_conv_prepare_args args = {};
+  args.struct_size = sizeof(args);
+  args.abi_version = Q27_DFLASH2_CONV_ABI_VERSION;
+  args.base_kernel = call->weights->mlp_conv_base;
+  args.kernel_projection = call->weights->mlp_conv_projection;
+  args.input_bf16 = input_bf16;
+  args.coefficients_bf16 = conv_workspace;
+  args.output_bf16 = prepared_bf16;
+  args.cublas_handle = call->cublas_handle;
+  args.cuda_stream = call->cuda_stream;
+  return q27_dflash2_conv_prepare(&args);
+}
+
+q27_dflash2_status FixedConvFinish(
+    const q27_dflash2_sublayer_call* call, const void* dense_output_bf16,
+    void* output_bf16, void* conv_workspace, uint64_t conv_workspace_bytes,
+    void* user_data) {
+  if (user_data != nullptr || call == nullptr || call->weights == nullptr ||
+      conv_workspace_bytes < Q27_DFLASH2_MLP_MIN_CONV_WORKSPACE_BYTES) {
+    return Invalid("invalid fixed DFlash2 MLP conv-finish arguments");
+  }
+  q27_dflash2_conv_finish_args args = {};
+  args.struct_size = sizeof(args);
+  args.abi_version = Q27_DFLASH2_CONV_ABI_VERSION;
+  args.base_kernel = call->weights->mlp_conv_base;
+  args.input_bf16 = dense_output_bf16;
+  args.coefficients_bf16 = conv_workspace;
+  args.output_bf16 = output_bf16;
+  args.cuda_stream = call->cuda_stream;
+  return q27_dflash2_conv_finish(&args);
+}
+
 }  // namespace
 
 extern "C" q27_dflash2_status q27_dflash2_mlp_query_layout(
@@ -305,4 +347,18 @@ extern "C" q27_dflash2_status q27_dflash2_mlp_forward_hook(
   return config->finish_conv(call, dense_output, call->output_bf16,
                              conv_workspace, config->conv_workspace_bytes,
                              config->conv_user_data);
+}
+
+extern "C" q27_dflash2_status q27_dflash2_mlp_sublayer(
+    const q27_dflash2_sublayer_call* call, void* user_data) {
+  if (user_data != nullptr)
+    return Invalid("fixed DFlash2 MLP sublayer user_data must be null");
+  q27_dflash2_mlp_hook_config config = {};
+  config.struct_size = sizeof(config);
+  config.abi_version = Q27_DFLASH2_MLP_ABI_VERSION;
+  config.prepare_conv = FixedConvPrepare;
+  config.finish_conv = FixedConvFinish;
+  config.conv_user_data = nullptr;
+  config.conv_workspace_bytes = Q27_DFLASH2_MLP_MIN_CONV_WORKSPACE_BYTES;
+  return q27_dflash2_mlp_forward_hook(call, &config);
 }

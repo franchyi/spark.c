@@ -105,9 +105,11 @@ typedef q27_dflash2_status (*q27_dflash2_mlp_hook)(
  * and sublayer_output are disjoint caller-owned [batch,8,5120] buffers.
  * final_hidden may alias normalized but no other input/scratch pointer.
  *
- * The function is operational only when the fixed MLP dependency is supplied.
  * It performs every residual/RMSNorm transition itself and invokes the linked
- * fixed attention then MLP for layers 0..4. It never allocates or synchronizes.
+ * fixed attention then fixed grouped-conv+dense MLP for layers 0..4. A null
+ * mlp field selects that production model-specific MLP. A non-null field is a
+ * development override retaining the same raw ABI. It never allocates or
+ * synchronizes.
  */
 typedef struct q27_dflash2_forward_args {
   uint32_t struct_size;
@@ -124,7 +126,7 @@ typedef struct q27_dflash2_forward_args {
   uint64_t workspace_bytes;
   uint32_t batch_size;
   float rms_epsilon;
-  q27_dflash2_mlp_hook mlp;
+  q27_dflash2_mlp_hook mlp; /* Optional; null selects linked fixed MLP. */
   void* mlp_user_data;
   void* cublas_handle;
   void* cuda_stream;

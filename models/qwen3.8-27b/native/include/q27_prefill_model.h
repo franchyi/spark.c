@@ -9,17 +9,21 @@
 extern "C" {
 #endif
 
-#define Q27_PREFILL_MODEL_ABI_VERSION 1u
+#define Q27_PREFILL_MODEL_ABI_VERSION 2u
 
 enum {
   Q27_PREFILL_MODEL_LAYERS = 64,
   Q27_PREFILL_MODEL_GDN_LAYERS = 48,
   Q27_PREFILL_MODEL_ATTENTION_LAYERS = 16,
   Q27_PREFILL_MODEL_TOKENS = 128,
+  Q27_PREFILL_MODEL_M512_TOKENS = 512,
   Q27_PREFILL_MODEL_HIDDEN = 5120,
   Q27_PREFILL_MODEL_VOCAB = 248320,
   Q27_PREFILL_MODEL_GDN = 0,
   Q27_PREFILL_MODEL_ATTENTION = 1,
+  Q27_PREFILL_MODEL_OUTPUT_NONE = 0,
+  Q27_PREFILL_MODEL_OUTPUT_LAST = 1,
+  Q27_PREFILL_MODEL_OUTPUT_ALL_ROWS = 2,
 };
 
 typedef enum q27_prefill_model_status_code {
@@ -129,6 +133,12 @@ typedef struct q27_prefill_model_plan q27_prefill_model_plan;
  * Layer i is attention iff (i+1)%4==0. The call performs embedding once,
  * all 64 target layers plus their dense MLPs, final norm, last-valid-row LM
  * head, and deterministic argmax. It allocates and synchronizes nothing.
+ *
+ * If target_features_bf16 is non-null, the call publishes the logical
+ * post-layer BF16 hidden state after zero-based target layers 5, 19, 33, 47,
+ * and 61. The fixed layout is [valid_tokens,5,5120], token-major. A logical
+ * post-layer state is the BF16-rounded sum of the layer MLP output and its
+ * residual, exactly matching the state observed before the next target layer.
  */
 typedef struct q27_prefill_model_args {
   uint32_t struct_size;
@@ -141,7 +151,7 @@ typedef struct q27_prefill_model_args {
   const void* lm_head_bf16;                  /* [248320,5120] */
   const q27_prefill_model_layer* layers;      /* host-visible [64] */
   uint32_t layer_count;
-  uint32_t produce_output;                   /* final norm/head/argmax iff 1 */
+  uint32_t produce_output;                   /* Q27_PREFILL_MODEL_OUTPUT_* */
   const float* rope_cos_sin_f32;
   uint64_t rope_row_stride_elements;
   uint32_t rope_position_capacity;
@@ -150,14 +160,29 @@ typedef struct q27_prefill_model_args {
   void* scratch;
   uint64_t scratch_bytes;
   void* cuda_stream;
+  void* output_top1_i32;                     /* device [valid_tokens], ALL_ROWS */
+  uint64_t output_top1_bytes;
+  void* target_features_bf16;                /* optional [valid_tokens,5,5120] */
+  uint64_t target_features_bytes;
 } q27_prefill_model_args;
 
 q27_prefill_model_status q27_prefill_model_query(
     const q27_prefill_model_config* config, q27_prefill_model_layout* output);
+/*
+ * M512 creates a distinct fixed-shape plan/layout. Use it for full prompt
+ * chunks, preserving the M128 plan/forward above for the final or verifier
+ * chunk. Both lanes update the same caller-owned per-layer KV/GDN state.
+ */
+q27_prefill_model_status q27_prefill_model_query_m512(
+    const q27_prefill_model_config* config, q27_prefill_model_layout* output);
 q27_prefill_model_status q27_prefill_model_plan_create(
+    const q27_prefill_model_config* config, q27_prefill_model_plan** output);
+q27_prefill_model_status q27_prefill_model_plan_create_m512(
     const q27_prefill_model_config* config, q27_prefill_model_plan** output);
 void q27_prefill_model_plan_destroy(q27_prefill_model_plan* plan);
 q27_prefill_model_status q27_prefill_model_forward(
+    q27_prefill_model_plan* plan, const q27_prefill_model_args* args);
+q27_prefill_model_status q27_prefill_model_forward_m512(
     q27_prefill_model_plan* plan, const q27_prefill_model_args* args);
 
 /* Device diagnostics inside a valid arena, readable after stream completion. */

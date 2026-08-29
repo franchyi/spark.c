@@ -85,6 +85,16 @@ q27_prefill_mlp_status q27_prefill_mlp_query(
 q27_prefill_mlp_status q27_prefill_mlp_forward(
     const q27_prefill_mlp_args* args);
 
+/*
+ * Disabled experimental candidate for FlashInfer/TensorRT-LLM's fused BF16
+ * SiLU*up+NVFP4 quantizer followed by the packed-input DOWN GEMM. The donor
+ * cannot assemble for GB10 sm_121, so this returns a kernel error propagated
+ * from Q27_PREFILL_NVFP4_UNIMPLEMENTED. q27_prefill_mlp_forward remains the
+ * production path.
+ */
+q27_prefill_mlp_status q27_prefill_mlp_forward_fused(
+    const q27_prefill_mlp_args* args);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

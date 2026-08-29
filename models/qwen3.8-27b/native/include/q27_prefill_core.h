@@ -11,6 +11,7 @@ extern "C" {
 
 enum {
   Q27_PREFILL_CORE_TOKENS = 128,
+  Q27_PREFILL_CORE_M512_TOKENS = 512,
   Q27_PREFILL_CORE_HIDDEN = 5120,
   Q27_PREFILL_CORE_VOCAB = 248320,
 };
@@ -67,6 +68,16 @@ typedef struct q27_prefill_norm_args {
 q27_prefill_core_status q27_prefill_embedding(
     const q27_prefill_embedding_args* args);
 q27_prefill_core_status q27_prefill_norm(
+    const q27_prefill_norm_args* args);
+
+/*
+ * M=512 variants of the same operations and argument ABI.  The caller must
+ * provide fixed [512,5120] output tiles; rows valid_tokens..511 are zeroed.
+ * Keeping separate symbols prevents changing the established M=128 contract.
+ */
+q27_prefill_core_status q27_prefill_embedding_m512(
+    const q27_prefill_embedding_args* args);
+q27_prefill_core_status q27_prefill_norm_m512(
     const q27_prefill_norm_args* args);
 
 #ifdef __cplusplus

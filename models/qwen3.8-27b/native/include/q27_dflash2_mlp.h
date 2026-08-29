@@ -100,8 +100,20 @@ q27_dflash2_status q27_dflash2_mlp_dense(
     const q27_dflash2_mlp_dense_args* args);
 
 /*
- * Exact q27_dflash2_mlp_hook ABI for q27_dflash2_forward. Missing prepare or
- * finish callbacks return Q27_DFLASH2_UNIMPLEMENTED before any CUDA work.
+ * Production fixed MLP sublayer. This directly applies the model-specific
+ * q27_dflash2_conv prepare/finish capsule around q27_dflash2_mlp_dense using
+ * the first 20,480 bytes of the convolution workspace for retained
+ * coefficients. user_data must be null. No callback, allocation, framework,
+ * synchronization, or identity fallback is permitted.
+ */
+q27_dflash2_status q27_dflash2_mlp_sublayer(
+    const q27_dflash2_sublayer_call* call, void* user_data);
+
+/*
+ * Development-compatible callback seam. Production q27_dflash2_forward uses
+ * q27_dflash2_mlp_sublayer when its optional mlp field is null. Missing
+ * prepare or finish callbacks here return Q27_DFLASH2_UNIMPLEMENTED before
+ * any CUDA work.
  */
 q27_dflash2_status q27_dflash2_mlp_forward_hook(
     const q27_dflash2_sublayer_call* call, void* user_data);

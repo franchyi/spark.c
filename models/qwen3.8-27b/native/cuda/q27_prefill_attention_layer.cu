@@ -16,11 +16,11 @@ struct q27_prefill_attention_layer_plan {
   q27_prefill_fp8_plan* kv = nullptr;
   q27_prefill_fp8_plan* o = nullptr;
   uint64_t fp8_workspace_bytes = 0;
+  uint32_t tokens = 0;
 };
 
 namespace {
 
-constexpr uint32_t kTokens = Q27_PREFILL_CORE_TOKENS;
 constexpr uint32_t kHidden = Q27_PREFILL_CORE_HIDDEN;
 constexpr uint32_t kQ = 12288;
 constexpr uint32_t kKv = 1024;
@@ -31,7 +31,61 @@ constexpr uint64_t kOWeightBytes = static_cast<uint64_t>(kHidden) * kHeads;
 constexpr uint64_t kNormBytes = static_cast<uint64_t>(kHidden) * 2;
 constexpr uint64_t kQkNormBytes = 256ULL * 2;
 static_assert(Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES % 256 == 0);
+static_assert(Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES % 256 == 0);
+static_assert(Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES ==
+              4ULL * Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES);
 thread_local std::string g_error;
+
+struct LayerLayout {
+  uint32_t tokens;
+  uint64_t hidden_bytes;
+  uint64_t scratch_bytes;
+  uint64_t normalized_offset;
+  uint64_t input_residual_offset;
+  uint64_t q_gate_offset;
+  uint64_t key_offset;
+  uint64_t value_offset;
+  uint64_t query_offset;
+  uint64_t gate_offset;
+  uint64_t context_offset;
+  uint64_t projected_offset;
+  uint64_t quantized_offset;
+  uint64_t attention_metadata_bytes;
+};
+
+constexpr LayerLayout kM128Layout{
+    Q27_PREFILL_CORE_TOKENS,
+    Q27_PREFILL_ATTENTION_LAYER_HIDDEN_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_NORMALIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_INPUT_RESIDUAL_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_Q_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_KEY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_VALUE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_QUERY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_CONTEXT_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_PROJECTED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_QUANTIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_METADATA_BYTES,
+};
+
+constexpr LayerLayout kM512Layout{
+    Q27_PREFILL_CORE_M512_TOKENS,
+    Q27_PREFILL_ATTENTION_LAYER_M512_HIDDEN_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_M512_NORMALIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_INPUT_RESIDUAL_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_Q_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_KEY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_VALUE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_QUERY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_CONTEXT_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_PROJECTED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M512_QUANTIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_M512_METADATA_BYTES,
+};
 
 q27_prefill_attention_layer_status Ok() {
   return {Q27_PREFILL_ATTENTION_LAYER_OK, "ok"};
@@ -118,13 +172,21 @@ bool WeightsValid(const q27_prefill_attention_layer_weights* weights) {
          Aligned(weights->o_weight_scale, alignof(float));
 }
 
+uint64_t AttentionWorkspaceBytes(const LayerLayout& layout,
+                                 uint32_t cache_capacity) {
+  return (layout.attention_metadata_bytes +
+          static_cast<uint64_t>(cache_capacity) * sizeof(int32_t) + 255ULL) &
+         ~255ULL;
+}
+
 bool CallValid(const q27_prefill_attention_layer_plan* plan,
-               const q27_prefill_attention_layer_args* args) {
+               const q27_prefill_attention_layer_args* args,
+               const LayerLayout& layout) {
   if (plan == nullptr || plan->q == nullptr || plan->kv == nullptr ||
-      plan->o == nullptr || args == nullptr ||
+      plan->o == nullptr || plan->tokens != layout.tokens || args == nullptr ||
       args->struct_size < sizeof(*args) ||
       args->abi_version != Q27_PREFILL_ATTENTION_LAYER_ABI_VERSION ||
-      args->valid_tokens == 0 || args->valid_tokens > kTokens ||
+      args->valid_tokens == 0 || args->valid_tokens > layout.tokens ||
       args->has_input_residual > 1 || !WeightsValid(args->weights) ||
       !Aligned(args->input_bf16, 16) ||
       (args->has_input_residual && !Aligned(args->input_residual_bf16, 16)) ||
@@ -132,14 +194,14 @@ bool CallValid(const q27_prefill_attention_layer_plan* plan,
       !Aligned(args->residual_output_bf16, 16) ||
       args->post_norm_output_bf16 == args->residual_output_bf16 ||
       !Aligned(args->scratch, Q27_PREFILL_ATTENTION_LAYER_SCRATCH_ALIGNMENT) ||
-      args->scratch_bytes < Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES ||
+      args->scratch_bytes < layout.scratch_bytes ||
       !Aligned(args->fp8_workspace, 256) ||
       args->fp8_workspace_bytes < plan->fp8_workspace_bytes ||
       !Aligned(args->attention_workspace, 256) ||
       args->cache_capacity < args->valid_tokens ||
       args->cache_capacity > Q27_PREFILL_ATTENTION_MAX_CAPACITY ||
       args->attention_workspace_bytes <
-          Q27_PREFILL_ATTENTION_WORKSPACE_BYTES(args->cache_capacity) ||
+          AttentionWorkspaceBytes(layout, args->cache_capacity) ||
       args->committed_tokens > args->cache_capacity - args->valid_tokens ||
       !Aligned(args->rope_cos_sin_f32, alignof(float)) ||
       args->rope_row_stride_elements < Q27_ATTENTION_ROTARY_DIM ||
@@ -156,16 +218,14 @@ bool CallValid(const q27_prefill_attention_layer_plan* plan,
   const uint64_t cache_bytes =
       static_cast<uint64_t>(args->cache_capacity) * 1024ULL;
   const Range mutable_ranges[] = {
-      {args->scratch, Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES},
+      {args->scratch, layout.scratch_bytes},
       {args->fp8_workspace, plan->fp8_workspace_bytes},
       {args->attention_workspace,
-       Q27_PREFILL_ATTENTION_WORKSPACE_BYTES(args->cache_capacity)},
+       AttentionWorkspaceBytes(layout, args->cache_capacity)},
       {args->key_cache_fp8_e4m3, cache_bytes},
       {args->value_cache_fp8_e4m3, cache_bytes},
-      {args->post_norm_output_bf16,
-       Q27_PREFILL_ATTENTION_LAYER_HIDDEN_BYTES},
-      {args->residual_output_bf16,
-       Q27_PREFILL_ATTENTION_LAYER_HIDDEN_BYTES},
+      {args->post_norm_output_bf16, layout.hidden_bytes},
+      {args->residual_output_bf16, layout.hidden_bytes},
   };
   for (uint32_t left = 0;
        left < sizeof(mutable_ranges) / sizeof(mutable_ranges[0]); ++left) {
@@ -179,9 +239,9 @@ bool CallValid(const q27_prefill_attention_layer_plan* plan,
     }
   }
   const Range inputs[] = {
-      {args->input_bf16, Q27_PREFILL_ATTENTION_LAYER_HIDDEN_BYTES},
+      {args->input_bf16, layout.hidden_bytes},
       {args->has_input_residual ? args->input_residual_bf16 : args->input_bf16,
-       Q27_PREFILL_ATTENTION_LAYER_HIDDEN_BYTES},
+       layout.hidden_bytes},
   };
   for (const Range input : inputs) {
     if (!ValidRange(input)) return false;
@@ -193,12 +253,12 @@ bool CallValid(const q27_prefill_attention_layer_plan* plan,
 }
 
 q27_prefill_attention_layer_status CreateProjection(
-    uint32_t n, uint32_t k, uint32_t fast_accum, uint64_t workspace_bytes,
-    q27_prefill_fp8_plan** output) {
+    uint32_t m, uint32_t n, uint32_t k, uint32_t fast_accum,
+    uint64_t workspace_bytes, q27_prefill_fp8_plan** output) {
   q27_prefill_fp8_plan_config config{};
   config.struct_size = sizeof(config);
   config.abi_version = Q27_PREFILL_FP8_ABI_VERSION;
-  config.m = kTokens;
+  config.m = m;
   config.n = n;
   config.k = k;
   config.fast_accum = fast_accum;
@@ -212,23 +272,23 @@ q27_prefill_attention_layer_status CreateProjection(
 }
 
 q27_prefill_attention_layer_status Project(
-    q27_prefill_fp8_plan* plan, const void* input, uint32_t n, uint32_t k,
-    const void* weight, const float* input_scale, const float* weight_scale,
-    void* quantized_input, void* output, void* workspace,
-    uint64_t workspace_bytes, void* stream) {
+    q27_prefill_fp8_plan* plan, uint32_t m, const void* input, uint32_t n,
+    uint32_t k, const void* weight, const float* input_scale,
+    const float* weight_scale, void* quantized_input, void* output,
+    void* workspace, uint64_t workspace_bytes, void* stream) {
   q27_prefill_fp8_project_args projection{};
   projection.struct_size = sizeof(projection);
   projection.abi_version = Q27_PREFILL_FP8_ABI_VERSION;
   projection.input_bf16 = input;
-  projection.input_bf16_bytes = static_cast<uint64_t>(kTokens) * k * 2;
+  projection.input_bf16_bytes = static_cast<uint64_t>(m) * k * 2;
   projection.input_scale = input_scale;
   projection.weight_fp8_e4m3 = weight;
   projection.packed_weight_bytes = static_cast<uint64_t>(n) * k;
   projection.weight_scale = weight_scale;
   projection.quantized_input_fp8_e4m3 = quantized_input;
-  projection.quantized_input_bytes = static_cast<uint64_t>(kTokens) * k;
+  projection.quantized_input_bytes = static_cast<uint64_t>(m) * k;
   projection.output_bf16 = output;
-  projection.output_bf16_bytes = static_cast<uint64_t>(kTokens) * n * 2;
+  projection.output_bf16_bytes = static_cast<uint64_t>(m) * n * 2;
   projection.workspace = workspace;
   projection.workspace_bytes = workspace_bytes;
   projection.cuda_stream = stream;
@@ -248,12 +308,31 @@ void Destroy(q27_prefill_attention_layer_plan* plan) {
   delete plan;
 }
 
-}  // namespace
+q27_prefill_attention_layer_status Scratch(
+    void* scratch, uint64_t scratch_bytes,
+    q27_prefill_attention_layer_scratch_view* output,
+    const LayerLayout& layout) {
+  if (!Aligned(scratch, Q27_PREFILL_ATTENTION_LAYER_SCRATCH_ALIGNMENT) ||
+      scratch_bytes < layout.scratch_bytes || output == nullptr) {
+    return Invalid("invalid Q27 target layer scratch");
+  }
+  auto* bytes = static_cast<uint8_t*>(scratch);
+  output->normalized_bf16 = bytes + layout.normalized_offset;
+  output->input_residual_bf16 = bytes + layout.input_residual_offset;
+  output->q_gate_bf16 = bytes + layout.q_gate_offset;
+  output->key_bf16 = bytes + layout.key_offset;
+  output->value_bf16 = bytes + layout.value_offset;
+  output->query_bf16 = bytes + layout.query_offset;
+  output->gate_bf16 = bytes + layout.gate_offset;
+  output->context_bf16 = bytes + layout.context_offset;
+  output->projected_bf16 = bytes + layout.projected_offset;
+  output->quantized_input_fp8 = bytes + layout.quantized_offset;
+  return Ok();
+}
 
-extern "C" q27_prefill_attention_layer_status
-q27_prefill_attention_layer_plan_create(
+q27_prefill_attention_layer_status CreatePlan(
     const q27_prefill_attention_layer_plan_config* config,
-    q27_prefill_attention_layer_plan** output) {
+    q27_prefill_attention_layer_plan** output, const LayerLayout& layout) {
   if (output == nullptr) return Invalid("Q27 target layer plan output is null");
   *output = nullptr;
   if (config == nullptr || config->struct_size < sizeof(*config) ||
@@ -269,14 +348,17 @@ q27_prefill_attention_layer_plan_create(
             "cannot allocate Q27 target layer plan"};
   }
   plan->fp8_workspace_bytes = config->fp8_workspace_bytes;
-  q27_prefill_attention_layer_status status = CreateProjection(
-      kQ, kHidden, config->fast_accum, config->fp8_workspace_bytes, &plan->q);
+  plan->tokens = layout.tokens;
+  q27_prefill_attention_layer_status status =
+      CreateProjection(layout.tokens, kQ, kHidden, config->fast_accum,
+                       config->fp8_workspace_bytes, &plan->q);
   if (status.code == Q27_PREFILL_ATTENTION_LAYER_OK) {
-    status = CreateProjection(kKv, kHidden, config->fast_accum,
+    status = CreateProjection(layout.tokens, kKv, kHidden, config->fast_accum,
                               config->fp8_workspace_bytes, &plan->kv);
   }
   if (status.code == Q27_PREFILL_ATTENTION_LAYER_OK) {
-    status = CreateProjection(kHidden, kHeads, config->fast_accum,
+    status = CreateProjection(layout.tokens, kHidden, kHeads,
+                              config->fast_accum,
                               config->fp8_workspace_bytes, &plan->o);
   }
   if (status.code != Q27_PREFILL_ATTENTION_LAYER_OK) {
@@ -285,6 +367,22 @@ q27_prefill_attention_layer_plan_create(
   }
   *output = plan;
   return Ok();
+}
+
+}  // namespace
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_plan_create(
+    const q27_prefill_attention_layer_plan_config* config,
+    q27_prefill_attention_layer_plan** output) {
+  return CreatePlan(config, output, kM128Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_plan_create_m512(
+    const q27_prefill_attention_layer_plan_config* config,
+    q27_prefill_attention_layer_plan** output) {
+  return CreatePlan(config, output, kM512Layout);
 }
 
 extern "C" void q27_prefill_attention_layer_plan_destroy(
@@ -296,27 +394,14 @@ extern "C" q27_prefill_attention_layer_status
 q27_prefill_attention_layer_scratch(
     void* scratch, uint64_t scratch_bytes,
     q27_prefill_attention_layer_scratch_view* output) {
-  if (!Aligned(scratch, Q27_PREFILL_ATTENTION_LAYER_SCRATCH_ALIGNMENT) ||
-      scratch_bytes < Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES ||
-      output == nullptr) {
-    return Invalid("invalid Q27 target layer scratch");
-  }
-  auto* bytes = static_cast<uint8_t*>(scratch);
-  output->normalized_bf16 =
-      bytes + Q27_PREFILL_ATTENTION_LAYER_NORMALIZED_OFFSET;
-  output->input_residual_bf16 =
-      bytes + Q27_PREFILL_ATTENTION_LAYER_INPUT_RESIDUAL_OFFSET;
-  output->q_gate_bf16 = bytes + Q27_PREFILL_ATTENTION_LAYER_Q_GATE_OFFSET;
-  output->key_bf16 = bytes + Q27_PREFILL_ATTENTION_LAYER_KEY_OFFSET;
-  output->value_bf16 = bytes + Q27_PREFILL_ATTENTION_LAYER_VALUE_OFFSET;
-  output->query_bf16 = bytes + Q27_PREFILL_ATTENTION_LAYER_QUERY_OFFSET;
-  output->gate_bf16 = bytes + Q27_PREFILL_ATTENTION_LAYER_GATE_OFFSET;
-  output->context_bf16 = bytes + Q27_PREFILL_ATTENTION_LAYER_CONTEXT_OFFSET;
-  output->projected_bf16 =
-      bytes + Q27_PREFILL_ATTENTION_LAYER_PROJECTED_OFFSET;
-  output->quantized_input_fp8 =
-      bytes + Q27_PREFILL_ATTENTION_LAYER_QUANTIZED_OFFSET;
-  return Ok();
+  return Scratch(scratch, scratch_bytes, output, kM128Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_scratch_m512(
+    void* scratch, uint64_t scratch_bytes,
+    q27_prefill_attention_layer_scratch_view* output) {
+  return Scratch(scratch, scratch_bytes, output, kM512Layout);
 }
 
 extern "C" uint32_t* q27_prefill_attention_layer_invalid_page_count(
@@ -326,17 +411,18 @@ extern "C" uint32_t* q27_prefill_attention_layer_invalid_page_count(
                                               args->attention_workspace_bytes);
 }
 
-extern "C" q27_prefill_attention_layer_status
-q27_prefill_attention_layer_forward(
+namespace {
+
+q27_prefill_attention_layer_status Forward(
     q27_prefill_attention_layer_plan* plan,
-    const q27_prefill_attention_layer_args* args) {
-  if (!CallValid(plan, args)) {
+    const q27_prefill_attention_layer_args* args,
+    const LayerLayout& layout) {
+  if (!CallValid(plan, args, layout)) {
     return Invalid("invalid Q27 target prefill layer call");
   }
   q27_prefill_attention_layer_scratch_view scratch{};
   q27_prefill_attention_layer_status status =
-      q27_prefill_attention_layer_scratch(args->scratch, args->scratch_bytes,
-                                           &scratch);
+      Scratch(args->scratch, args->scratch_bytes, &scratch, layout);
   if (status.code != Q27_PREFILL_ATTENTION_LAYER_OK) return status;
 
   q27_prefill_norm_args input_norm{};
@@ -351,13 +437,16 @@ q27_prefill_attention_layer_forward(
   input_norm.residual_output_bf16 = scratch.input_residual_bf16;
   input_norm.epsilon = 1.0e-6F;
   input_norm.cuda_stream = args->cuda_stream;
-  const q27_prefill_core_status norm_status = q27_prefill_norm(&input_norm);
+  const q27_prefill_core_status norm_status =
+      layout.tokens == Q27_PREFILL_CORE_TOKENS
+          ? q27_prefill_norm(&input_norm)
+          : q27_prefill_norm_m512(&input_norm);
   if (norm_status.code != Q27_PREFILL_CORE_OK) {
     return Error(Q27_PREFILL_ATTENTION_LAYER_KERNEL_ERROR,
                  "Q27 target input norm", norm_status.message);
   }
 
-  status = Project(plan->q, scratch.normalized_bf16, kQ, kHidden,
+  status = Project(plan->q, layout.tokens, scratch.normalized_bf16, kQ, kHidden,
                    args->weights->q_weight_fp8_e4m3,
                    args->weights->q_input_scale,
                    args->weights->q_weight_scale,
@@ -365,7 +454,8 @@ q27_prefill_attention_layer_forward(
                    args->fp8_workspace, args->fp8_workspace_bytes,
                    args->cuda_stream);
   if (status.code != Q27_PREFILL_ATTENTION_LAYER_OK) return status;
-  status = Project(plan->kv, scratch.normalized_bf16, kKv, kHidden,
+  status = Project(plan->kv, layout.tokens, scratch.normalized_bf16, kKv,
+                   kHidden,
                    args->weights->k_weight_fp8_e4m3,
                    args->weights->k_input_scale,
                    args->weights->k_weight_scale,
@@ -373,7 +463,8 @@ q27_prefill_attention_layer_forward(
                    args->fp8_workspace, args->fp8_workspace_bytes,
                    args->cuda_stream);
   if (status.code != Q27_PREFILL_ATTENTION_LAYER_OK) return status;
-  status = Project(plan->kv, scratch.normalized_bf16, kKv, kHidden,
+  status = Project(plan->kv, layout.tokens, scratch.normalized_bf16, kKv,
+                   kHidden,
                    args->weights->v_weight_fp8_e4m3,
                    args->weights->v_input_scale,
                    args->weights->v_weight_scale,
@@ -382,11 +473,11 @@ q27_prefill_attention_layer_forward(
                    args->cuda_stream);
   if (status.code != Q27_PREFILL_ATTENTION_LAYER_OK) return status;
 
-  if (args->valid_tokens < kTokens) {
+  if (args->valid_tokens < layout.tokens) {
     auto* padded = static_cast<uint8_t*>(scratch.context_bf16) +
                    static_cast<uint64_t>(args->valid_tokens) * kHeads * 2;
     const uint64_t padded_bytes =
-        static_cast<uint64_t>(kTokens - args->valid_tokens) * kHeads * 2;
+        static_cast<uint64_t>(layout.tokens - args->valid_tokens) * kHeads * 2;
     const cudaError_t zero_status = cudaMemsetAsync(
         padded, 0, padded_bytes,
         static_cast<cudaStream_t>(args->cuda_stream));
@@ -422,13 +513,16 @@ q27_prefill_attention_layer_forward(
   attention.workspace_bytes = args->attention_workspace_bytes;
   attention.cuda_stream = args->cuda_stream;
   const q27_prefill_attention_status attention_status =
-      q27_prefill_attention(&attention);
+      layout.tokens == Q27_PREFILL_CORE_TOKENS
+          ? q27_prefill_attention(&attention)
+          : q27_prefill_attention_m512(&attention);
   if (attention_status.code != Q27_PREFILL_ATTENTION_OK) {
     return Error(Q27_PREFILL_ATTENTION_LAYER_KERNEL_ERROR,
                  "Q27 target prefill attention", attention_status.message);
   }
 
-  status = Project(plan->o, scratch.context_bf16, kHidden, kHeads,
+  status = Project(plan->o, layout.tokens, scratch.context_bf16, kHidden,
+                   kHeads,
                    args->weights->o_weight_fp8_e4m3,
                    args->weights->o_input_scale,
                    args->weights->o_weight_scale,
@@ -450,10 +544,29 @@ q27_prefill_attention_layer_forward(
   post_norm.residual_output_bf16 = args->residual_output_bf16;
   post_norm.epsilon = 1.0e-6F;
   post_norm.cuda_stream = args->cuda_stream;
-  const q27_prefill_core_status post_status = q27_prefill_norm(&post_norm);
+  const q27_prefill_core_status post_status =
+      layout.tokens == Q27_PREFILL_CORE_TOKENS
+          ? q27_prefill_norm(&post_norm)
+          : q27_prefill_norm_m512(&post_norm);
   return post_status.code == Q27_PREFILL_CORE_OK
              ? Ok()
              : Error(Q27_PREFILL_ATTENTION_LAYER_KERNEL_ERROR,
                      "Q27 target post-attention norm/residual",
                      post_status.message);
+}
+
+}  // namespace
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_forward(
+    q27_prefill_attention_layer_plan* plan,
+    const q27_prefill_attention_layer_args* args) {
+  return Forward(plan, args, kM128Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_forward_m512(
+    q27_prefill_attention_layer_plan* plan,
+    const q27_prefill_attention_layer_args* args) {
+  return Forward(plan, args, kM512Layout);
 }

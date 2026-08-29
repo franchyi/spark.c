@@ -118,6 +118,34 @@ typedef struct q27_prefill_nvfp4_project_args {
   void* cuda_stream;
 } q27_prefill_nvfp4_project_args;
 
+/*
+ * Experimental FlashInfer/TensorRT-LLM fused BF16 SiLU(gate)*up + NVFP4
+ * quantization ABI for the Q27 down projection. input_gate_up_bf16 is the merged
+ * [M,2,17408] output of the gate/up GEMM. The implementation fixes
+ * n_experts=1 and writes a validated device mask value M into
+ * single_expert_mask_i32 before invoking the donor kernel. Packed/scaled
+ * outputs have the exact Q27 DOWN shape and can be passed directly to
+ * q27_prefill_nvfp4_down_packed without another quantization launch. The
+ * pinned donor currently cannot assemble for GB10 sm_121, so the shipping
+ * implementation returns Q27_PREFILL_NVFP4_UNIMPLEMENTED without touching
+ * any buffer.
+ */
+typedef struct q27_prefill_nvfp4_silu_mul_quantize_args {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t m;
+  uint32_t reserved;
+  const void* input_gate_up_bf16;       /* [M,2,17408] */
+  uint64_t input_gate_up_bytes;
+  const float* input_global_scale_inv;  /* device [1] */
+  int32_t* single_expert_mask_i32;      /* device [1], overwritten with M */
+  void* packed_output_fp4_e2m1;         /* [M,17408/2] */
+  uint64_t packed_output_bytes;
+  void* output_scales_e4m3_128x4;
+  uint64_t output_scale_bytes;
+  void* cuda_stream;
+} q27_prefill_nvfp4_silu_mul_quantize_args;
+
 q27_prefill_nvfp4_status q27_prefill_nvfp4_query(
     uint32_t m, uint32_t projection, q27_prefill_nvfp4_shape* output);
 q27_prefill_nvfp4_status q27_prefill_nvfp4_quantize(
@@ -126,6 +154,12 @@ q27_prefill_nvfp4_status q27_prefill_nvfp4_gemm(
     const q27_prefill_nvfp4_gemm_args* args);
 q27_prefill_nvfp4_status q27_prefill_nvfp4_project(
     const q27_prefill_nvfp4_project_args* args);
+q27_prefill_nvfp4_status q27_prefill_nvfp4_silu_mul_quantize(
+    const q27_prefill_nvfp4_silu_mul_quantize_args* args);
+
+/* DOWN-only packed-input entry; it never launches an input quantizer. */
+q27_prefill_nvfp4_status q27_prefill_nvfp4_down_packed(
+    const q27_prefill_nvfp4_gemm_args* args);
 
 #ifdef __cplusplus
 }  // extern "C"

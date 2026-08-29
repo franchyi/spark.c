@@ -59,13 +59,15 @@ GDN_PREFILL_WY_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-wy.so
 GDN_PREFILL_SUBLAYER_SHARED := \
 	$(BUILD_DIR)/libq27-gdn-prefill-sublayer.so
 GDN_PREFILL_LAYER_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-layer.so
+GDN_PREFILL_M512_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-m512.so
 PREFILL_MODEL_SHARED := $(BUILD_DIR)/libq27-prefill-model.so
 PREFILL_SHARED := $(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) \
 	$(PREFILL_NVFP4_SHARED) $(PREFILL_MLP_SHARED) \
 	$(PREFILL_ATTENTION_SHARED) $(PREFILL_ATTENTION_LAYER_SHARED) \
 	$(GDN_PREFILL_SHARED) $(GDN_PREFILL_AB_SHARED) \
 	$(GDN_PREFILL_WY_SHARED) $(GDN_PREFILL_SUBLAYER_SHARED) \
-	$(GDN_PREFILL_LAYER_SHARED) $(PREFILL_MODEL_SHARED)
+	$(GDN_PREFILL_LAYER_SHARED) $(GDN_PREFILL_M512_SHARED) \
+	$(PREFILL_MODEL_SHARED)
 CAPSULE_SHARED := $(KERNEL_SHARED) $(MAPPING_SHARED) $(GDN_SHARED) \
 	$(NVFP4_SHARED) $(MLP_SHARED) $(ATTENTION_SHARED) $(GDN_BLOCK_SHARED) \
 	$(LM_HEAD_BF16_SHARED) $(MODEL_SHARED) $(PREFILL_SHARED)
@@ -277,14 +279,26 @@ $(GDN_PREFILL_LAYER_SHARED): cuda/q27_gdn_prefill_layer.cu \
 		-lq27-prefill-fp8 -lcublasLt -lcublas -lcudart \
 		$(ORIGIN_RPATH) -o $@
 
+$(GDN_PREFILL_M512_SHARED): cuda/q27_gdn_prefill_m512.cu \
+		include/q27_gdn_prefill_m512.h $(GDN_PREFILL_SHARED) \
+		$(GDN_PREFILL_AB_SHARED) $(GDN_PREFILL_WY_SHARED) \
+		$(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-L$(BUILD_DIR) -lq27-gdn-prefill -lq27-gdn-prefill-ab \
+		-lq27-gdn-prefill-wy -lq27-prefill-core -lq27-prefill-fp8 \
+		-lcublasLt -lcublas -lcudart $(ORIGIN_RPATH) -o $@
+
 $(PREFILL_MODEL_SHARED): cuda/q27_prefill_model.cu \
 		include/q27_prefill_model.h $(GDN_PREFILL_LAYER_SHARED) \
+		$(GDN_PREFILL_M512_SHARED) \
 		$(PREFILL_ATTENTION_LAYER_SHARED) $(PREFILL_MLP_SHARED) \
 		$(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) \
 		$(LM_HEAD_BF16_SHARED) $(KERNEL_SHARED) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
 		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
 		-L$(BUILD_DIR) -lq27-gdn-prefill-layer \
+		-lq27-gdn-prefill-m512 \
 		-lq27-prefill-attention-layer -lq27-prefill-mlp \
 		-lq27-prefill-core -lq27-prefill-fp8 -lq27-lm-head-bf16 \
 		-lq27-kernels -lcublas -lcudart $(ORIGIN_RPATH) -o $@

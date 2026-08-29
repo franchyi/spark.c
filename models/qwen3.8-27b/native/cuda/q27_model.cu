@@ -44,6 +44,12 @@ constexpr uint64_t kLmHeadBytes =
 constexpr uint64_t kGdnMergedAbStride = 96ULL * kHidden * 2;
 constexpr uint64_t kGdnMergedAbBytes =
     Q27_MODEL_GDN_LAYERS * kGdnMergedAbStride;
+constexpr uint64_t kDflash2FeatureBytes =
+    static_cast<uint64_t>(Q27_MODEL_DFLASH2_BLOCK_SIZE) *
+    Q27_MODEL_DFLASH2_TARGET_FEATURES * Q27_MODEL_DFLASH2_HIDDEN_SIZE * 2;
+constexpr uint64_t kDflash2PrefillFeatureBytes =
+    static_cast<uint64_t>(Q27_PREFILL_MODEL_M512_TOKENS) *
+    Q27_MODEL_DFLASH2_TARGET_FEATURES * Q27_MODEL_DFLASH2_HIDDEN_SIZE * 2;
 constexpr uint64_t kKvBytesPerToken =
     static_cast<uint64_t>(Q27_ATTENTION_KV_HEADS) *
     Q27_ATTENTION_HEAD_DIM;
@@ -208,6 +214,8 @@ struct q27_model {
   uint8_t* gdn_scratch = nullptr;
   uint8_t* gdn_convolution_state = nullptr;
   uint8_t* gdn_recurrent_state = nullptr;
+  uint8_t* verify_base_convolution_state = nullptr;
+  uint8_t* verify_base_recurrent_state = nullptr;
   float* gdn_a_log = nullptr;
   float* gdn_dt_bias = nullptr;
   float* gdn_qkvz_input_scale = nullptr;
@@ -231,7 +239,12 @@ struct q27_model {
   q27_prefill_model_plan* prefill_plan = nullptr;
   q27_prefill_model_layout prefill_layout = {};
   uint8_t* prefill_scratch = nullptr;
+  q27_prefill_model_plan* prefill_plan_m512 = nullptr;
+  q27_prefill_model_layout prefill_layout_m512 = {};
+  uint8_t* prefill_scratch_m512 = nullptr;
   uint32_t* prefill_token_tile = nullptr;
+  uint8_t* verify_target_features = nullptr;
+  int32_t* verify_target_top1 = nullptr;
 
   uint8_t* attention_q_gate = nullptr;
   uint8_t* attention_key = nullptr;
@@ -387,8 +400,12 @@ q27_model_status DumpBoundary(q27_model* model, uint32_t layer,
 q27_model_status FreeModel(q27_model* model) {
   if (model == nullptr) return Ok();
   if (model->stream != nullptr) cudaStreamSynchronize(model->stream);
+  q27_prefill_model_plan_destroy(model->prefill_plan_m512);
   q27_prefill_model_plan_destroy(model->prefill_plan);
+  cudaFree(model->verify_target_top1);
+  cudaFree(model->verify_target_features);
   cudaFree(model->prefill_token_tile);
+  cudaFree(model->prefill_scratch_m512);
   cudaFree(model->prefill_scratch);
   cudaFree(model->prefill_gdn_ab_arena);
   cudaFree(model->prefill_gate_up_scale_arena);
@@ -420,6 +437,8 @@ q27_model_status FreeModel(q27_model* model) {
   cudaFree(model->gdn_qkvz_input_scale);
   cudaFree(model->gdn_recurrent_state);
   cudaFree(model->gdn_convolution_state);
+  cudaFree(model->verify_base_recurrent_state);
+  cudaFree(model->verify_base_convolution_state);
   cudaFree(model->gdn_scratch);
   cudaFree(model->projection_fp8);
   cudaFree(model->residual);
@@ -455,6 +474,10 @@ q27_model_status AllocateModel(q27_model* model) {
   Q27_ALLOC(model->gdn_convolution_state,
             gdn.convolution_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS);
   Q27_ALLOC(model->gdn_recurrent_state,
+            gdn.recurrent_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS);
+  Q27_ALLOC(model->verify_base_convolution_state,
+            gdn.convolution_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS);
+  Q27_ALLOC(model->verify_base_recurrent_state,
             gdn.recurrent_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS);
   Q27_ALLOC(model->gdn_a_log,
             static_cast<uint64_t>(Q27_MODEL_GDN_LAYERS) *
@@ -528,7 +551,31 @@ q27_model_status AllocateModel(q27_model* model) {
     return Kernel("q27 prefill state layout: ",
                   "decode and prefill GDN state strides differ");
   Q27_ALLOC(model->prefill_scratch, model->prefill_layout.scratch_bytes);
-  Q27_ALLOC(model->prefill_token_tile, Q27_PREFILL_MODEL_TOKENS);
+  if (model->state_capacity >= Q27_PREFILL_MODEL_M512_TOKENS) {
+    model->prefill_layout_m512 = {sizeof(model->prefill_layout_m512),
+                                  Q27_PREFILL_MODEL_ABI_VERSION};
+    prefill = q27_prefill_model_query_m512(
+        &prefill_config, &model->prefill_layout_m512);
+    if (prefill.code != Q27_PREFILL_MODEL_OK)
+      return Kernel("q27 M512 prefill model layout: ", prefill.message);
+    if (model->prefill_layout_m512.gdn_conv_bytes_per_layer !=
+            model->gdn_conv_stride ||
+        model->prefill_layout_m512.gdn_state_bytes_per_layer !=
+            model->gdn_recurrent_stride ||
+        model->prefill_layout_m512.attention_cache_bytes_per_layer !=
+            model->prefill_layout.attention_cache_bytes_per_layer)
+      return Kernel("q27 M512 prefill state layout: ",
+                    "M128 and M512 persistent state layouts differ");
+    Q27_ALLOC(model->prefill_scratch_m512,
+              model->prefill_layout_m512.scratch_bytes);
+    prefill = q27_prefill_model_plan_create_m512(
+        &prefill_config, &model->prefill_plan_m512);
+    if (prefill.code != Q27_PREFILL_MODEL_OK)
+      return Kernel("q27 M512 prefill model plan: ", prefill.message);
+  }
+  Q27_ALLOC(model->prefill_token_tile, Q27_PREFILL_MODEL_M512_TOKENS);
+  Q27_ALLOC(model->verify_target_features, kDflash2PrefillFeatureBytes);
+  Q27_ALLOC(model->verify_target_top1, Q27_MODEL_DFLASH2_BLOCK_SIZE);
   prefill = q27_prefill_model_plan_create(&prefill_config,
                                            &model->prefill_plan);
   if (prefill.code != Q27_PREFILL_MODEL_OK)
@@ -540,15 +587,18 @@ q27_model_status AllocateModel(q27_model* model) {
   Q27_ALLOC(model->output_token, 1);
 
   model->state_bytes =
-      gdn.convolution_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS +
-      gdn.recurrent_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS +
+      2 * gdn.convolution_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS +
+      2 * gdn.recurrent_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS +
       cache_bytes * 2;
   model->scratch_bytes = kHiddenBytes * 3 + 6144 + gdn.scratch_bytes +
                          mlp.scratch_bytes + mlp.workspace_bytes +
                          Q27_ATTENTION_WORKSPACE_BYTES +
                          static_cast<uint64_t>(kVocabulary) * sizeof(float) +
                          model->prefill_layout.scratch_bytes +
-                         Q27_PREFILL_MODEL_TOKENS * sizeof(uint32_t);
+                         model->prefill_layout_m512.scratch_bytes +
+                         Q27_PREFILL_MODEL_M512_TOKENS * sizeof(uint32_t) +
+                         kDflash2PrefillFeatureBytes +
+                         Q27_MODEL_DFLASH2_BLOCK_SIZE * sizeof(int32_t);
 #undef Q27_ALLOC
   return Ok();
 }
@@ -875,6 +925,63 @@ q27_model_status PrepareModel(q27_model* model) {
   if (reset.code != Q27_MODEL_OK) return reset;
   error = cudaStreamSynchronize(model->stream);
   return error == cudaSuccess ? Ok() : Cuda("q27 model prepare sync: ", error);
+}
+
+q27_model_status RunPrefillTile(q27_model* model, uint32_t valid_tokens,
+                                uint32_t committed_tokens,
+                                uint32_t output_mode,
+                                void* target_features_bf16,
+                                int32_t* output_top1_i32,
+                                uint32_t physical_tokens =
+                                    Q27_PREFILL_MODEL_TOKENS) {
+  const bool m512 = physical_tokens == Q27_PREFILL_MODEL_M512_TOKENS;
+  if ((!m512 && physical_tokens != Q27_PREFILL_MODEL_TOKENS) ||
+      (m512 && model->prefill_plan_m512 == nullptr))
+    return Invalid("invalid q27 prefill physical tile");
+  q27_prefill_model_plan* plan =
+      m512 ? model->prefill_plan_m512 : model->prefill_plan;
+  const q27_prefill_model_layout& layout =
+      m512 ? model->prefill_layout_m512 : model->prefill_layout;
+  void* scratch =
+      m512 ? static_cast<void*>(model->prefill_scratch_m512)
+           : static_cast<void*>(model->prefill_scratch);
+  q27_prefill_model_args args = {};
+  args.struct_size = sizeof(args);
+  args.abi_version = Q27_PREFILL_MODEL_ABI_VERSION;
+  args.valid_tokens = valid_tokens;
+  args.committed_tokens = committed_tokens;
+  args.token_ids_u32 = model->prefill_token_tile;
+  args.embedding_bf16 = model->weights.embedding_bf16;
+  args.final_norm_bf16 = model->weights.final_norm_bf16;
+  args.lm_head_bf16 = model->weights.lm_head_bf16;
+  args.layers = model->prefill_layers;
+  args.layer_count = Q27_MODEL_LAYERS;
+  args.produce_output = output_mode;
+  args.rope_cos_sin_f32 = model->rope_cache;
+  args.rope_row_stride_elements = Q27_ATTENTION_ROTARY_DIM;
+  args.rope_position_capacity = model->state_capacity;
+  args.output_token_i32 = model->output_token;
+  args.scratch = scratch;
+  args.scratch_bytes = layout.scratch_bytes;
+  args.cuda_stream = model->stream;
+  args.output_top1_i32 = output_top1_i32;
+  args.output_top1_bytes = output_top1_i32 == nullptr
+                               ? 0
+                               : static_cast<uint64_t>(valid_tokens) *
+                                     sizeof(int32_t);
+  args.target_features_bf16 = target_features_bf16;
+  args.target_features_bytes =
+      target_features_bf16 == nullptr
+          ? 0
+          : static_cast<uint64_t>(valid_tokens) *
+                Q27_MODEL_DFLASH2_TARGET_FEATURES *
+                Q27_MODEL_DFLASH2_HIDDEN_SIZE * 2;
+  const q27_prefill_model_status prefill =
+      m512 ? q27_prefill_model_forward_m512(plan, &args)
+           : q27_prefill_model_forward(plan, &args);
+  return prefill.code == Q27_PREFILL_MODEL_OK
+             ? Ok()
+             : Kernel("q27 batched prefill: ", prefill.message);
 }
 
 q27_model_status Norm(q27_model* model, const void* input,
@@ -1309,8 +1416,9 @@ extern "C" q27_model_status q27_model_consume_token(q27_model* model,
   return Ok();
 }
 
-extern "C" q27_model_status q27_model_prefill_greedy(
+q27_model_status PrefillGreedy(
     q27_model* model, const uint32_t* host_tokens, uint32_t count,
+    q27_model_dflash2_feature_sink sink, void* sink_user_data,
     uint32_t* output_token) {
   if (model == nullptr || host_tokens == nullptr || output_token == nullptr ||
       count == 0 || count > model->capacity)
@@ -1324,9 +1432,16 @@ extern "C" q27_model_status q27_model_prefill_greedy(
   model->logits_valid = false;
   const auto begin = std::chrono::steady_clock::now();
   uint32_t consumed = 0;
+  const q27_prefill_model_layout* last_layout = &model->prefill_layout;
+  void* last_scratch = model->prefill_scratch;
   while (consumed < count) {
-    const uint32_t valid = std::min<uint32_t>(
-        Q27_PREFILL_MODEL_TOKENS, count - consumed);
+    const uint32_t remaining = count - consumed;
+    const bool use_m512 = model->prefill_plan_m512 != nullptr &&
+                          remaining > Q27_PREFILL_MODEL_TOKENS;
+    const uint32_t physical_tokens =
+        use_m512 ? Q27_PREFILL_MODEL_M512_TOKENS
+                 : Q27_PREFILL_MODEL_TOKENS;
+    const uint32_t valid = std::min<uint32_t>(physical_tokens, remaining);
     cudaError_t error = cudaMemcpyAsync(
         model->prefill_token_tile, host_tokens + consumed,
         static_cast<uint64_t>(valid) * sizeof(uint32_t),
@@ -1334,35 +1449,31 @@ extern "C" q27_model_status q27_model_prefill_greedy(
     if (error != cudaSuccess)
       return Cuda("q27 prefill token tile copy: ", error);
 
-    q27_prefill_model_args args = {};
-    args.struct_size = sizeof(args);
-    args.abi_version = Q27_PREFILL_MODEL_ABI_VERSION;
-    args.valid_tokens = valid;
-    args.committed_tokens = model->position;
-    args.token_ids_u32 = model->prefill_token_tile;
-    args.embedding_bf16 = model->weights.embedding_bf16;
-    args.final_norm_bf16 = model->weights.final_norm_bf16;
-    args.lm_head_bf16 = model->weights.lm_head_bf16;
-    args.layers = model->prefill_layers;
-    args.layer_count = Q27_MODEL_LAYERS;
-    args.produce_output = consumed + valid == count ? 1U : 0U;
-    args.rope_cos_sin_f32 = model->rope_cache;
-    args.rope_row_stride_elements = Q27_ATTENTION_ROTARY_DIM;
-    args.rope_position_capacity = model->state_capacity;
-    args.output_token_i32 = model->output_token;
-    args.scratch = model->prefill_scratch;
-    args.scratch_bytes = model->prefill_layout.scratch_bytes;
-    args.cuda_stream = model->stream;
-    const q27_prefill_model_status prefill =
-        q27_prefill_model_forward(model->prefill_plan, &args);
-    if (prefill.code != Q27_PREFILL_MODEL_OK)
-      return Kernel("q27 batched prefill: ", prefill.message);
+    const uint32_t output_mode =
+        consumed + valid == count ? Q27_PREFILL_MODEL_OUTPUT_LAST
+                                  : Q27_PREFILL_MODEL_OUTPUT_NONE;
+    void* features = sink == nullptr ? nullptr : model->verify_target_features;
+    q27_model_status prefill = RunPrefillTile(
+        model, valid, model->position, output_mode, features, nullptr,
+        physical_tokens);
+    if (prefill.code != Q27_MODEL_OK) return prefill;
+    if (sink != nullptr) {
+      const q27_model_dflash2_feature_batch batch{
+          sizeof(batch), Q27_MODEL_ABI_VERSION, features, valid,
+          model->position, model->cublas, model->stream};
+      const q27_model_status consumed_features = sink(&batch, sink_user_data);
+      if (consumed_features.code != Q27_MODEL_OK) return consumed_features;
+    }
     model->position += valid;
     consumed += valid;
+    last_layout = use_m512 ? &model->prefill_layout_m512
+                           : &model->prefill_layout;
+    last_scratch = use_m512 ? static_cast<void*>(model->prefill_scratch_m512)
+                            : static_cast<void*>(model->prefill_scratch);
   }
 
   const float* prefill_logits = q27_prefill_model_logits(
-      &model->prefill_layout, model->prefill_scratch);
+      last_layout, last_scratch);
   cudaError_t error = cudaMemcpyAsync(
       model->logits, prefill_logits,
       static_cast<uint64_t>(kVocabulary) * sizeof(float),
@@ -1377,8 +1488,7 @@ extern "C" q27_model_status q27_model_prefill_greedy(
     return Cuda("q27 prefill token result copy: ", error);
   error = cudaMemcpyAsync(
       &invalid,
-      q27_prefill_model_invalid_count(&model->prefill_layout,
-                                      model->prefill_scratch),
+      q27_prefill_model_invalid_count(last_layout, last_scratch),
       sizeof(invalid), cudaMemcpyDeviceToHost, model->stream);
   if (error != cudaSuccess)
     return Cuda("q27 prefill validation copy: ", error);
@@ -1395,6 +1505,205 @@ extern "C" q27_model_status q27_model_prefill_greedy(
           std::chrono::steady_clock::now() - begin)
           .count());
   model->logits_valid = true;
+  return Ok();
+}
+
+extern "C" q27_model_status q27_model_prefill_greedy(
+    q27_model* model, const uint32_t* host_tokens, uint32_t count,
+    uint32_t* output_token) {
+  return PrefillGreedy(model, host_tokens, count, nullptr, nullptr,
+                       output_token);
+}
+
+extern "C" q27_model_status q27_model_prefill_dflash2(
+    q27_model* model, const uint32_t* host_tokens, uint32_t count,
+    q27_model_dflash2_feature_sink sink, void* sink_user_data,
+    uint32_t* output_token) {
+  if (sink == nullptr)
+    return Invalid("q27 DFlash2 prefill feature sink is null");
+  return PrefillGreedy(model, host_tokens, count, sink, sink_user_data,
+                       output_token);
+}
+
+extern "C" q27_model_status q27_model_get_dflash2_runtime_view(
+    const q27_model* model, q27_model_dflash2_runtime_view* output) {
+  if (model == nullptr || output == nullptr ||
+      output->struct_size != sizeof(*output) ||
+      output->abi_version != Q27_MODEL_ABI_VERSION)
+    return Invalid("invalid q27 DFlash2 runtime view arguments");
+  q27_model_dflash2_runtime_view view{};
+  view.struct_size = sizeof(view);
+  view.abi_version = Q27_MODEL_ABI_VERSION;
+  view.embedding_bf16 = model->weights.embedding_bf16;
+  view.lm_head_bf16 = model->weights.lm_head_bf16;
+  view.vocabulary = kVocabulary;
+  view.hidden_size = kHidden;
+  *output = view;
+  return Ok();
+}
+
+extern "C" q27_model_status q27_model_dflash2_verify(
+    q27_model* model,
+    const uint32_t host_candidates[Q27_MODEL_DFLASH2_BLOCK_SIZE],
+    q27_model_dflash2_verify_result* output) {
+  if (model == nullptr || host_candidates == nullptr || output == nullptr ||
+      output->struct_size != sizeof(*output) ||
+      output->abi_version != Q27_MODEL_ABI_VERSION)
+    return Invalid("invalid q27 DFlash2 verify arguments");
+  if (model->position > model->capacity ||
+      Q27_MODEL_DFLASH2_BLOCK_SIZE > model->capacity - model->position)
+    return Invalid("q27 DFlash2 verify requires eight context rows");
+  for (uint32_t slot = 0; slot < Q27_MODEL_DFLASH2_BLOCK_SIZE; ++slot)
+    if (host_candidates[slot] >= kVocabulary)
+      return Invalid("q27 DFlash2 candidate token is out of range");
+
+  const uint64_t conv_bytes =
+      model->gdn_conv_stride * Q27_MODEL_GDN_LAYERS;
+  const uint64_t recurrent_bytes =
+      model->gdn_recurrent_stride * Q27_MODEL_GDN_LAYERS;
+  const uint32_t base_position = model->position;
+  const auto begin = std::chrono::steady_clock::now();
+  model->logits_valid = false;
+
+  cudaError_t error = cudaMemcpyAsync(
+      model->verify_base_convolution_state, model->gdn_convolution_state,
+      conv_bytes, cudaMemcpyDeviceToDevice, model->stream);
+  if (error != cudaSuccess)
+    return Cuda("q27 DFlash2 convolution snapshot: ", error);
+  error = cudaMemcpyAsync(model->verify_base_recurrent_state,
+                          model->gdn_recurrent_state, recurrent_bytes,
+                          cudaMemcpyDeviceToDevice, model->stream);
+  if (error != cudaSuccess)
+    return Cuda("q27 DFlash2 recurrence snapshot: ", error);
+  error = cudaMemcpyAsync(
+      model->prefill_token_tile, host_candidates,
+      Q27_MODEL_DFLASH2_BLOCK_SIZE * sizeof(uint32_t),
+      cudaMemcpyHostToDevice, model->stream);
+  if (error != cudaSuccess)
+    return Cuda("q27 DFlash2 candidate copy: ", error);
+
+  auto restore_base = [&]() -> q27_model_status {
+    cudaError_t restore = cudaMemcpyAsync(
+        model->gdn_convolution_state,
+        model->verify_base_convolution_state, conv_bytes,
+        cudaMemcpyDeviceToDevice, model->stream);
+    if (restore != cudaSuccess)
+      return Cuda("q27 DFlash2 convolution restore: ", restore);
+    restore = cudaMemcpyAsync(model->gdn_recurrent_state,
+                              model->verify_base_recurrent_state,
+                              recurrent_bytes, cudaMemcpyDeviceToDevice,
+                              model->stream);
+    return restore == cudaSuccess
+               ? Ok()
+               : Cuda("q27 DFlash2 recurrence restore: ", restore);
+  };
+  auto restore_and_sync = [&]() -> q27_model_status {
+    q27_model_status restore = restore_base();
+    if (restore.code != Q27_MODEL_OK) return restore;
+    const cudaError_t sync = cudaStreamSynchronize(model->stream);
+    return sync == cudaSuccess ? Ok()
+                               : Cuda("q27 DFlash2 rollback sync: ", sync);
+  };
+
+  q27_model_status status = RunPrefillTile(
+      model, Q27_MODEL_DFLASH2_BLOCK_SIZE, base_position,
+      Q27_PREFILL_MODEL_OUTPUT_ALL_ROWS, model->verify_target_features,
+      model->verify_target_top1);
+  if (status.code != Q27_MODEL_OK) {
+    const q27_model_status rollback = restore_and_sync();
+    return rollback.code == Q27_MODEL_OK ? status : rollback;
+  }
+
+  uint32_t target_top1[Q27_MODEL_DFLASH2_BLOCK_SIZE] = {};
+  uint32_t invalid = 0;
+  error = cudaMemcpyAsync(target_top1, model->verify_target_top1,
+                          sizeof(target_top1), cudaMemcpyDeviceToHost,
+                          model->stream);
+  if (error == cudaSuccess) {
+    error = cudaMemcpyAsync(
+        &invalid,
+        q27_prefill_model_invalid_count(&model->prefill_layout,
+                                        model->prefill_scratch),
+        sizeof(invalid), cudaMemcpyDeviceToHost, model->stream);
+  }
+  if (error == cudaSuccess) error = cudaStreamSynchronize(model->stream);
+  if (error != cudaSuccess) {
+    const q27_model_status rollback = restore_and_sync();
+    return rollback.code == Q27_MODEL_OK
+               ? Cuda("q27 DFlash2 verify result sync: ", error)
+               : rollback;
+  }
+  if (invalid != 0) {
+    const q27_model_status rollback = restore_and_sync();
+    return rollback.code == Q27_MODEL_OK
+               ? Kernel("q27 DFlash2 verify: ",
+                        "device token/page validation failed")
+               : rollback;
+  }
+  for (uint32_t slot = 0; slot < Q27_MODEL_DFLASH2_BLOCK_SIZE; ++slot) {
+    if (target_top1[slot] >= kVocabulary) {
+      const q27_model_status rollback = restore_and_sync();
+      return rollback.code == Q27_MODEL_OK
+                 ? Kernel("q27 DFlash2 verify: ",
+                          "target top-1 token is out of range")
+                 : rollback;
+    }
+  }
+
+  uint32_t accept_length = 0;
+  for (uint32_t slot = 0; slot < Q27_MODEL_DFLASH2_BLOCK_SIZE - 1; ++slot) {
+    if (accept_length == slot &&
+        host_candidates[slot + 1] == target_top1[slot])
+      ++accept_length;
+  }
+  const uint32_t commit_length = accept_length + 1;
+  const uint32_t bonus_token = target_top1[accept_length];
+
+  status = restore_base();
+  if (status.code != Q27_MODEL_OK) return status;
+  status = RunPrefillTile(model, commit_length, base_position,
+                          Q27_PREFILL_MODEL_OUTPUT_NONE, nullptr, nullptr);
+  if (status.code != Q27_MODEL_OK) {
+    const q27_model_status rollback = restore_and_sync();
+    return rollback.code == Q27_MODEL_OK ? status : rollback;
+  }
+  invalid = 0;
+  error = cudaMemcpyAsync(
+      &invalid,
+      q27_prefill_model_invalid_count(&model->prefill_layout,
+                                      model->prefill_scratch),
+      sizeof(invalid), cudaMemcpyDeviceToHost, model->stream);
+  if (error == cudaSuccess) error = cudaStreamSynchronize(model->stream);
+  if (error != cudaSuccess || invalid != 0) {
+    const q27_model_status rollback = restore_and_sync();
+    if (rollback.code != Q27_MODEL_OK) return rollback;
+    return error != cudaSuccess
+               ? Cuda("q27 DFlash2 committed-prefix sync: ", error)
+               : Kernel("q27 DFlash2 committed prefix: ",
+                        "device token/page validation failed");
+  }
+
+  q27_model_dflash2_verify_result result = {};
+  result.struct_size = sizeof(result);
+  result.abi_version = Q27_MODEL_ABI_VERSION;
+  result.base_position = base_position;
+  result.new_position = base_position + commit_length;
+  result.accept_length = accept_length;
+  result.commit_length = commit_length;
+  result.bonus_token = bonus_token;
+  std::memcpy(result.target_top1, target_top1, sizeof(target_top1));
+  for (uint32_t slot = 0; slot < accept_length; ++slot)
+    result.committed_tokens[slot] = host_candidates[slot + 1];
+  result.committed_tokens[accept_length] = bonus_token;
+  result.target_features_bf16 = model->verify_target_features;
+  result.target_features_bytes = kDflash2FeatureBytes;
+
+  model->position = result.new_position;
+  model->last_decode_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - begin)
+          .count());
+  *output = result;
   return Ok();
 }
 

@@ -546,11 +546,19 @@ def _install(output_dir: Path) -> None:
                 l2norm_count=0,
             )
             _write_valid_tokens(output_dir)
-            # c427 Qwen3_5GatedDeltaNet owns the parameter as
-            # `self.conv1d.weight` with physical [10240,1,4] shape. The
-            # separate `conv_weights` name exists only as a local view passed
-            # to RadixLinearAttention during __init__; it is not an attribute.
-            weight = linear.conv1d.weight.reshape(QKV_WIDTH, CONV_KERNEL)
+            # c427 passes this exact [10240,4] view to gdn_backend through
+            # RadixLinearAttention. Keep the owning parameter check explicit
+            # so the capture cannot silently drift from checkpoint storage.
+            weight = linear.attn.conv_weights
+            source_weight = linear.conv1d.weight.reshape(
+                QKV_WIDTH, CONV_KERNEL
+            )
+            if tuple(weight.shape) != (QKV_WIDTH, CONV_KERNEL) or not torch.equal(
+                weight, source_weight
+            ):
+                raise RuntimeError(
+                    "runtime GDN conv_weights differs from conv1d.weight"
+                )
             _snapshot(output_dir, "conv_weight", weight)
 
         def qkvz_hook(_module, _module_input, module_output):

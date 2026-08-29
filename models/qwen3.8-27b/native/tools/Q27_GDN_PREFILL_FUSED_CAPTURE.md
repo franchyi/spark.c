@@ -68,9 +68,10 @@ port 8888 was closed, and the GPU was released; no retry was attempted.
 
 The post-run static fix follows the exact pinned c427 owner. In
 `Qwen3_5GatedDeltaNet.__init__`, the module owns `self.conv1d`, its parameter
-is `self.conv1d.weight` with physical `[10240,1,4]` shape, and `conv_weights`
-is only a local `[10240,4]` view passed into `RadixLinearAttention`. The
-capture now snapshots
-`linear.conv1d.weight.reshape(QKV_WIDTH, CONV_KERNEL)`. This correction is
-source-proven but unexecuted; a later authorized run must still satisfy every
-admissibility check above before timing.
+is `self.conv1d.weight` with physical `[10240,1,4]` shape, and the local
+`[10240,4]` view is retained by `RadixLinearAttention` as
+`linear.attn.conv_weights`. That latter object is the exact runtime weight
+passed to `gdn_backend`. The capture now snapshots it and first asserts byte
+equality with `linear.conv1d.weight.reshape(QKV_WIDTH, CONV_KERNEL)`. This
+correction is source-proven but unexecuted; a later authorized run must still
+satisfy every admissibility check above before timing.

@@ -13,6 +13,7 @@ extern "C" {
 
 enum {
   Q27_PREFILL_ATTENTION_TILE_TOKENS = 128,
+  Q27_PREFILL_ATTENTION_M512_TOKENS = 512,
   Q27_PREFILL_ATTENTION_MAX_CAPACITY = 262144,
 };
 
@@ -25,6 +26,18 @@ enum {
 #define Q27_PREFILL_ATTENTION_METADATA_BYTES 256ULL
 #define Q27_PREFILL_ATTENTION_WORKSPACE_BYTES(capacity) \
   (((Q27_PREFILL_ATTENTION_METADATA_BYTES + \
+     (uint64_t)(capacity) * sizeof(int32_t)) + 255ULL) & ~255ULL)
+
+/* Fixed M=512 lane. Its larger metadata prefix holds up to 48 FI plan tiles. */
+#define Q27_PREFILL_ATTENTION_M512_Q_GATE_BYTES \
+  (512ULL * 24ULL * 2ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M512_KV_INPUT_BYTES \
+  (512ULL * 4ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M512_QUERY_BYTES \
+  (512ULL * 24ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M512_METADATA_BYTES 768ULL
+#define Q27_PREFILL_ATTENTION_M512_WORKSPACE_BYTES(capacity) \
+  (((Q27_PREFILL_ATTENTION_M512_METADATA_BYTES + \
      (uint64_t)(capacity) * sizeof(int32_t)) + 255ULL) & ~255ULL)
 
 typedef enum q27_prefill_attention_status_code {
@@ -92,6 +105,14 @@ typedef struct q27_prefill_attention_args {
 } q27_prefill_attention_args;
 
 q27_prefill_attention_status q27_prefill_attention(
+    const q27_prefill_attention_args* args);
+
+/*
+ * Same model geometry and argument ABI as q27_prefill_attention, with fixed
+ * [512,...] input/output buffers and valid_tokens in [1,512]. It performs one
+ * pinned FlashInfer causal prefill call for the whole valid prefix.
+ */
+q27_prefill_attention_status q27_prefill_attention_m512(
     const q27_prefill_attention_args* args);
 
 /* Device pointer into the fixed metadata prefix of a valid workspace. */

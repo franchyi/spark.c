@@ -65,14 +65,15 @@ The following pieces can be extracted without retaining a framework runtime:
    `cuda/q27_dflash2_conv.cu` performs the exact BF16 M=8 coefficient projection
    and side-0/side-1 two-tap, group-16 convolution from
    `DFlashGroupedConv._convolve`. Token zero never reads the preceding block.
-3. **Remaining BF16 draft backbone — next.** Port
+3. **BF16 draft backbone — joined as an isolated capsule.**
    `DFlashAttention.forward`, `DFlashMLP.forward`, and their fixed projections
-   from `sglang/srt/models/dflash.py`. The residual/RMSNorm coordinator is
-   already in `cuda/q27_dflash2_model.cu`. The real BF16 Q/K/V projections,
-   per-head Q/K norm, NeoX RoPE, and O projection are implemented in
-   `cuda/q27_dflash2_attention.cu`; it refuses to run without the exact sliding
-   attention hook. CUTLASS is an optional fixed-tactic replacement for cuBLAS
-   only after measurement.
+   from `sglang/srt/models/dflash.py` are connected by the residual/RMSNorm
+   coordinator in `cuda/q27_dflash2_model.cu`. The real BF16 Q/K/V
+   projections, per-head Q/K norm, NeoX RoPE, and O projection are implemented
+   in `cuda/q27_dflash2_attention.cu`. The MLP now directly links the same
+   model-specific dynamic grouped-conv prepare/finish capsule used by
+   attention; a null MLP callback selects this production path. CUTLASS is an
+   optional fixed-tactic replacement for cuBLAS only after measurement.
 4. **Sliding block attention — exact FlashInfer specialization implemented.**
    `cuda/q27_dflash2_flashinfer.cu` instantiates only BF16 Q=8/KV<=2055,
    32/8-head GQA, D=128, causal window-left=2047 through
@@ -96,11 +97,13 @@ The following pieces can be extracted without retaining a framework runtime:
    `FusedKVMaterializeHelper` without importing its Torch/Triton runtime. A
    future stacked five-layer GEMM/fused-write tactic is performance work, not a
    correctness prerequisite.
-6. **DFlash2 selector math — partly implemented.** Reuse FlashInfer
-   `csrc/topk.cu::radix_topk` / `include/flashinfer/topk.cuh::TopKDispatch` for
-   deterministic top-16 over seven target-LM-head rows. Port
-   deterministic top-16. The hidden projection, bounds-safe fixed rank-256
-   `_score_edges` translation, and path walk are already implemented.
+6. **DFlash2 selector math — isolated capsules implemented.**
+   `cuda/q27_dflash2_topk.cu` applies the borrowed target BF16 LM head to the
+   seven predicted draft rows through caller-owned FP32 logits, then performs
+   deterministic top-16 with lower-token-ID tie breaking. The hidden
+   projection, bounds-safe fixed rank-256 `_score_edges` translation, and path
+   walk are implemented separately. No production coordinator currently joins
+   these calls or checks their asynchronous invariant counters.
 
 ## Current boundary and missing work
 
@@ -114,9 +117,13 @@ codebook scoring, and the five-layer residual/RMSNorm coordinator. Its
 attention path is linked directly to `q27_dflash2_attention_sublayer`: fixed
 attention convolution, the pinned FlashInfer specialization, and attention
 convolution finish share one documented 8,769,796-byte caller workspace. No
-attention callback or identity fallback remains. The coordinator still returns
-`UNIMPLEMENTED` unless the fixed MLP dependency is supplied, so it does **not**
-pretend to be a complete draft forward.
+attention callback or identity fallback remains. Its default MLP path is now
+linked directly to `q27_dflash2_mlp_sublayer`, which performs fixed MLP
+convolution prepare, gate/up/SiLU/down, and convolution finish. Thus the
+isolated five-layer draft forward is callable once strict draft weights,
+embeddings, state, cuBLAS, and caller workspace are supplied. This does not
+make the end-to-end speculative server callable: draft weight loading and the
+Rust block scheduler remain absent.
 
 `libq27-dflash2-attention.so` contains attention convolution prepare/finish,
 Q/K/V projections, per-head Q/K RMSNorm, the pinned full-dimension NeoX RoPE,
@@ -139,11 +146,32 @@ Missing integration is the top-level draft/target scheduling bridge. The
 separate MLP, target-head top-k, and target verify capsules are tracked
 alongside these files.
 
-The target capsule also needs a block-verify ABI that captures the five
-post-layer feature tensors and preserves eight candidate recurrent-state
-checkpoints. Only the state selected by `commit_length` may become live. A
-sequence of eight ordinary state-mutating decode calls is not equivalent and
-must not be used.
+The exact end-to-end blockers are:
+
+- The main `native/Makefile`, `scripts/build-native.sh`, Rust `build.rs`, and
+  `q27-serve` do not build, link, load, or call any DFlash2 library.
+- There is no native/Rust loader that maps the 81-tensor draft checkpoint into
+  `q27_dflash2_weights`; the Python contract tool validates it only.
+- The detached `q27_verify_forward_t8(weights,state,journal)` seam still
+  returns `Q27_VERIFY_UNIMPLEMENTED`. The joined batch-one MVP instead exports
+  `q27_model_dflash2_verify(model,candidates,result)`: it uses the live model's
+  existing M<=128 target path, emits all eight top-1 rows plus BF16 feature
+  taps after layers 5/19/33/47/61, restores a GDN snapshot, and reruns only the
+  accepted prefix. This correctness-first transaction synchronizes and
+  performs a second target forward rather than retaining eight checkpoints.
+- Draft KV/context materialization, draft proposal, target verification,
+  draft-ring update, emitted-token scheduling, and the next round are not
+  ordered by one scheduler. The model-level target transaction is callable,
+  but no Rust request can reach it yet.
+
+Consequently the five-layer draft forward and target verification transaction
+are callable native C boundaries, but an OpenAI request cannot enter DFlash2
+through the shipping Rust service.
+
+The next promotion gate is exact Spark parity for the model-level transaction:
+all eight target top-1 rows, five feature taps, greedy acceptance, and live
+state after restore-plus-prefix replay. The final optimized verifier may
+replace the replay with per-row recurrent checkpoints only after that gate.
 
 Build the isolated implemented capsule on Spark with:
 

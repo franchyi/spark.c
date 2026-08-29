@@ -82,6 +82,33 @@ Sampling, grammar masking, and non-greedy rejection sampling are outside this
 first target capsule. Its acceptance ABI is intentionally temperature-zero
 greedy only.
 
+## Joined batch-one verifier MVP
+
+The shipping target model now exposes `q27_model_dflash2_verify`, a bounded
+model-level transaction over the already resident fixed-M128 target path. It
+does not use the detached `q27_verify_target_state` allocation above. Instead
+it reuses `q27_model`'s private prefill plan, weights, RoPE, FP8 KV caches, and
+scratch:
+
+1. snapshot all 48 live GDN convolution/recurrent states;
+2. run one `valid_tokens=8` target tile over `[anchor,draft x7]`;
+3. capture BF16 logical post-layer states after layers 5/19/33/47/61 as
+   `[8,5,5120]` and compute all eight target top-1 rows with one BF16 GEMM;
+4. compute temperature-zero consecutive acceptance on the host;
+5. restore the GDN snapshot; and
+6. rerun only `candidates[0..commit_length)` so accepted state becomes live.
+
+Rejected attention KV rows remain physically append-only, but model position
+hides them and the accepted-prefix replay overwrites every visible row. The
+call allocates nothing in the transaction and returns only after the accepted
+prefix is live. Its model-owned feature view remains on device for the draft
+context projection. The synchronization and second target replay make this a
+correctness-first MVP, not the final CUDA-graph verifier.
+
+`q27_verify_forward_t8` remains an unjoined detached-state seam and still
+returns `Q27_VERIFY_UNIMPLEMENTED`; callers must not confuse it with the
+model-level transaction.
+
 ## Spark-only isolated build
 
 From the repository root on the Spark host:

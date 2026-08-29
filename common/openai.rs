@@ -6,7 +6,7 @@
 //! never imports Python, Torch, SGLang, or an inference-framework scheduler.
 
 use std::fmt::{Display, Formatter};
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -502,18 +502,7 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
         thread::spawn(move || {
             produce_stream(backend, tokenizer, prepared, include_usage, sender);
         });
-        let response = Response::new(
-            StatusCode(200),
-            vec![
-                header("Content-Type", "text/event-stream; charset=utf-8"),
-                header("Cache-Control", "no-cache"),
-                header("X-Accel-Buffering", "no"),
-            ],
-            ChannelReader::new(receiver),
-            None,
-            None,
-        );
-        let _ = request.respond(response);
+        respond_sse_frames(request, receiver);
     }
 
     fn prepare_response(&self, request: ResponsesRequest) -> Result<PreparedResponse, ApiError> {
@@ -624,18 +613,7 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
         thread::spawn(move || {
             produce_response_stream(backend, tokenizer, prepared, sender);
         });
-        let response = Response::new(
-            StatusCode(200),
-            vec![
-                header("Content-Type", "text/event-stream; charset=utf-8"),
-                header("Cache-Control", "no-cache"),
-                header("X-Accel-Buffering", "no"),
-            ],
-            ChannelReader::new(receiver),
-            None,
-            None,
-        );
-        let _ = request.respond(response);
+        respond_sse_frames(request, receiver);
     }
 }
 
@@ -1032,6 +1010,57 @@ fn send_response_sse(
     sender
         .send(frame)
         .map_err(|_| GenerationError::new("client disconnected"))
+}
+
+/// Write each SSE frame as one HTTP chunk and flush it immediately.
+///
+/// tiny_http 0.12 wraps unknown-length responses in
+/// `chunked_transfer::Encoder::new`, whose 8192-byte buffer is only flushed
+/// when full or dropped. A token stream smaller than that therefore arrives
+/// at the client when generation ends. `Request::into_writer` is tiny_http's
+/// public raw-response boundary; using it here preserves its connection
+/// sequencing while making frame delivery explicit.
+fn respond_sse_frames(request: Request, receiver: mpsc::Receiver<Vec<u8>>) {
+    if *request.http_version() <= (1, 0) {
+        let response = Response::new(
+            StatusCode(200),
+            vec![
+                header("Content-Type", "text/event-stream; charset=utf-8"),
+                header("Cache-Control", "no-cache"),
+                header("X-Accel-Buffering", "no"),
+            ],
+            ChannelReader::new(receiver),
+            None,
+            None,
+        );
+        let _ = request.respond(response);
+        return;
+    }
+
+    let version = request.http_version().clone();
+    let mut writer = request.into_writer();
+    let result = (|| -> io::Result<()> {
+        write!(
+            writer,
+            "HTTP/{} 200 OK\r\n\
+             Content-Type: text/event-stream; charset=utf-8\r\n\
+             Cache-Control: no-cache\r\n\
+             X-Accel-Buffering: no\r\n\
+             Transfer-Encoding: chunked\r\n\r\n",
+            version
+        )?;
+        writer.flush()?;
+
+        for frame in receiver {
+            write!(writer, "{:x}\r\n", frame.len())?;
+            writer.write_all(&frame)?;
+            writer.write_all(b"\r\n")?;
+            writer.flush()?;
+        }
+        writer.write_all(b"0\r\n\r\n")?;
+        writer.flush()
+    })();
+    let _ = result;
 }
 
 struct ChannelReader {
