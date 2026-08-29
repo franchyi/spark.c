@@ -7,7 +7,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::io::{Cursor, Read};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +23,8 @@ use crate::tokenizer::{
 
 const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_MAX_NEW_TOKENS: u32 = 256;
+const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const SSE_FRAME_CHANNEL_CAPACITY: usize = 1;
 static NEXT_COMPLETION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +86,12 @@ pub trait TokenGenerator: Send + Sync + 'static {
         1.0
     }
 
+    /// Hard process-level admission limit. A model-specific single-slot
+    /// capsule should normally allow one active and one queued request.
+    fn max_in_flight_requests(&self) -> usize {
+        DEFAULT_MAX_IN_FLIGHT_REQUESTS
+    }
+
     fn generate(
         &self,
         request: GenerationRequest,
@@ -131,6 +139,27 @@ impl OpenAiTokenizer for NativeQwenTokenizer {
     }
 }
 
+struct InFlightPermit {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InFlightPermit {
+    fn try_acquire(counter: Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < limit).then_some(current + 1)
+            })
+            .ok()?;
+        Some(Self { counter })
+    }
+}
+
+impl Drop for InFlightPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
 pub struct OpenAiServer<T: OpenAiTokenizer, B: TokenGenerator> {
     tokenizer: Arc<T>,
     backend: Arc<B>,
@@ -144,9 +173,24 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
     pub fn serve(self, bind: &str) -> Result<(), ServerError> {
         let server = Server::http(bind).map_err(|error| ServerError::Bind(error.to_string()))?;
         let service = Arc::new(self);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let limit = service.backend.max_in_flight_requests();
         for request in server.incoming_requests() {
+            let Some(permit) = InFlightPermit::try_acquire(Arc::clone(&in_flight), limit) else {
+                respond_error(
+                    request,
+                    503,
+                    "server is at its in-flight request limit",
+                    "server_error",
+                    None,
+                );
+                continue;
+            };
             let service = Arc::clone(&service);
-            thread::spawn(move || service.handle(request));
+            thread::spawn(move || {
+                let _permit = permit;
+                service.handle(request);
+            });
         }
         Ok(())
     }
@@ -299,6 +343,22 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
                 Some("model"),
             ));
         }
+        if request.stop.is_some() {
+            return Err(ApiError::invalid(
+                "custom stop sequences are not supported; this service uses the model EOS tokens",
+                Some("stop"),
+            ));
+        }
+        if request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            return Err(ApiError::invalid(
+                "tools are not supported by this lightweight Chat Completions endpoint",
+                Some("tools"),
+            ));
+        }
         if request.max_tokens.is_some() && request.max_completion_tokens.is_some() {
             return Err(ApiError::invalid(
                 "max_tokens and max_completion_tokens cannot both be set",
@@ -423,7 +483,7 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
         prepared: PreparedCompletion,
         include_usage: bool,
     ) {
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+        let (sender, receiver) = sse_frame_channel();
         let backend = Arc::clone(&self.backend);
         let tokenizer = Arc::clone(&self.tokenizer);
         thread::spawn(move || {
@@ -484,6 +544,8 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
             reasoning_effort,
             chat_template_kwargs: request.chat_template_kwargs,
             stream_options: None,
+            stop: None,
+            tools: None,
         };
         let completion = self.prepare(chat)?;
         let suffix = completion
@@ -543,7 +605,7 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
     }
 
     fn respond_response_streaming(&self, request: Request, prepared: PreparedResponse) {
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+        let (sender, receiver) = sse_frame_channel();
         let backend = Arc::clone(&self.backend);
         let tokenizer = Arc::clone(&self.tokenizer);
         thread::spawn(move || {
@@ -569,7 +631,7 @@ fn produce_stream<T: OpenAiTokenizer, B: TokenGenerator>(
     tokenizer: Arc<T>,
     prepared: PreparedCompletion,
     include_usage: bool,
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::SyncSender<Vec<u8>>,
 ) {
     let prompt_tokens = prepared.generation.prompt_token_ids.len();
     if send_sse(
@@ -699,7 +761,7 @@ fn produce_response_stream<T: OpenAiTokenizer, B: TokenGenerator>(
     backend: Arc<B>,
     tokenizer: Arc<T>,
     prepared: PreparedResponse,
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::SyncSender<Vec<u8>>,
 ) {
     let prompt_tokens = prepared.generation.prompt_token_ids.len();
     let mut sequence = 0_u64;
@@ -931,7 +993,11 @@ fn produce_response_stream<T: OpenAiTokenizer, B: TokenGenerator>(
     }
 }
 
-fn send_sse(sender: &mpsc::Sender<Vec<u8>>, value: Value) -> Result<(), GenerationError> {
+fn sse_frame_channel() -> (mpsc::SyncSender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    mpsc::sync_channel(SSE_FRAME_CHANNEL_CAPACITY)
+}
+
+fn send_sse(sender: &mpsc::SyncSender<Vec<u8>>, value: Value) -> Result<(), GenerationError> {
     let mut frame = b"data: ".to_vec();
     serde_json::to_writer(&mut frame, &value)
         .map_err(|error| GenerationError::new(error.to_string()))?;
@@ -942,7 +1008,7 @@ fn send_sse(sender: &mpsc::Sender<Vec<u8>>, value: Value) -> Result<(), Generati
 }
 
 fn send_response_sse(
-    sender: &mpsc::Sender<Vec<u8>>,
+    sender: &mpsc::SyncSender<Vec<u8>>,
     event: &str,
     value: Value,
 ) -> Result<(), GenerationError> {
@@ -1003,6 +1069,8 @@ struct ChatCompletionRequest {
     reasoning_effort: Option<WireReasoningEffort>,
     chat_template_kwargs: Option<WireChatTemplateOptions>,
     stream_options: Option<StreamOptions>,
+    stop: Option<Value>,
+    tools: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1508,6 +1576,77 @@ mod tests {
             service.prepare(explicit).expect("prepared").generation.temperature,
             0.25
         );
+    }
+
+    #[test]
+    fn unsupported_chat_stop_and_tools_are_rejected_instead_of_ignored() {
+        let service = OpenAiServer::new(tokenizer(), Arc::new(GreedyDefaultBackend));
+        for (field, field_value) in [
+            ("stop", json!("END")),
+            ("tools", json!([{"type": "function", "function": {"name": "lookup"}}])),
+        ] {
+            let mut value = json!({
+                "model": "qwen3.8-27b-native",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1
+            });
+            value
+                .as_object_mut()
+                .expect("request object")
+                .insert(field.to_owned(), field_value);
+            let request = serde_json::from_value(value).expect("wire request");
+            let error = match service.prepare(request) {
+                Err(error) => error,
+                Ok(_) => panic!("unsupported field was accepted"),
+            };
+            assert_eq!(error.status, 400);
+            assert_eq!(error.param, Some(field));
+        }
+    }
+
+    #[test]
+    fn in_flight_admission_rejects_saturation_and_reopens_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = InFlightPermit::try_acquire(Arc::clone(&counter), 2).expect("first permit");
+        let second =
+            InFlightPermit::try_acquire(Arc::clone(&counter), 2).expect("second permit");
+        assert!(InFlightPermit::try_acquire(Arc::clone(&counter), 2).is_none());
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+
+        drop(first);
+        let replacement =
+            InFlightPermit::try_acquire(Arc::clone(&counter), 2).expect("replacement permit");
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        drop(second);
+        drop(replacement);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert!(InFlightPermit::try_acquire(counter, 0).is_none());
+    }
+
+    #[test]
+    fn sse_frame_channel_backpressures_after_one_buffered_frame() {
+        assert_eq!(SSE_FRAME_CHANNEL_CAPACITY, 1);
+        let (sender, receiver) = sse_frame_channel();
+        sender.send(b"first".to_vec()).expect("fill channel");
+        let (attempted, observe_attempt) = mpsc::sync_channel(0);
+        let (finished, observe_finish) = mpsc::sync_channel(0);
+        let producer = thread::spawn(move || {
+            attempted.send(()).expect("announce send");
+            sender.send(b"second".to_vec()).expect("backpressured send");
+            finished.send(()).expect("announce finish");
+        });
+
+        observe_attempt.recv().expect("producer reached send");
+        assert!(matches!(
+            observe_finish.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(receiver.recv().expect("first frame"), b"first");
+        observe_finish
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("producer unblocked");
+        assert_eq!(receiver.recv().expect("second frame"), b"second");
+        producer.join().expect("producer thread");
     }
 
     #[test]
