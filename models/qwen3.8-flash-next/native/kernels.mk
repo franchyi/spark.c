@@ -86,6 +86,7 @@ FLASHINFER_FUSED_MOE_GENERATED_SOURCES = $(shell \
 # per translation unit, split by CTA-M and mixed-input mode: 11 files total.
 FLASHINFER_FUSED_MOE_GENERATED_SOURCE_COUNT := 11
 FLASHINFER_FUSED_MOE_INCLUDES := $(FLASHINFER_INCLUDES) \
+	-I$(FLASHINFER_ROOT)/csrc/fused_moe/cutlass_backend \
 	-I$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include \
 	-I$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include \
 	-I$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels \
@@ -100,27 +101,16 @@ FLASHINFER_FUSED_MOE_FLAGS := $(FLASHINFER_ARCH_FLAGS) \
 	-DENABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 \
 	-DUSING_OSS_CUTLASS_MOE_GEMM \
 	-DCUTLASS_ENABLE_GDC_FOR_SM100=1
+# Match FlashInfer's pinned JIT build mode exactly for the generated SM121 MoE
+# module.  In particular, its architecture-specific FP4 conversions require
+# compute_121a (a plain sm_121 target rejects the E2M1 conversion opcodes), and
+# CUTLASS 4.5 selects an ill-formed epilogue aggregate under C++20.
+FLASHINFER_FUSED_MOE_GENCODE ?= -gencode=arch=compute_121a,code=sm_121a
+FLASHINFER_FUSED_MOE_NVCCFLAGS := $(filter-out -std=% -arch=%,$(NVCCFLAGS)) \
+	-std=c++17 $(FLASHINFER_FUSED_MOE_GENCODE)
 FLASHINFER_FUSED_MOE_SOURCES := \
 	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_uint4.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp8.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp4.cu \
 	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp32_fp32.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint8.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint4.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp16.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint8.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint4.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp8.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp4.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp4.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu \
-	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu \
-	$(FLASHINFER_ROOT)/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu \
-	$(FLASHINFER_ROOT)/csrc/fused_moe/cutlass_backend/deepgemm_jit_setup.cu \
-	$(FLASHINFER_ROOT)/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu \
 	$(FLASHINFER_ROOT)/csrc/nv_internal/cpp/common/envUtils.cpp \
 	$(FLASHINFER_ROOT)/csrc/nv_internal/cpp/common/logger.cpp \
 	$(FLASHINFER_ROOT)/csrc/nv_internal/cpp/common/stringUtils.cpp \
@@ -129,6 +119,25 @@ FLASHINFER_FUSED_MOE_SOURCES := \
 	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu \
 	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp \
 	$(FLASHINFER_ROOT)/csrc/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
+FLASHINFER_FUSED_MOE_OBJECT_DIR := $(BUILD_DIR)/flashinfer-fused-moe-objects
+FLASHINFER_FUSED_MOE_ALL_SOURCES := $(FLASHINFER_FUSED_MOE_SOURCES) \
+	$(FLASHINFER_FUSED_MOE_GENERATED_SOURCES) \
+	$(KERNEL_DIR)/cuda/qwen_fused_moe_flashinfer.cu
+FLASHINFER_FUSED_MOE_OBJECTS := $(foreach source,$(FLASHINFER_FUSED_MOE_ALL_SOURCES),\
+	$(FLASHINFER_FUSED_MOE_OBJECT_DIR)/$(notdir $(basename $(source))).o)
+
+# Compile the generated CUTLASS registry one translation unit per make job.
+# A single NVCC link command otherwise serializes all 11 expensive SM120 units
+# internally and leaves `make -j` idle.
+define FLASHINFER_FUSED_MOE_COMPILE_RULE
+$(FLASHINFER_FUSED_MOE_OBJECT_DIR)/$(notdir $(basename $(1))).o: $(1) $(KERNEL_DIR)/include/flash/qwen_fused_moe_flashinfer_api.h
+	mkdir -p $$(FLASHINFER_FUSED_MOE_OBJECT_DIR)
+	$$(NVCC) $$(FLASHINFER_FUSED_MOE_NVCCFLAGS) $$(FLASHINFER_FUSED_MOE_FLAGS) \
+		-Xcompiler=-fPIC -I$$(KERNEL_DIR)/include \
+		$$(FLASHINFER_FUSED_MOE_INCLUDES) -c $$< -o $$@
+endef
+$(foreach source,$(FLASHINFER_FUSED_MOE_ALL_SOURCES),\
+	$(eval $(call FLASHINFER_FUSED_MOE_COMPILE_RULE,$(source))))
 TILELANG_QSA_SCORE_INCLUDE := -Ivendor/tilelang-qsa-score/include
 QWEN_XQA_FLAGS := --expt-relaxed-constexpr \
 	-DBEAM_WIDTH=1 -DUSE_INPUT_KV=0 -DUSE_CUSTOM_BARRIER=1 \
@@ -219,10 +228,6 @@ check-flashinfer-fused-moe-generated:
 			echo "Incomplete or mismatched FlashInfer SM120 fused-MoE registry: found $$# generated sources, expected $(FLASHINFER_FUSED_MOE_GENERATED_SOURCE_COUNT) for pinned 906181e" >&2; \
 			exit 2; \
 		}
-	@test -n "$(TVM_FFI_ROOT)" && test -f "$(TVM_FFI_ROOT)/include/tvm/ffi/extra/module.h" || { \
-		echo "TVM_FFI_ROOT with TVM-FFI headers is required by FlashInfer's pinned fused-MoE binding" >&2; \
-		exit 2; \
-	}
 
 qsa-shared: $(CUDA_QSA_SHARED)
 
@@ -679,17 +684,13 @@ $(CUDA_QWEN_DECODE_GLUE_SHARED): $(KERNEL_DIR)/cuda/qwen_decode_glue.cu $(KERNEL
 # Full-bank NVFP4 fused MoE.  This deliberately follows FlashInfer's own
 # `gen_cutlass_fused_moe_sm120_module` source and flag set instead of treating
 # the checked-in generic grouped-GEMM files as a replacement for its generated
-# tactic registry.  Backend 121 is implemented by the same SM120 module; CUDA
-# code generation still follows CUDA_ARCH (sm_121a on GB10).
-$(CUDA_QWEN_FUSED_MOE_SHARED): $(KERNEL_DIR)/cuda/qwen_fused_moe_flashinfer.cu $(KERNEL_DIR)/include/flash/qwen_fused_moe_flashinfer_api.h $(FLASHINFER_FUSED_MOE_SOURCES) $(FLASHINFER_FUSED_MOE_GENERATED_SOURCES) | check-flashinfer-fused-moe-generated
+# tactic registry.  Backend 121 is implemented by the same SM120 module; the
+# opt-in target defaults to FlashInfer's exact sm_121a JIT gencode for GB10.
+$(CUDA_QWEN_FUSED_MOE_SHARED): $(FLASHINFER_FUSED_MOE_OBJECTS) | check-flashinfer-fused-moe-generated
 	mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_FUSED_MOE_FLAGS) -shared -Xcompiler=-fPIC \
-		-I$(KERNEL_DIR)/include $(FLASHINFER_FUSED_MOE_INCLUDES) \
-		-I$(TVM_FFI_ROOT)/include \
-		$(FLASHINFER_FUSED_MOE_SOURCES) \
-		$(FLASHINFER_FUSED_MOE_GENERATED_SOURCES) \
-		$(KERNEL_DIR)/cuda/qwen_fused_moe_flashinfer.cu \
-		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lnvrtc -lcuda -lcudart -ldl \
+	$(NVCC) $(FLASHINFER_FUSED_MOE_NVCCFLAGS) -shared \
+		$(FLASHINFER_FUSED_MOE_OBJECTS) \
+		-lcuda -lcudart -ldl \
 		-Xcompiler=-pthread -o $(CUDA_QWEN_FUSED_MOE_SHARED)
 
 # Small link overlay for the Rust engine's model-local ABI.  The ordinary

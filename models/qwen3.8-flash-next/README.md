@@ -62,6 +62,21 @@ Prefill gives every token immutable QSA metadata and takes one PLE cache lease
 per T<=16 bucket, removing the prior per-token host fences. The old hot-bank,
 prepared-cache, expert-copy, and NVMe expert paths remain fallbacks only.
 
+The fused-MoE server is packaged separately, so it cannot replace the stable
+indexed binary accidentally. After the two fused libraries and SoA-v2 sidecar
+exist, build and launch it with:
+
+```bash
+build/bin/qwen_expert_sidecar_v2 "$SPARK_ENGINE_MODEL" \
+  "$SPARK_ENGINE_MODEL/.spark.c/experts-nvfp4-soa-v2.ssx"
+./scripts/build-fused-serve.sh
+FLASH_QWEN_FUSED_MOE_SIDECAR="$SPARK_ENGINE_MODEL/.spark.c/experts-nvfp4-soa-v2.ssx" \
+  ./scripts/serve-fused.sh
+```
+
+This emits `build/bin/qwen_serve_fused`, linked to
+`libflash-qwen-runtime-fused.so`; normal `build/bin/qwen_serve` is unchanged.
+
 ## Spark canary (2026-08-30)
 
 One cold request plus two warm determinism checks used a 66-token prompt and

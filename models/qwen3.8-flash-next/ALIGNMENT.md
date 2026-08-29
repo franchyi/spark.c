@@ -7,10 +7,13 @@ per-token host fences. Warm 66-token prefill measured 43.3--44.5 tok/s and
 target-only decode 9.7--10.9 tok/s. It remains an eager implementation and is
 not yet a performance peer of the pinned SGLang/vLLM oracles.
 
-The next shared prefill/decode gain is full-bank fused MoE. The isolated,
-currently unlinked ABI is `qwen_fused_moe_flashinfer_api.h`; its wrapper is
-`qwen_fused_moe_flashinfer.cu`. Integration requires a per-layer SoA-v2
-sidecar and FlashInfer's complete generated SM120 fused-MoE instantiation set.
+The next shared prefill/decode gain is full-bank fused MoE. Its isolated ABI is
+`qwen_fused_moe_flashinfer_api.h`; its wrapper is
+`qwen_fused_moe_flashinfer.cu`. The opt-in overlay and Rust server are built as
+`libflash-qwen-runtime-fused.so` and `build/bin/qwen_serve_fused`; use
+`scripts/build-fused-serve.sh` then `scripts/serve-fused.sh`. Activation still
+requires a per-layer SoA-v2 sidecar and FlashInfer's complete generated SM120
+fused-MoE instantiation set.
 The legacy AoS sidecar orders W13 as `[gate; up]`; SoA-v2 must swap it to
 `[up; gate]` for the SGLang/FlashInfer contract.
 

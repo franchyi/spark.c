@@ -30,7 +30,12 @@
 #include <vector>
 
 #include "tensorrt_llm/common/workspace.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+// Pull in the pinned implementation so this model-specific translation unit
+// instantiates only the BF16-input/NVFP4-weight runner it owns.  Linking
+// FlashInfer's catch-all instantiation file would also instantiate every FP8,
+// INT4, FP16, and legacy-architecture runner and turns this edge build into the
+// full framework build.
+#include "cutlass_fused_moe_kernels.cuh"
 
 namespace qwen_fused_moe {
 
