@@ -96,6 +96,26 @@ a passing promotion gate:
   cosine `0.978850851`, mean absolute error `0.279888856`, maximum absolute
   error `2.263875246`.
 
+The losing cases remain close in candidate space. For `9707`, the native winner
+is oracle rank two and the oracle winner is native rank two; the top-five sets
+overlap 4/5 and the top-ten sets overlap 9/10. The oracle margin is `0.750`,
+while native reverses it with a `0.424` margin. For `151644`, decision zero keeps
+the same winner, the top-five sets overlap 5/5, and the top-ten sets overlap
+9/10; its margin shrinks from `0.3125` to `0.0569`. At decision one, native
+selects oracle rank two, only `0.250` below the oracle winner.
+
+This is not a uniform logit offset or scale error. The two ordinary-token cases
+have nearly identical broad error distributions (about `0.232` median absolute
+error and `0.355` RMSE), but their per-vocabulary error vectors are uncorrelated
+(`-0.025`). An affine oracle-to-native fit leaves `0.349` and `0.354` residual
+RMSE, nearly all of the original error. Combined with a passing case through the
+same raw-token harness and LM head, the evidence favors activation-dependent
+rounding drift between native FlashInfer GDN recurrence and the pinned SGLang
+Triton GDN path. It does not exclude another token-dependent kernel defect.
+The hard next check is a same-token layer/GDN-boundary comparison for `9707` and
+`151644`, or a Triton-equivalent native T=1 recurrence. Exact-token, ordered
+top-five, and numerical gates must not be relaxed.
+
 This is an arbitrary raw-token/zero-state diagnostic, not the required valid
 ChatML service-prefix acceptance. Tokens `9707` and `151644` are not ChatML
 prefixes, and `248045` is only `<|im_start|>`, not a complete rendered prompt.
