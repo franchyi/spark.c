@@ -31,12 +31,29 @@ make build       # build the native q27 tools
 SPARK_ENGINE_MODEL=/path/to/snapshot make inspect
 SPARK_ENGINE_MODEL=/path/to/snapshot \
   SPARK_ENGINE_SIDECAR=/path/to/q27-scales-v1.bin make eager
+SPARK_ENGINE_MODEL=/path/to/snapshot \
+  SPARK_ENGINE_SIDECAR=/path/to/q27-scales-v1.bin make serve
+make smoke       # /v1/models, non-stream chat, and SSE chat
 make oracle-serve # explicit parity oracle only
 make oracle-smoke
 make oracle-bench
 make oracle-stop
 make provenance
 ```
+
+The native service is a single model-specific Rust process with one serialized
+decode slot. It uses the checkpoint's pinned Rust tokenizer and fixed Qwen text
+chat template, then prefills through the decode-only ABI one token at a time.
+Only greedy generation is currently real: requests must set `temperature=0`
+and `top_p=1`. The default bind is `0.0.0.0:30000`, the default resident context
+capacity is `4096`, and both can be overridden with the corresponding
+`SPARK_ENGINE_*` variables used by `scripts/serve-native.sh`.
+
+Spark functional smoke on 2026-08-29 used a capacity-128 slot and the exact
+pinned checkpoint. `/v1/models`, non-stream chat, and SSE chat all passed; two
+successive 13-token prompts with one completion token took `1.601 s` and
+`1.346 s`. These are decode-only functional timings, not a prefill-throughput
+benchmark: the MVP serializes every prompt token through the one-token ABI.
 
 Downloads use `HF_ENDPOINT=https://hf-mirror.com`; GitHub fetches use
 `GH_PROXY=https://ghfast.top/`. The resident image pulls through

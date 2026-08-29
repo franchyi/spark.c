@@ -20,10 +20,11 @@ docker run --rm --network host --user "$user_id:$group_id" \
   -e CARGO_TARGET_DIR=/cargo-target \
   -e 'RUSTFLAGS=-L native=/work/build/q27 -C link-arg=-Wl,-rpath,$ORIGIN/../q27 -C link-arg=-Wl,-rpath-link,/work/build/q27 -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
   "$rust_image" \
-  cargo build --release -p sparkserve-q27 --bin q27-inspect --bin q27-map-inspect --bin q27-pack-scales --bin q27-inspect-scales --bin q27-eager
+  cargo build --locked --release -p sparkserve-q27 --bin q27-inspect --bin q27-map-inspect --bin q27-pack-scales --bin q27-inspect-scales --bin q27-eager --bin q27-serve
 cp "$target_host/release/q27-inspect" "$repo_root/build/bin/q27-inspect"
 cp "$target_host/release/q27-map-inspect" "$repo_root/build/bin/q27-map-inspect"
 cp "$target_host/release/q27-pack-scales" "$repo_root/build/bin/q27-pack-scales"
 cp "$target_host/release/q27-inspect-scales" "$repo_root/build/bin/q27-inspect-scales"
 cp "$target_host/release/q27-eager" "$repo_root/build/bin/q27-eager"
+cp "$target_host/release/q27-serve" "$repo_root/build/bin/q27-serve"
 echo "q27 native tools ready in $repo_root/build/bin"

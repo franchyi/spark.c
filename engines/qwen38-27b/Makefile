@@ -19,11 +19,10 @@ fetch-oracle:
 	@./scripts/fetch-oracle.sh
 
 serve:
-	@echo "q27 native serving is not promoted yet; use oracle-serve only for parity" >&2
-	@exit 1
+	@./scripts/serve-native.sh
 
 smoke:
-	@./scripts/smoke.sh
+	@./scripts/smoke-native.sh
 
 bench:
 	@./scripts/bench.sh
