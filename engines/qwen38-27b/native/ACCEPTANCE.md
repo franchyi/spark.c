@@ -78,6 +78,43 @@ The numerical limits bracket the retained position-zero reference
 a small regression margin. Threshold overrides are command-line diagnostics;
 milestone reports should use the defaults.
 
+## Real ChatML promotion gate
+
+The model-serving promotion gate **passes 3/3** on Spark. The native service
+rendered exactly the same prompt token IDs as the pinned SGLang oracle and
+emitted exactly the same eight greedy output token IDs for every case:
+
+- `short-greeting`: 20 prompt tokens, 8 output tokens;
+- `small-code`: 26 prompt tokens, 8 output tokens;
+- `short-prose`: 21 prompt tokens, 8 output tokens.
+
+The retained suite is
+`/home/chaoyi/.cache/sparkserve-q27-chatml-oracle/run-20260829-v1/native/parity-suite.json`;
+the machine-readable passing report is the sibling `parity-report.json`. The
+oracle is `lmsysorg/sglang:qwen38-27b` image
+`sha256:0076dffa60b76b7bf033c04d05e0cc69d46f2b8cd60aa2468827782afe9bc38f`,
+SGLang `c4271c3fe1262fc2adbd162c33b25de5255251c5`, FlashInfer
+`906181e3f4cf4bcc81835fb480db4011bbd80b62`, and checkpoint
+`RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead` revision
+`009632fef96dd349150baa780c984e62e70e91fe`, with speculative decoding off.
+
+The native trace is three complete `sparkserve.q27.token-trace.v1` JSONL
+records, 912 bytes, mode `0600`; its SHA-256 is
+`9ab33f6b14a4dc214f645c5c5337e54f836c4ae3e276f0264d8e8f4385df052c`.
+The final packaging audit is retained at
+`/home/chaoyi/.cache/sparkserve-q27-chatml-oracle/run-20260829-v1/packaging-audit/final-report.json`
+(SHA-256 `b86e3ff824d480f2d24fbe158e164bb3d8015deececb80393fd109cf6199f662`);
+it records the audited `q27-serve` hash
+`e8366025b144eb7f8bf9b93a3c41e5a6a6042eb9c1f2fc5ec5af5830082d66fc`,
+verified capsule manifest, complete required CUDA/cuBLAS/TVM-FFI/q27 closure,
+and no forbidden framework or JIT dependency.
+
+All three cases finished by the eight-token length limit. The suppressed-stop
+token trace path remains untested by this gate and must be retained as residual
+coverage. This valid, tokenizer-rendered ChatML result is the promotion gate;
+the arbitrary raw-start diagnostic below remains a separate failing numerical
+diagnostic and is not reclassified or weakened by this pass.
+
 ## Three-case raw-start diagnostic
 
 The default non-smoke comparator was run on Spark on 2026-08-29 with raw starts
