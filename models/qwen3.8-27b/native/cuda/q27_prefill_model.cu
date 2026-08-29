@@ -4,6 +4,7 @@
 
 #include "q27_gdn_prefill_layer.h"
 #include "q27_gdn_prefill_m512.h"
+#include "q27_gdn_verify_t8.h"
 #include "q27_kernels.h"
 #include "q27_lm_head_bf16.h"
 #include "q27_prefill_core.h"
@@ -27,6 +28,8 @@ struct q27_prefill_model_plan {
   q27_prefill_model_layout layout{};
   q27_prefill_fp8_plan* gdn_qkvz = nullptr;
   q27_prefill_fp8_plan* gdn_out = nullptr;
+  q27_prefill_fp8_plan* gdn_qkvz_verify_t8 = nullptr;
+  q27_prefill_fp8_plan* gdn_out_verify_t8 = nullptr;
   q27_prefill_attention_layer_plan* attention = nullptr;
   cublasHandle_t cublas = nullptr;
   uint32_t tokens = 0;
@@ -166,6 +169,17 @@ q27_prefill_model_status BuildLayout(const q27_prefill_model_config* config,
   q27_prefill_mlp_status ms = q27_prefill_mlp_query(tokens, &mlp);
   if (ms.code != Q27_PREFILL_MLP_OK)
     return Error("query dense MLP", ms.message);
+  if (tokens == Q27_PREFILL_MODEL_TOKENS) {
+    q27_prefill_mlp_layout verify_mlp{sizeof(verify_mlp),
+                                      Q27_PREFILL_MLP_ABI_VERSION};
+    ms = q27_prefill_mlp_query_verify_t8(&verify_mlp);
+    if (ms.code != Q27_PREFILL_MLP_OK)
+      return Error("query T8 verify dense MLP", ms.message);
+    mlp.scratch_bytes = std::max(mlp.scratch_bytes,
+                                 verify_mlp.scratch_bytes);
+    mlp.workspace_bytes = std::max(mlp.workspace_bytes,
+                                   verify_mlp.workspace_bytes);
+  }
 
   uint64_t cursor = 0;
   const uint64_t hidden_bytes = HiddenBytes(tokens);
@@ -228,6 +242,8 @@ void Destroy(q27_prefill_model_plan* plan) {
   if (plan->cublas != nullptr) cublasDestroy(plan->cublas);
   q27_prefill_attention_layer_plan_destroy(plan->attention);
   q27_prefill_fp8_plan_destroy(plan->gdn_out);
+  q27_prefill_fp8_plan_destroy(plan->gdn_out_verify_t8);
+  q27_prefill_fp8_plan_destroy(plan->gdn_qkvz_verify_t8);
   q27_prefill_fp8_plan_destroy(plan->gdn_qkvz);
   delete plan;
 }
@@ -336,6 +352,19 @@ bool CommonCallValid(const q27_prefill_model_plan* plan,
            args->target_features_bytes >=
                static_cast<uint64_t>(args->valid_tokens) *
                    kTargetFeaturesPerRowBytes)) &&
+         args->verify_t8_gdn <= 1 &&
+         (!args->verify_t8_gdn ||
+          (tokens == Q27_PREFILL_MODEL_TOKENS &&
+           args->valid_tokens == Q27_GDN_VERIFY_TOKENS &&
+           Aligned(args->gdn_checkpoint_convolution_bf16) &&
+           args->gdn_checkpoint_convolution_bytes >=
+               Q27_GDN_VERIFY_GDN_LAYERS *
+                   Q27_GDN_VERIFY_CONV_JOURNAL_BYTES_PER_LAYER &&
+           Aligned(args->gdn_checkpoint_recurrent_bf16) &&
+           args->gdn_checkpoint_recurrent_bytes >=
+               Q27_GDN_VERIFY_GDN_LAYERS *
+                   Q27_GDN_VERIFY_RECURRENT_JOURNAL_BYTES_PER_LAYER &&
+           Aligned(args->gdn_state_index_i32, alignof(int32_t)))) &&
          Aligned(args->scratch) &&
          args->scratch_bytes >= plan->layout.scratch_bytes;
 }
@@ -363,6 +392,14 @@ q27_prefill_model_status CreatePlan(const q27_prefill_model_config* config,
   status = CreateFp8(gdn_tokens, 16384, 5120, *config, &plan->gdn_qkvz);
   if (status.code == Q27_PREFILL_MODEL_OK)
     status = CreateFp8(gdn_tokens, 5120, 6144, *config, &plan->gdn_out);
+  if (status.code == Q27_PREFILL_MODEL_OK &&
+      tokens == Q27_PREFILL_MODEL_TOKENS)
+    status = CreateFp8(Q27_GDN_VERIFY_TOKENS, 16384, 5120, *config,
+                       &plan->gdn_qkvz_verify_t8);
+  if (status.code == Q27_PREFILL_MODEL_OK &&
+      tokens == Q27_PREFILL_MODEL_TOKENS)
+    status = CreateFp8(Q27_GDN_VERIFY_TOKENS, 5120, 6144, *config,
+                       &plan->gdn_out_verify_t8);
   if (status.code == Q27_PREFILL_MODEL_OK) {
     q27_prefill_attention_layer_plan_config ac{};
     ac.struct_size = sizeof(ac);
@@ -497,7 +534,9 @@ q27_prefill_model_status Forward(q27_prefill_model_plan* plan,
 
   q27_prefill_mlp_layout mlp_layout{sizeof(mlp_layout),
                                      Q27_PREFILL_MLP_ABI_VERSION};
-  q27_prefill_mlp_status ml = q27_prefill_mlp_query(tokens, &mlp_layout);
+  q27_prefill_mlp_status ml = args->verify_t8_gdn
+                                  ? q27_prefill_mlp_query_verify_t8(&mlp_layout)
+                                  : q27_prefill_mlp_query(tokens, &mlp_layout);
   if (ml.code != Q27_PREFILL_MLP_OK)
     return Error("MLP layout", ml.message);
   auto* common = static_cast<uint8_t*>(arena.shared);
@@ -546,10 +585,30 @@ q27_prefill_model_status Forward(q27_prefill_model_plan* plan,
         ga.residual_output_bf16 = residual_out;
         ga.scratch = arena.shared;
         ga.scratch_bytes = plan->layout.shared_bytes;
-        ga.qkvz_plan = plan->gdn_qkvz;
-        ga.output_plan = plan->gdn_out;
+        ga.qkvz_plan = args->verify_t8_gdn ? plan->gdn_qkvz_verify_t8
+                                           : plan->gdn_qkvz;
+        ga.output_plan = args->verify_t8_gdn ? plan->gdn_out_verify_t8
+                                             : plan->gdn_out;
         ga.cublas_handle = plan->cublas;
         ga.cuda_stream = args->cuda_stream;
+        ga.verify_t8_gdn = args->verify_t8_gdn;
+        if (args->verify_t8_gdn) {
+          const uint32_t gdn_index = layer_index - layer_index / 4;
+          ga.checkpoint_convolution_bf16 =
+              static_cast<uint8_t*>(
+                  args->gdn_checkpoint_convolution_bf16) +
+              static_cast<uint64_t>(gdn_index) *
+                  Q27_GDN_VERIFY_CONV_JOURNAL_BYTES_PER_LAYER;
+          ga.checkpoint_convolution_bytes =
+              Q27_GDN_VERIFY_CONV_JOURNAL_BYTES_PER_LAYER;
+          ga.checkpoint_recurrent_bf16 =
+              static_cast<uint8_t*>(args->gdn_checkpoint_recurrent_bf16) +
+              static_cast<uint64_t>(gdn_index) *
+                  Q27_GDN_VERIFY_RECURRENT_JOURNAL_BYTES_PER_LAYER;
+          ga.checkpoint_recurrent_bytes =
+              Q27_GDN_VERIFY_RECURRENT_JOURNAL_BYTES_PER_LAYER;
+          ga.state_index_i32 = args->gdn_state_index_i32;
+        }
         const q27_gdn_prefill_layer_status gs =
             q27_gdn_prefill_layer_forward(&ga);
         if (gs.code != Q27_GDN_PREFILL_LAYER_OK)
@@ -715,9 +774,12 @@ q27_prefill_model_status Forward(q27_prefill_model_plan* plan,
     q27_prefill_mlp_args ma{};
     ma.struct_size = sizeof(ma);
     ma.abi_version = Q27_PREFILL_MLP_ABI_VERSION;
-    ma.tokens = tokens;
+    ma.tokens = args->verify_t8_gdn ? Q27_GDN_VERIFY_TOKENS : tokens;
     ma.input_bf16 = arena.normalized;
-    ma.input_bf16_bytes = hidden_bytes;
+    ma.input_bf16_bytes = args->verify_t8_gdn
+                              ? static_cast<uint64_t>(Q27_GDN_VERIFY_TOKENS) *
+                                    Q27_PREFILL_MODEL_HIDDEN * 2
+                              : hidden_bytes;
     ma.gate_up_weight_fp4_e2m1 = layer.mlp.gate_up_weight_fp4_e2m1;
     ma.gate_up_weight_bytes = layer.mlp.gate_up_weight_bytes;
     ma.gate_up_weight_scales_e4m3_128x4 =
@@ -732,13 +794,14 @@ q27_prefill_model_status Forward(q27_prefill_model_plan* plan,
     ma.activated_global_scale_inv = layer.mlp.activated_global_scale_inv;
     ma.down_alpha = layer.mlp.down_alpha;
     ma.output_bf16 = arena.hidden;
-    ma.output_bf16_bytes = hidden_bytes;
+    ma.output_bf16_bytes = ma.input_bf16_bytes;
     ma.scratch = arena.shared;
     ma.scratch_bytes = mlp_layout.scratch_bytes;
     ma.workspace = common + Align(mlp_layout.scratch_bytes);
     ma.workspace_bytes = mlp_layout.workspace_bytes;
     ma.cuda_stream = args->cuda_stream;
-    ml = q27_prefill_mlp_forward(&ma);
+    ml = args->verify_t8_gdn ? q27_prefill_mlp_forward_verify_t8(&ma)
+                             : q27_prefill_mlp_forward(&ma);
     if (ml.code != Q27_PREFILL_MLP_OK)
       return Error("dense MLP", ml.message);
     std::swap(residual_in, residual_out);

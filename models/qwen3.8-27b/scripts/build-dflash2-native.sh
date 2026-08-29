@@ -61,11 +61,12 @@ mkdir -p "$repo_root/build/bin" "$cargo_target" "$cargo_home"
 docker run --rm --network host --user "$user_id:$group_id" \
   -v "$repo_root:/work" -w /work \
   -v /usr/local/cuda:/usr/local/cuda:ro \
+  -v /usr/lib/aarch64-linux-gnu:/host-driver-lib:ro \
   -v "$cargo_target:/cargo-target" \
   -v "$cargo_home:/cargo-home" \
   -e CARGO_HOME=/cargo-home \
   -e CARGO_TARGET_DIR=/cargo-target \
-  -e 'RUSTFLAGS=-L native=/work/build/q27 -C link-arg=-Wl,-rpath,$ORIGIN/../q27 -C link-arg=-Wl,-rpath-link,/work/build/q27 -C link-arg=-Wl,-rpath-link,/usr/local/cuda/targets/sbsa-linux/lib' \
+  -e 'RUSTFLAGS=-L native=/work/build/q27 -C link-arg=-Wl,-rpath,$ORIGIN/../q27 -C link-arg=-Wl,-rpath-link,/work/build/q27 -C link-arg=-Wl,-rpath-link,/usr/local/cuda/targets/sbsa-linux/lib -C link-arg=-Wl,-rpath-link,/host-driver-lib' \
   "$rust_image" \
   cargo build --locked --release --jobs "$jobs" \
     --manifest-path models/qwen3.8-27b/native/Cargo.toml \

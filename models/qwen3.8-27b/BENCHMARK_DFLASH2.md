@@ -232,6 +232,38 @@ The decode optimization order is therefore:
 4. Fuse the five small-T BF16 draft layers, then move acceptance/checkpoint
    selection device-side and CUDA-graph the fixed block.
 
+## Fixed-T8 native decode canaries
+
+Three subsequent exact 47 -> 256 Spark canaries measured the fixed-T8 work.
+Each row is one measured request, not a repeated benchmark; `target verify` is
+the final block's profiled target-verification latency.
+
+| native configuration | after-first decode | total request | target verify |
+|---|---:|---:|---:|
+| GDN state journal, no committed replay | 9.043992 s / 28.1955 tok/s | 9.892169 s | 197.666 ms |
+| true-M8 GDN FP8 projections | 8.729769 s / 29.2104 tok/s | 9.347580 s | 186.524 ms |
+| true-M8 GDN and NVFP4 MLP | 6.753411 s / **37.7587 tok/s** | **7.362513 s** | **145.644 ms** |
+
+The final native canary is 7.0% faster than the retained Mia/SGLang reference
+of 35.299 tok/s on this after-first metric. All three requests passed the
+prompt/completion-count and finish-reason gates, retained the same native
+content hash
+`fe36211f6495f02312b4f37f741d5412a993e4cb331d43f710778015cec2ccac`, and
+made 39 verify calls with 273 proposals, 219 accepted draft tokens, and
+80.2198% acceptance. That hash still differs from the Mia reference, so these
+are performance canaries with `REQUEST_PASS`, not promoted correctness-parity
+results. One sample is also insufficient to establish a statistically stable
+performance lead.
+
+The retained Spark artifacts are:
+
+- GDN journal:
+  `/home/chaoyi/.cache/spark-c-q27-bench/run-20260830-native-dflash2-t8-gdn-v1`.
+- True-M8 GDN FP8:
+  `/home/chaoyi/.cache/spark-c-q27-bench/run-20260830-native-dflash2-t8-gdn-m8fp8-v1`.
+- True-M8 GDN and NVFP4 MLP:
+  `/home/chaoyi/.cache/spark-c-q27-bench/run-20260830-native-dflash2-t8-m8-v1`.
+
 The decode hash mismatch is most likely a target argmax divergence inside the
 currently unvalidated T8/M128 verifier, not an acceptance or KV scheduling
 error. The retained JSON did not include token IDs, so the next correctness

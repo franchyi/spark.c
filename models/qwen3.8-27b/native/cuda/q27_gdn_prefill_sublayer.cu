@@ -5,6 +5,7 @@
 #include "q27_gdn_prefill.h"
 #include "q27_gdn_prefill_ab.h"
 #include "q27_gdn_prefill_wy.h"
+#include "q27_gdn_verify_t8.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -186,7 +187,17 @@ extern "C" q27_gdn_prefill_sublayer_status q27_gdn_prefill_sublayer_forward(
       args->output_hidden_bf16 == nullptr ||
       args->output_hidden_bytes < fp8_layout.output_bf16_bytes ||
       args->output_plan == nullptr || args->cublas_handle == nullptr ||
-      !Aligned(args->scratch) || args->scratch_bytes < required)
+      !Aligned(args->scratch) || args->scratch_bytes < required ||
+      args->verify_t8_gdn > 1 ||
+      (args->verify_t8_gdn &&
+       (args->valid_tokens != Q27_GDN_VERIFY_TOKENS ||
+        args->checkpoint_convolution_bf16 == nullptr ||
+        args->checkpoint_convolution_bytes <
+            Q27_GDN_VERIFY_CONV_JOURNAL_BYTES_PER_LAYER ||
+        args->checkpoint_recurrent_bf16 == nullptr ||
+        args->checkpoint_recurrent_bytes <
+            Q27_GDN_VERIFY_RECURRENT_JOURNAL_BYTES_PER_LAYER ||
+        args->state_index_i32 == nullptr)))
     return Invalid("invalid q27 GDN prefill sublayer arguments");
 
   auto* arena = static_cast<uint8_t*>(args->scratch);
@@ -210,50 +221,79 @@ extern "C" q27_gdn_prefill_sublayer_status q27_gdn_prefill_sublayer_forward(
   void* normalized_output = arena + kNormalizedOutputOffset;
   void* common = arena + kCommonOffset;
   cudaStream_t stream = static_cast<cudaStream_t>(args->cuda_stream);
+  const bool verify_t8 = args->verify_t8_gdn != 0;
+  q27_gdn_prefill_status gs{};
+  q27_gdn_prefill_wy_status ws{};
+  cudaError_t cuda = cudaSuccess;
 
-  q27_gdn_prefill_conv_args conv = {};
-  conv.struct_size = sizeof(conv);
-  conv.abi_version = Q27_GDN_PREFILL_ABI_VERSION;
-  conv.valid_tokens = args->valid_tokens;
-  conv.mixed_qkv_bf16 = args->projected_qkv_bf16;
-  conv.mixed_qkv_bytes = args->projected_qkv_bytes;
-  conv.conv_weight_bf16 = args->conv_weight_bf16;
-  conv.conv_weight_bytes = args->conv_weight_bytes;
-  conv.convolution_state_bf16 = args->convolution_state_bf16;
-  conv.convolution_state_bytes = args->convolution_state_bytes;
-  conv.convolved_qkv_bf16 = convolved;
-  conv.convolved_qkv_bytes = kConvolvedBytes;
-  conv.cuda_stream = args->cuda_stream;
-  q27_gdn_prefill_status gs = q27_gdn_prefill_causal_conv(&conv);
-  if (gs.code != Q27_GDN_PREFILL_OK)
-    return Capsule("GDN convolution: ", gs.message);
+  if (verify_t8) {
+    q27_gdn_verify_t8_conv_args conv{};
+    conv.struct_size = sizeof(conv);
+    conv.abi_version = Q27_GDN_VERIFY_T8_ABI_VERSION;
+    conv.projected_qkv_bf16 = args->projected_qkv_bf16;
+    conv.projected_qkv_bytes = args->projected_qkv_bytes;
+    conv.conv_weight_bf16 = args->conv_weight_bf16;
+    conv.conv_weight_bytes = args->conv_weight_bytes;
+    conv.live_convolution_state_bf16 = args->convolution_state_bf16;
+    conv.live_convolution_state_bytes = args->convolution_state_bytes;
+    conv.convolved_qkv_bf16 = convolved;
+    conv.convolved_qkv_bytes = kConvolvedBytes;
+    conv.checkpoint_convolution_bf16 =
+        args->checkpoint_convolution_bf16;
+    conv.checkpoint_convolution_bytes =
+        args->checkpoint_convolution_bytes;
+    conv.cuda_stream = args->cuda_stream;
+    const q27_gdn_verify_t8_status verify =
+        q27_gdn_verify_t8_convolve(&conv);
+    if (verify.code != Q27_GDN_VERIFY_T8_OK)
+      return Capsule("GDN T=8 convolution: ", verify.message);
+  } else {
+    q27_gdn_prefill_conv_args conv{};
+    conv.struct_size = sizeof(conv);
+    conv.abi_version = Q27_GDN_PREFILL_ABI_VERSION;
+    conv.valid_tokens = args->valid_tokens;
+    conv.mixed_qkv_bf16 = args->projected_qkv_bf16;
+    conv.mixed_qkv_bytes = args->projected_qkv_bytes;
+    conv.conv_weight_bf16 = args->conv_weight_bf16;
+    conv.conv_weight_bytes = args->conv_weight_bytes;
+    conv.convolution_state_bf16 = args->convolution_state_bf16;
+    conv.convolution_state_bytes = args->convolution_state_bytes;
+    conv.convolved_qkv_bf16 = convolved;
+    conv.convolved_qkv_bytes = kConvolvedBytes;
+    conv.cuda_stream = args->cuda_stream;
+    gs = q27_gdn_prefill_causal_conv(&conv);
+    if (gs.code != Q27_GDN_PREFILL_OK)
+      return Capsule("GDN convolution: ", gs.message);
 
-  constexpr int kThreads = 256;
-  constexpr uint64_t kSplitElements = 128ULL * 10240;
-  SplitQkv<<<(kSplitElements + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(convolved), args->valid_tokens,
-      static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(k),
-      static_cast<__nv_bfloat16*>(v));
-  cudaError_t cuda = cudaPeekAtLastError();
-  if (cuda != cudaSuccess) return CudaError("GDN split QKV: ", cuda);
+    constexpr int kThreads = 256;
+    constexpr uint64_t kSplitElements = 128ULL * 10240;
+    SplitQkv<<<(kSplitElements + kThreads - 1) / kThreads, kThreads, 0,
+               stream>>>(static_cast<const __nv_bfloat16*>(convolved),
+                         args->valid_tokens,
+                         static_cast<__nv_bfloat16*>(q),
+                         static_cast<__nv_bfloat16*>(k),
+                         static_cast<__nv_bfloat16*>(v));
+    cuda = cudaPeekAtLastError();
+    if (cuda != cudaSuccess) return CudaError("GDN split QKV: ", cuda);
 
-  q27_gdn_prefill_l2norm_args l2 = {};
-  l2.struct_size = sizeof(l2);
-  l2.abi_version = Q27_GDN_PREFILL_WY_ABI_VERSION;
-  l2.valid_tokens = args->valid_tokens;
-  l2.input_bf16 = q;
-  l2.input_bytes = kQkBytes;
-  l2.output_bf16 = q_norm;
-  l2.output_bytes = kQkBytes;
-  l2.cuda_stream = args->cuda_stream;
-  q27_gdn_prefill_wy_status ws = q27_gdn_prefill_l2norm(&l2);
-  if (ws.code != Q27_GDN_PREFILL_WY_OK)
-    return Capsule("GDN Q L2Norm: ", ws.message);
-  l2.input_bf16 = k;
-  l2.output_bf16 = k_norm;
-  ws = q27_gdn_prefill_l2norm(&l2);
-  if (ws.code != Q27_GDN_PREFILL_WY_OK)
-    return Capsule("GDN K L2Norm: ", ws.message);
+    q27_gdn_prefill_l2norm_args l2{};
+    l2.struct_size = sizeof(l2);
+    l2.abi_version = Q27_GDN_PREFILL_WY_ABI_VERSION;
+    l2.valid_tokens = args->valid_tokens;
+    l2.input_bf16 = q;
+    l2.input_bytes = kQkBytes;
+    l2.output_bf16 = q_norm;
+    l2.output_bytes = kQkBytes;
+    l2.cuda_stream = args->cuda_stream;
+    ws = q27_gdn_prefill_l2norm(&l2);
+    if (ws.code != Q27_GDN_PREFILL_WY_OK)
+      return Capsule("GDN Q L2Norm: ", ws.message);
+    l2.input_bf16 = k;
+    l2.output_bf16 = k_norm;
+    ws = q27_gdn_prefill_l2norm(&l2);
+    if (ws.code != Q27_GDN_PREFILL_WY_OK)
+      return Capsule("GDN K L2Norm: ", ws.message);
+  }
 
   q27_gdn_prefill_ab_args ab = {};
   ab.struct_size = sizeof(ab);
@@ -275,6 +315,33 @@ extern "C" q27_gdn_prefill_sublayer_status q27_gdn_prefill_sublayer_forward(
   if (abs.code != Q27_GDN_PREFILL_AB_OK)
     return Capsule("GDN A/B projection: ", abs.message);
 
+  if (verify_t8) {
+    q27_gdn_verify_t8_recurrent_args recurrent{};
+    recurrent.struct_size = sizeof(recurrent);
+    recurrent.abi_version = Q27_GDN_VERIFY_T8_ABI_VERSION;
+    recurrent.convolved_qkv_bf16 = convolved;
+    recurrent.convolved_qkv_bytes = kConvolvedBytes;
+    recurrent.projected_a_bf16 = projected_a;
+    recurrent.projected_a_bytes = kGateInputBytes;
+    recurrent.projected_b_bf16 = projected_b;
+    recurrent.projected_b_bytes = kGateInputBytes;
+    recurrent.a_log_f32 = args->a_log_f32;
+    recurrent.dt_bias_f32 = args->dt_bias_f32;
+    recurrent.live_recurrent_state_bf16 = args->recurrent_state_bf16;
+    recurrent.live_recurrent_state_bytes = args->recurrent_state_bytes;
+    recurrent.state_index_i32 = args->state_index_i32;
+    recurrent.recurrent_output_bf16 = recurrent_output;
+    recurrent.recurrent_output_bytes = kValueBytes;
+    recurrent.checkpoint_recurrent_bf16 =
+        args->checkpoint_recurrent_bf16;
+    recurrent.checkpoint_recurrent_bytes =
+        args->checkpoint_recurrent_bytes;
+    recurrent.cuda_stream = args->cuda_stream;
+    const q27_gdn_verify_t8_status verify =
+        q27_gdn_verify_t8_recurrent(&recurrent);
+    if (verify.code != Q27_GDN_VERIFY_T8_OK)
+      return Capsule("GDN T=8 recurrence: ", verify.message);
+  } else {
   q27_gdn_prefill_gate_args gates = {};
   gates.struct_size = sizeof(gates);
   gates.abi_version = Q27_GDN_PREFILL_ABI_VERSION;
@@ -369,6 +436,7 @@ extern "C" q27_gdn_prefill_sublayer_status q27_gdn_prefill_sublayer_forward(
   ws = q27_gdn_prefill_recurrent_output(&out);
   if (ws.code != Q27_GDN_PREFILL_WY_OK)
     return Capsule("GDN recurrent output: ", ws.message);
+  }
 
   q27_gdn_prefill_norm_args norm = {};
   norm.struct_size = sizeof(norm);
@@ -387,22 +455,28 @@ extern "C" q27_gdn_prefill_sublayer_status q27_gdn_prefill_sublayer_forward(
   if (gs.code != Q27_GDN_PREFILL_OK)
     return Capsule("GDN gated norm: ", gs.message);
 
+  const uint64_t fp8_input_bytes =
+      verify_t8 ? 8ULL * 6144 * 2 : kValueBytes;
+  const uint64_t fp8_quantized_bytes =
+      verify_t8 ? 8ULL * 6144 : fp8_layout.quantized_input_bytes;
+  const uint64_t fp8_output_bytes =
+      verify_t8 ? 8ULL * 5120 * 2 : args->output_hidden_bytes;
   auto* quantized = common;
-  auto* fp8_workspace = static_cast<uint8_t*>(common) +
-                        Align(fp8_layout.quantized_input_bytes);
+  auto* fp8_workspace =
+      static_cast<uint8_t*>(common) + Align(fp8_quantized_bytes);
   q27_prefill_fp8_project_args project = {};
   project.struct_size = sizeof(project);
   project.abi_version = Q27_PREFILL_FP8_ABI_VERSION;
   project.input_bf16 = normalized_output;
-  project.input_bf16_bytes = kValueBytes;
+  project.input_bf16_bytes = fp8_input_bytes;
   project.input_scale = args->out_input_scale;
   project.weight_fp8_e4m3 = args->out_weight_fp8_e4m3;
   project.packed_weight_bytes = args->out_weight_bytes;
   project.weight_scale = args->out_weight_scale;
   project.quantized_input_fp8_e4m3 = quantized;
-  project.quantized_input_bytes = fp8_layout.quantized_input_bytes;
+  project.quantized_input_bytes = fp8_quantized_bytes;
   project.output_bf16 = args->output_hidden_bf16;
-  project.output_bf16_bytes = args->output_hidden_bytes;
+  project.output_bf16_bytes = fp8_output_bytes;
   project.workspace = fp8_workspace;
   project.workspace_bytes = fp8_layout.workspace_bytes;
   project.cuda_stream = args->cuda_stream;

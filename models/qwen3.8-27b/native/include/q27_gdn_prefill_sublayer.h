@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define Q27_GDN_PREFILL_SUBLAYER_ABI_VERSION 1u
+#define Q27_GDN_PREFILL_SUBLAYER_ABI_VERSION 2u
 
 typedef enum q27_gdn_prefill_sublayer_status_code {
   Q27_GDN_PREFILL_SUBLAYER_OK = 0,
@@ -74,6 +74,13 @@ typedef struct q27_gdn_prefill_sublayer_args {
   q27_prefill_fp8_plan* output_plan;
   void* cublas_handle;
   void* cuda_stream;
+  uint32_t verify_t8_gdn;
+  uint32_t reserved2;
+  void* checkpoint_convolution_bf16; /* [8,10240,3], verify only */
+  uint64_t checkpoint_convolution_bytes;
+  void* checkpoint_recurrent_bf16;   /* [8,48,128,128], verify only */
+  uint64_t checkpoint_recurrent_bytes;
+  const int32_t* state_index_i32;     /* device scalar zero, verify only */
 } q27_gdn_prefill_sublayer_args;
 
 q27_gdn_prefill_sublayer_status q27_gdn_prefill_sublayer_query(

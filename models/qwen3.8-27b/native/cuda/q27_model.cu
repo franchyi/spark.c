@@ -5,6 +5,7 @@
 #include "q27_attention.h"
 #include "q27_gdn.h"
 #include "q27_gdn_block.h"
+#include "q27_gdn_verify_t8.h"
 #include "q27_kernels.h"
 #include "q27_lm_head_bf16.h"
 #include "q27_mlp.h"
@@ -116,6 +117,11 @@ bool ProfileDecode(uint32_t position) {
 
 bool DFlash2ProfileRequested() {
   const char* value = std::getenv("Q27_DFLASH2_PROFILE");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool DFlash2T8GdnRequested() {
+  const char* value = std::getenv("Q27_DFLASH2_T8_GDN");
   return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
@@ -231,6 +237,7 @@ struct q27_model {
   uint64_t last_decode_us = 0;
   bool logits_valid = false;
   bool dflash2_profile_enabled = false;
+  bool dflash2_t8_gdn_enabled = false;
   bool dflash2_profile_valid = false;
   cudaEvent_t dflash2_profile_begin[kDflash2ProfilePhaseCount]{};
   cudaEvent_t dflash2_profile_end[kDflash2ProfilePhaseCount]{};
@@ -249,6 +256,10 @@ struct q27_model {
   uint8_t* gdn_recurrent_state = nullptr;
   uint8_t* verify_base_convolution_state = nullptr;
   uint8_t* verify_base_recurrent_state = nullptr;
+  uint8_t* verify_convolution_journal = nullptr;
+  uint8_t* verify_recurrent_journal = nullptr;
+  uint32_t* verify_selected_row = nullptr;
+  uint32_t* verify_commit_error = nullptr;
   float* gdn_a_log = nullptr;
   float* gdn_dt_bias = nullptr;
   float* gdn_qkvz_input_scale = nullptr;
@@ -547,6 +558,10 @@ q27_model_status FreeModel(q27_model* model) {
   cudaFree(model->gdn_qkvz_input_scale);
   cudaFree(model->gdn_recurrent_state);
   cudaFree(model->gdn_convolution_state);
+  cudaFree(model->verify_commit_error);
+  cudaFree(model->verify_selected_row);
+  cudaFree(model->verify_recurrent_journal);
+  cudaFree(model->verify_convolution_journal);
   cudaFree(model->verify_base_recurrent_state);
   cudaFree(model->verify_base_convolution_state);
   cudaFree(model->gdn_scratch);
@@ -589,6 +604,16 @@ q27_model_status AllocateModel(q27_model* model) {
             gdn.convolution_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS);
   Q27_ALLOC(model->verify_base_recurrent_state,
             gdn.recurrent_state_bytes_per_slot * Q27_MODEL_GDN_LAYERS);
+  if (model->dflash2_t8_gdn_enabled) {
+    Q27_ALLOC(model->verify_convolution_journal,
+              Q27_GDN_VERIFY_GDN_LAYERS *
+                  Q27_GDN_VERIFY_CONV_JOURNAL_BYTES_PER_LAYER);
+    Q27_ALLOC(model->verify_recurrent_journal,
+              Q27_GDN_VERIFY_GDN_LAYERS *
+                  Q27_GDN_VERIFY_RECURRENT_JOURNAL_BYTES_PER_LAYER);
+    Q27_ALLOC(model->verify_selected_row, 1);
+    Q27_ALLOC(model->verify_commit_error, 1);
+  }
   Q27_ALLOC(model->gdn_a_log,
             static_cast<uint64_t>(Q27_MODEL_GDN_LAYERS) *
                 Q27_GDN_VALUE_HEADS);
@@ -1187,6 +1212,23 @@ q27_model_status RunPrefillTile(q27_model* model, uint32_t valid_tokens,
           : static_cast<uint64_t>(valid_tokens) *
                 Q27_MODEL_DFLASH2_TARGET_FEATURES *
                 Q27_MODEL_DFLASH2_HIDDEN_SIZE * 2;
+  args.verify_t8_gdn =
+      model->dflash2_t8_gdn_enabled &&
+              output_mode == Q27_PREFILL_MODEL_OUTPUT_ALL_ROWS
+          ? 1U
+          : 0U;
+  if (args.verify_t8_gdn) {
+    args.gdn_checkpoint_convolution_bf16 =
+        model->verify_convolution_journal;
+    args.gdn_checkpoint_convolution_bytes =
+        Q27_GDN_VERIFY_GDN_LAYERS *
+        Q27_GDN_VERIFY_CONV_JOURNAL_BYTES_PER_LAYER;
+    args.gdn_checkpoint_recurrent_bf16 = model->verify_recurrent_journal;
+    args.gdn_checkpoint_recurrent_bytes =
+        Q27_GDN_VERIFY_GDN_LAYERS *
+        Q27_GDN_VERIFY_RECURRENT_JOURNAL_BYTES_PER_LAYER;
+    args.gdn_state_index_i32 = model->state_index;
+  }
   q27_prefill_model_status prefill{};
   if (m8192)
     prefill = q27_prefill_model_forward_m8192(plan, &args);
@@ -1561,6 +1603,7 @@ extern "C" q27_model_status q27_model_create(
   model->weights.layers = model->layers;
   model->capacity = options->context_capacity;
   model->dflash2_profile_enabled = DFlash2ProfileRequested();
+  model->dflash2_t8_gdn_enabled = DFlash2T8GdnRequested();
   model->state_capacity =
       std::max<uint32_t>(options->context_capacity,
                          static_cast<uint32_t>(Q27_PREFILL_MODEL_TOKENS));
@@ -1849,16 +1892,19 @@ extern "C" q27_model_status q27_model_dflash2_verify(
   status = RecordDFlash2Profile(model, kDflash2ProfileSnapshot, true);
   if (status.code != Q27_MODEL_OK) return status;
 
-  cudaError_t error = cudaMemcpyAsync(
-      model->verify_base_convolution_state, model->gdn_convolution_state,
-      conv_bytes, cudaMemcpyDeviceToDevice, model->stream);
-  if (error != cudaSuccess)
-    return Cuda("q27 DFlash2 convolution snapshot: ", error);
-  error = cudaMemcpyAsync(model->verify_base_recurrent_state,
-                          model->gdn_recurrent_state, recurrent_bytes,
-                          cudaMemcpyDeviceToDevice, model->stream);
-  if (error != cudaSuccess)
-    return Cuda("q27 DFlash2 recurrence snapshot: ", error);
+  cudaError_t error = cudaSuccess;
+  if (!model->dflash2_t8_gdn_enabled) {
+    error = cudaMemcpyAsync(
+        model->verify_base_convolution_state, model->gdn_convolution_state,
+        conv_bytes, cudaMemcpyDeviceToDevice, model->stream);
+    if (error != cudaSuccess)
+      return Cuda("q27 DFlash2 convolution snapshot: ", error);
+    error = cudaMemcpyAsync(model->verify_base_recurrent_state,
+                            model->gdn_recurrent_state, recurrent_bytes,
+                            cudaMemcpyDeviceToDevice, model->stream);
+    if (error != cudaSuccess)
+      return Cuda("q27 DFlash2 recurrence snapshot: ", error);
+  }
   error = cudaMemcpyAsync(
       model->prefill_token_tile, host_candidates,
       Q27_MODEL_DFLASH2_BLOCK_SIZE * sizeof(uint32_t),
@@ -1869,6 +1915,7 @@ extern "C" q27_model_status q27_model_dflash2_verify(
   if (status.code != Q27_MODEL_OK) return status;
 
   auto restore_base = [&]() -> q27_model_status {
+    if (model->dflash2_t8_gdn_enabled) return Ok();
     cudaError_t restore = cudaMemcpyAsync(
         model->gdn_convolution_state,
         model->verify_base_convolution_state, conv_bytes,
@@ -1968,6 +2015,7 @@ extern "C" q27_model_status q27_model_dflash2_verify(
   const uint32_t commit_length = accept_length + 1;
   const uint32_t bonus_token = target_top1[accept_length];
   const bool speculative_state_is_committed =
+      !model->dflash2_t8_gdn_enabled &&
       commit_length == Q27_MODEL_DFLASH2_BLOCK_SIZE;
 
   status = RecordDFlash2Profile(model, kDflash2ProfileRollback, true);
@@ -1990,7 +2038,37 @@ extern "C" q27_model_status q27_model_dflash2_verify(
     const q27_model_status rollback = restore_and_sync();
     return rollback.code == Q27_MODEL_OK ? status : rollback;
   }
-  if (!speculative_state_is_committed) {
+  if (model->dflash2_t8_gdn_enabled) {
+    const uint32_t selected_row = commit_length - 1;
+    error = cudaMemcpyAsync(model->verify_selected_row, &selected_row,
+                            sizeof(selected_row), cudaMemcpyHostToDevice,
+                            model->stream);
+    if (error != cudaSuccess)
+      return Cuda("q27 DFlash2 selected GDN state: ", error);
+    q27_gdn_verify_t8_commit_args commit{};
+    commit.struct_size = sizeof(commit);
+    commit.abi_version = Q27_GDN_VERIFY_T8_ABI_VERSION;
+    commit.checkpoint_convolution_bf16 =
+        model->verify_convolution_journal;
+    commit.checkpoint_convolution_bytes =
+        Q27_GDN_VERIFY_GDN_LAYERS *
+        Q27_GDN_VERIFY_CONV_JOURNAL_BYTES_PER_LAYER;
+    commit.checkpoint_recurrent_bf16 = model->verify_recurrent_journal;
+    commit.checkpoint_recurrent_bytes =
+        Q27_GDN_VERIFY_GDN_LAYERS *
+        Q27_GDN_VERIFY_RECURRENT_JOURNAL_BYTES_PER_LAYER;
+    commit.live_convolution_state_bf16 = model->gdn_convolution_state;
+    commit.live_convolution_state_bytes = conv_bytes;
+    commit.live_recurrent_state_bf16 = model->gdn_recurrent_state;
+    commit.live_recurrent_state_bytes = recurrent_bytes;
+    commit.selected_row_u32 = model->verify_selected_row;
+    commit.device_error_u32 = model->verify_commit_error;
+    commit.cuda_stream = model->stream;
+    const q27_gdn_verify_t8_status committed =
+        q27_gdn_verify_t8_commit(&commit);
+    if (committed.code != Q27_GDN_VERIFY_T8_OK)
+      return Kernel("q27 DFlash2 GDN journal commit: ", committed.message);
+  } else if (!speculative_state_is_committed) {
     status = RunPrefillTile(model, commit_length, base_position,
                             Q27_PREFILL_MODEL_OUTPUT_NONE, nullptr, nullptr);
     if (status.code != Q27_MODEL_OK) {
@@ -2005,6 +2083,7 @@ extern "C" q27_model_status q27_model_dflash2_verify(
     return rollback.code == Q27_MODEL_OK ? status : rollback;
   }
   invalid = 0;
+  uint32_t commit_error = 0;
   status = RecordDFlash2Profile(
       model, kDflash2ProfileCommittedResultSync, true);
   if (status.code != Q27_MODEL_OK) {
@@ -2016,6 +2095,11 @@ extern "C" q27_model_status q27_model_dflash2_verify(
       q27_prefill_model_invalid_count(&model->prefill_layout,
                                       model->prefill_scratch),
       sizeof(invalid), cudaMemcpyDeviceToHost, model->stream);
+  if (error == cudaSuccess && model->dflash2_t8_gdn_enabled) {
+    error = cudaMemcpyAsync(&commit_error, model->verify_commit_error,
+                            sizeof(commit_error), cudaMemcpyDeviceToHost,
+                            model->stream);
+  }
   if (error == cudaSuccess) {
     status = RecordDFlash2Profile(
         model, kDflash2ProfileCommittedResultSync, false);
@@ -2031,13 +2115,14 @@ extern "C" q27_model_status q27_model_dflash2_verify(
     }
   }
   if (error == cudaSuccess) error = cudaStreamSynchronize(model->stream);
-  if (error != cudaSuccess || invalid != 0) {
+  if (error != cudaSuccess || invalid != 0 || commit_error != 0) {
     const q27_model_status rollback = restore_and_sync();
     if (rollback.code != Q27_MODEL_OK) return rollback;
-    return error != cudaSuccess
-               ? Cuda("q27 DFlash2 committed-prefix sync: ", error)
-               : Kernel("q27 DFlash2 committed prefix: ",
-                        "device token/page validation failed");
+    if (error != cudaSuccess)
+      return Cuda("q27 DFlash2 committed-prefix sync: ", error);
+    return Kernel("q27 DFlash2 committed prefix: ",
+                  commit_error != 0 ? "invalid GDN journal selection"
+                                    : "device token/page validation failed");
   }
   status = CollectDFlash2Profile(model);
   if (status.code != Q27_MODEL_OK) {

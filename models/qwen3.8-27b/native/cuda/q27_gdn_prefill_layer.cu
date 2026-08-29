@@ -3,6 +3,7 @@
 #include "q27_gdn_prefill_layer.h"
 
 #include "q27_gdn_prefill_sublayer.h"
+#include "q27_gdn_verify_t8.h"
 #include "q27_prefill_core.h"
 
 #include <cuda_bf16.h>
@@ -126,7 +127,16 @@ extern "C" q27_gdn_prefill_layer_status q27_gdn_prefill_layer_forward(
       args->normalized_output_bf16 == nullptr || args->residual_output_bf16 == nullptr ||
       args->qkvz_plan == nullptr || args->output_plan == nullptr ||
       args->cublas_handle == nullptr || !Aligned(args->scratch) ||
-      args->scratch_bytes < required)
+      args->scratch_bytes < required || args->verify_t8_gdn > 1 ||
+      (args->verify_t8_gdn &&
+       (args->valid_tokens != Q27_GDN_VERIFY_TOKENS ||
+        args->checkpoint_convolution_bf16 == nullptr ||
+        args->checkpoint_convolution_bytes <
+            Q27_GDN_VERIFY_CONV_JOURNAL_BYTES_PER_LAYER ||
+        args->checkpoint_recurrent_bf16 == nullptr ||
+        args->checkpoint_recurrent_bytes <
+            Q27_GDN_VERIFY_RECURRENT_JOURNAL_BYTES_PER_LAYER ||
+        args->state_index_i32 == nullptr)))
     return Invalid("invalid q27 GDN full-layer arguments");
   auto* arena = static_cast<uint8_t*>(args->scratch);
   void* normalized = arena + kNormInputOffset;
@@ -152,28 +162,36 @@ extern "C" q27_gdn_prefill_layer_status q27_gdn_prefill_layer_forward(
   q27_prefill_core_status cs = q27_prefill_norm(&norm);
   if (cs.code != Q27_PREFILL_CORE_OK) return Error("input norm: ", cs.message);
 
+  const uint64_t qkvz_input_bytes =
+      args->verify_t8_gdn ? 8ULL * 5120 * 2 : kHiddenBytes;
+  const uint64_t qkvz_quantized_bytes =
+      args->verify_t8_gdn ? 8ULL * 5120 : qkvz.quantized_input_bytes;
+  const uint64_t qkvz_output_bytes =
+      args->verify_t8_gdn ? 8ULL * 16384 * 2 : kFusedBytes;
   auto* quantized = common;
-  auto* workspace = static_cast<uint8_t*>(common) + A(qkvz.quantized_input_bytes);
+  auto* workspace =
+      static_cast<uint8_t*>(common) + A(qkvz_quantized_bytes);
   q27_prefill_fp8_project_args projection = {};
   projection.struct_size = sizeof(projection);
   projection.abi_version = Q27_PREFILL_FP8_ABI_VERSION;
   projection.input_bf16 = normalized;
-  projection.input_bf16_bytes = kHiddenBytes;
+  projection.input_bf16_bytes = qkvz_input_bytes;
   projection.input_scale = args->qkvz_input_scale;
   projection.weight_fp8_e4m3 = args->qkvz_weight_fp8_e4m3;
   projection.packed_weight_bytes = args->qkvz_weight_bytes;
   projection.weight_scale = args->qkvz_weight_scale;
   projection.quantized_input_fp8_e4m3 = quantized;
-  projection.quantized_input_bytes = qkvz.quantized_input_bytes;
+  projection.quantized_input_bytes = qkvz_quantized_bytes;
   projection.output_bf16 = fused;
-  projection.output_bf16_bytes = kFusedBytes;
+  projection.output_bf16_bytes = qkvz_output_bytes;
   projection.workspace = workspace;
   projection.workspace_bytes = qkvz.workspace_bytes;
   projection.cuda_stream = args->cuda_stream;
   q27_prefill_fp8_status fs = q27_prefill_fp8_project(args->qkvz_plan, &projection);
   if (fs.code != Q27_PREFILL_FP8_OK) return Error("fused QKVZ: ", fs.message);
   constexpr int threads = 256;
-  constexpr uint64_t elements = 128ULL * 16384;
+  const uint64_t elements =
+      (args->verify_t8_gdn ? 8ULL : 128ULL) * 16384;
   SplitQkvz<<<(elements + threads - 1) / threads, threads, 0,
               static_cast<cudaStream_t>(args->cuda_stream)>>>(
       static_cast<const __nv_bfloat16*>(fused),
@@ -214,6 +232,14 @@ extern "C" q27_gdn_prefill_layer_status q27_gdn_prefill_layer_forward(
   subargs.output_plan = args->output_plan;
   subargs.cublas_handle = args->cublas_handle;
   subargs.cuda_stream = args->cuda_stream;
+  subargs.verify_t8_gdn = args->verify_t8_gdn;
+  subargs.checkpoint_convolution_bf16 =
+      args->checkpoint_convolution_bf16;
+  subargs.checkpoint_convolution_bytes =
+      args->checkpoint_convolution_bytes;
+  subargs.checkpoint_recurrent_bf16 = args->checkpoint_recurrent_bf16;
+  subargs.checkpoint_recurrent_bytes = args->checkpoint_recurrent_bytes;
+  subargs.state_index_i32 = args->state_index_i32;
   q27_gdn_prefill_sublayer_status ss = q27_gdn_prefill_sublayer_forward(&subargs);
   if (ss.code != Q27_GDN_PREFILL_SUBLAYER_OK)
     return Error("GDN sublayer: ", ss.message);

@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define Q27_PREFILL_MODEL_ABI_VERSION 2u
+#define Q27_PREFILL_MODEL_ABI_VERSION 3u
 
 enum {
   Q27_PREFILL_MODEL_LAYERS = 64,
@@ -167,6 +167,13 @@ typedef struct q27_prefill_model_args {
   uint64_t output_top1_bytes;
   void* target_features_bf16;                /* optional [valid_tokens,5,5120] */
   uint64_t target_features_bytes;
+  uint32_t verify_t8_gdn;
+  uint32_t reserved3;
+  void* gdn_checkpoint_convolution_bf16;      /* [48,8,10240,3] */
+  uint64_t gdn_checkpoint_convolution_bytes;
+  void* gdn_checkpoint_recurrent_bf16;        /* [48,8,48,128,128] */
+  uint64_t gdn_checkpoint_recurrent_bytes;
+  const int32_t* gdn_state_index_i32;         /* device scalar zero */
 } q27_prefill_model_args;
 
 q27_prefill_model_status q27_prefill_model_query(

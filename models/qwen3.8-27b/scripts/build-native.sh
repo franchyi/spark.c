@@ -20,9 +20,16 @@ docker run --rm --gpus all --network host --user "$user_id:$group_id" \
   "$cuda_image" \
   bash -euo pipefail -c '
     mkdir -p "$FLASHINFER_WORKSPACE_BASE" "$XDG_CACHE_HOME"
-    rm -rf build/q27 build/q27-aot
+    # c427 prefill artifacts may be root-owned because they are exported by a
+    # separate donor container. They are not inputs to this capsule build.
+    # Rebuild only the model-owned AOT directories and leave c427 untouched.
+    rm -rf build/q27 build/q27-aot/gdn build/q27-aot/quantize \
+      build/q27-aot/verify-t8 build/q27-aot/.verified
     python3 vendor/tools/export-gdn-aot.py build/q27-aot/gdn \
       --namespace q27 --tokens 1
+    PYTHONPATH=/work/vendor/_deps/flashinfer \
+      python3 vendor/tools/export-q27-gdn-verify-aot.py \
+        build/q27-aot/verify-t8
     python3 models/qwen3.8-27b/native/tools/export-nvfp4-aot.py build/q27-aot/quantize
     sha256sum -c vendor/q27-aot-sm121.sha256
 
@@ -72,11 +79,12 @@ mkdir -p "$repo_root/build/bin" "$target_host" "$cargo_home"
 docker run --rm --network host --user "$user_id:$group_id" \
   -v "$repo_root:/work" -w /work \
   -v /usr/local/cuda:/usr/local/cuda:ro \
+  -v /usr/lib/aarch64-linux-gnu:/host-driver-lib:ro \
   -v "$target_host:/cargo-target" \
   -v "$cargo_home:/cargo-home" \
   -e CARGO_HOME=/cargo-home \
   -e CARGO_TARGET_DIR=/cargo-target \
-  -e 'RUSTFLAGS=-L native=/work/build/q27 -C link-arg=-Wl,-rpath,$ORIGIN/../q27 -C link-arg=-Wl,-rpath-link,/work/build/q27 -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
+  -e 'RUSTFLAGS=-L native=/work/build/q27 -C link-arg=-Wl,-rpath,$ORIGIN/../q27 -C link-arg=-Wl,-rpath-link,/work/build/q27 -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64 -C link-arg=-Wl,-rpath-link,/host-driver-lib' \
   "$rust_image" \
   cargo build --locked --release \
     --manifest-path models/qwen3.8-27b/native/Cargo.toml \

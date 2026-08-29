@@ -28,6 +28,8 @@ SHARED_FLAGS := --shared -Xcompiler=-fPIC
 ORIGIN_RPATH := -Xlinker=-rpath -Xlinker='$$ORIGIN'
 
 GDN_AOT_OBJECT := $(AOT_DIR)/gdn/gdn_bf16_t1_h16_hv48_k128_v128_sm121.o
+GDN_VERIFY_T8_AOT_OBJECT := \
+	$(AOT_DIR)/verify-t8/q27_verify_gdn_bf16_t8_h16_hv48_k128_v128_sm121.o
 NVFP4_K5120_AOT_OBJECT := \
 	$(AOT_DIR)/quantize/swizzled_bfloat16_k5120_sf0_pdl0.o
 NVFP4_K17408_AOT_OBJECT := \
@@ -49,6 +51,7 @@ LM_HEAD_BF16_SHARED := $(BUILD_DIR)/libq27-lm-head-bf16.so
 PREFILL_CORE_SHARED := $(BUILD_DIR)/libq27-prefill-core.so
 PREFILL_FP8_SHARED := $(BUILD_DIR)/libq27-prefill-fp8.so
 PREFILL_NVFP4_SHARED := $(BUILD_DIR)/libq27-prefill-nvfp4.so
+VERIFY_NVFP4_SHARED := $(BUILD_DIR)/libq27-verify-nvfp4.so
 PREFILL_MLP_SHARED := $(BUILD_DIR)/libq27-prefill-mlp.so
 PREFILL_ATTENTION_SHARED := $(BUILD_DIR)/libq27-prefill-attention.so
 PREFILL_ATTENTION_LAYER_SHARED := \
@@ -59,17 +62,18 @@ GDN_PREFILL_WY_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-wy.so
 GDN_PREFILL_FUSED_SPLIT_NORM_SHARED := \
 	$(BUILD_DIR)/libq27-gdn-prefill-fused-split-norm.so
 GDN_PREFILL_C427_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-c427.so
+GDN_VERIFY_T8_SHARED := $(BUILD_DIR)/libq27-gdn-verify-t8.so
 GDN_PREFILL_SUBLAYER_SHARED := \
 	$(BUILD_DIR)/libq27-gdn-prefill-sublayer.so
 GDN_PREFILL_LAYER_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-layer.so
 GDN_PREFILL_M512_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-m512.so
 PREFILL_MODEL_SHARED := $(BUILD_DIR)/libq27-prefill-model.so
 PREFILL_SHARED := $(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) \
-	$(PREFILL_NVFP4_SHARED) $(PREFILL_MLP_SHARED) \
+	$(PREFILL_NVFP4_SHARED) $(VERIFY_NVFP4_SHARED) $(PREFILL_MLP_SHARED) \
 	$(PREFILL_ATTENTION_SHARED) $(PREFILL_ATTENTION_LAYER_SHARED) \
 	$(GDN_PREFILL_SHARED) $(GDN_PREFILL_AB_SHARED) \
 	$(GDN_PREFILL_WY_SHARED) $(GDN_PREFILL_FUSED_SPLIT_NORM_SHARED) \
-	$(GDN_PREFILL_C427_SHARED) \
+	$(GDN_PREFILL_C427_SHARED) $(GDN_VERIFY_T8_SHARED) \
 	$(GDN_PREFILL_SUBLAYER_SHARED) \
 	$(GDN_PREFILL_LAYER_SHARED) $(GDN_PREFILL_M512_SHARED) \
 	$(PREFILL_MODEL_SHARED)
@@ -187,12 +191,13 @@ $(GDN_BLOCK_SHARED): cuda/q27_gdn_block.cc include/q27_gdn_block.h \
 $(MODEL_SHARED): cuda/q27_model.cu include/q27_model.h $(KERNEL_SHARED) \
 		$(GDN_BLOCK_SHARED) $(MLP_SHARED) $(ATTENTION_SHARED) \
 		$(LM_HEAD_BF16_SHARED) $(PREFILL_MODEL_SHARED) \
-		$(PREFILL_NVFP4_SHARED) | $(BUILD_DIR)
+		$(PREFILL_NVFP4_SHARED) $(GDN_VERIFY_T8_SHARED) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
 		-Xlinker=-soname -Xlinker=$(notdir $@) cuda/q27_model.cu \
 		-L$(BUILD_DIR) -lq27-gdn-block -lq27-gdn -lq27-mlp \
 		-lq27-nvfp4 -lq27-attention -lq27-lm-head-bf16 -lq27-kernels \
-		-lq27-prefill-model -lq27-prefill-nvfp4 -lcublas \
+		-lq27-prefill-model -lq27-prefill-nvfp4 -lq27-gdn-verify-t8 \
+		-lcublas \
 		$(ORIGIN_RPATH) -o $@
 
 $(LM_HEAD_BF16_SHARED): cuda/q27_lm_head_bf16.cu \
@@ -225,11 +230,25 @@ $(PREFILL_NVFP4_SHARED): cuda/q27_prefill_nvfp4.cu \
 		$(CUDA_DIALECT_ARCHIVE) -L$(TVM_FFI_ROOT)/lib -ltvm_ffi \
 		-lcuda -lcudart -ldl -Xcompiler=-pthread $(ORIGIN_RPATH) -o $@
 
+$(VERIFY_NVFP4_SHARED): cuda/q27_verify_nvfp4.cu \
+		include/q27_verify_nvfp4.h $(AOT_STAMP) | $(BUILD_DIR)
+	test -n "$(TVM_FFI_ROOT)"
+	test -n "$(CUDA_DIALECT_ARCHIVE)"
+	test -f "$(CUDA_DIALECT_ARCHIVE)"
+	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_FLAGS) $(INCLUDES) \
+		$(CCCL_INCLUDES) $(FLASHINFER_INCLUDES) \
+		-I$(TVM_FFI_ROOT)/include $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		$(NVFP4_K5120_AOT_OBJECT) $(NVFP4_K17408_AOT_OBJECT) \
+		$(CUDA_DIALECT_ARCHIVE) -L$(TVM_FFI_ROOT)/lib -ltvm_ffi \
+		-lcuda -lcudart -ldl -Xcompiler=-pthread $(ORIGIN_RPATH) -o $@
+
 $(PREFILL_MLP_SHARED): cuda/q27_prefill_mlp.cu \
-		include/q27_prefill_mlp.h $(PREFILL_NVFP4_SHARED) | $(BUILD_DIR)
+		include/q27_prefill_mlp.h include/q27_verify_nvfp4.h \
+		$(PREFILL_NVFP4_SHARED) $(VERIFY_NVFP4_SHARED) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
 		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
-		-L$(BUILD_DIR) -lq27-prefill-nvfp4 -lcudart \
+		-L$(BUILD_DIR) -lq27-prefill-nvfp4 -lq27-verify-nvfp4 -lcudart \
 		$(ORIGIN_RPATH) -o $@
 
 $(PREFILL_ATTENTION_SHARED): cuda/q27_prefill_attention.cu \
@@ -285,14 +304,28 @@ $(GDN_PREFILL_C427_SHARED): cuda/q27_gdn_prefill_c427.cu \
 		cuda/q27_gdn_prefill_c427_aot.cc \
 		-lcuda -lcudart $(ORIGIN_RPATH) -o $@
 
+$(GDN_VERIFY_T8_SHARED): cuda/q27_gdn_verify_t8.cu \
+		cuda/q27_gdn_verify_t8_flashinfer.cc include/q27_gdn_verify_t8.h \
+		$(GDN_VERIFY_T8_AOT_OBJECT) | $(BUILD_DIR)
+	test -n "$(TVM_FFI_ROOT)"
+	test -n "$(CUDA_DIALECT_ARCHIVE)"
+	test -f "$(CUDA_DIALECT_ARCHIVE)"
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -I$(TVM_FFI_ROOT)/include \
+		$(SHARED_FLAGS) -Xlinker=-soname -Xlinker=$(notdir $@) \
+		cuda/q27_gdn_verify_t8.cu cuda/q27_gdn_verify_t8_flashinfer.cc \
+		$(GDN_VERIFY_T8_AOT_OBJECT) $(CUDA_DIALECT_ARCHIVE) \
+		-L$(TVM_FFI_ROOT)/lib -ltvm_ffi -lcuda -lcudart -ldl \
+		-Xcompiler=-pthread $(ORIGIN_RPATH) -o $@
+
 $(GDN_PREFILL_SUBLAYER_SHARED): cuda/q27_gdn_prefill_sublayer.cu \
 		include/q27_gdn_prefill_sublayer.h $(GDN_PREFILL_SHARED) \
 		$(GDN_PREFILL_AB_SHARED) $(GDN_PREFILL_WY_SHARED) \
-		$(PREFILL_FP8_SHARED) | $(BUILD_DIR)
+		$(GDN_VERIFY_T8_SHARED) $(PREFILL_FP8_SHARED) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
 		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
 		-L$(BUILD_DIR) -lq27-gdn-prefill -lq27-gdn-prefill-ab \
-		-lq27-gdn-prefill-wy -lq27-prefill-fp8 -lcublas -lcudart \
+		-lq27-gdn-prefill-wy -lq27-gdn-verify-t8 \
+		-lq27-prefill-fp8 -lcublas -lcudart \
 		$(ORIGIN_RPATH) -o $@
 
 $(GDN_PREFILL_LAYER_SHARED): cuda/q27_gdn_prefill_layer.cu \

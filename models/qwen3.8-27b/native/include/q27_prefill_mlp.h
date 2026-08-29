@@ -86,6 +86,17 @@ q27_prefill_mlp_status q27_prefill_mlp_forward(
     const q27_prefill_mlp_args* args);
 
 /*
+ * Fixed physical M=8 DFlash2 target-verify path. This is deliberately a
+ * separate entry point: callers must opt in, set tokens=8, and provide exact
+ * [8,*] input/output byte counts. It reuses the pinned FlashInfer/CUTLASS
+ * q27_verify_nvfp4 capsule and never falls back to an M=128 prefill GEMM.
+ */
+q27_prefill_mlp_status q27_prefill_mlp_query_verify_t8(
+    q27_prefill_mlp_layout* output);
+q27_prefill_mlp_status q27_prefill_mlp_forward_verify_t8(
+    const q27_prefill_mlp_args* args);
+
+/*
  * Disabled experimental candidate for FlashInfer/TensorRT-LLM's fused BF16
  * SiLU*up+NVFP4 quantizer followed by the packed-input DOWN GEMM. The donor
  * cannot assemble for GB10 sm_121, so this returns a kernel error propagated
