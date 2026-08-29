@@ -7,6 +7,9 @@ cuda_image=${SPARKSERVE_CUDA_IMAGE:-sparkserve/sglang:qwen38flashnext-sm121}
 rust_image=${SPARKSERVE_RUST_IMAGE:-docker.1ms.run/rust:1.89.0}
 jobs=${JOBS:-4}
 target_host=${SPARKSERVE_RUST_TARGET:-${HOME}/.cache/sparkserve-rust-target}
+cargo_home=${SPARKSERVE_CARGO_HOME:-${HOME}/.cache/sparkserve-cargo-home}
+user_id=$(id -u)
+group_id=$(id -g)
 cuda_host_root=${SPARKSERVE_CUDA_HOST_ROOT:-$(readlink -f /usr/local/cuda)}
 if [[ ! -d "$cuda_host_root/lib64" ]]; then
   echo "cannot locate the Spark CUDA toolkit at $cuda_host_root" >&2
@@ -20,11 +23,14 @@ if [[ "$actual_cuda_image_id" != "$expected_cuda_image_id" ]]; then
 fi
 
 "$script_dir/fetch-kernel-sources.sh" "$repo_root/third_party/_deps/flashinfer"
+mkdir -p "$repo_root/build/bin" "$target_host" "$cargo_home"
 
-docker run --rm --gpus all --network host \
+docker run --rm --gpus all --network host --user "$user_id:$group_id" \
   -v "$repo_root:/work" -w /work \
+  -e HOME=/tmp/sparkserve-cuda-home \
   "$cuda_image" \
   bash -euo pipefail -c '
+    mkdir -p "$HOME"
     rm -rf build/aot-qwen
     python3 scripts/export-gdn-aot.py build/aot-qwen/gdn --tokens 1 2 4 8 16
     python3 scripts/export-silu-nvfp4-aot.py build/aot-qwen/silu
@@ -51,11 +57,13 @@ docker run --rm --gpus all --network host \
   '
 
 mkdir -p "$target_host"
-docker run --rm --network host \
+docker run --rm --network host --user "$user_id:$group_id" \
   -v "$repo_root:/work" -w /work \
   -v "$target_host:/cargo-target" \
+  -v "$cargo_home:/cargo-home" \
   -v "$cuda_host_root:/usr/local/cuda:ro" \
-  -e CARGO_HOME=/work/.cache/cargo-home \
+  -e HOME=/tmp/sparkserve-rust-home \
+  -e CARGO_HOME=/cargo-home \
   -e CARGO_TARGET_DIR=/cargo-target \
   -e RUSTFLAGS='-L native=/work/build -l dylib=sparkserve-fabric -l dylib=sparkserve-qwen-runtime -l dylib=sparkserve-qsa -C link-arg=-Wl,-rpath-link,/work/build -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
   "$rust_image" \
