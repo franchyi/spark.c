@@ -3,7 +3,22 @@
   "mirror": "https://hf-mirror.com",
   "models": [
     {
-      "id": "qwen38-flash-next-nvfp4",
+      "id": "qwen3.8-27b-nvfp4",
+      "repo": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+      "revision": "009632fef96dd349150baa780c984e62e70e91fe",
+      "architecture": "Qwen3_5ForConditionalGeneration",
+      "format": "modelopt_nvfp4_safetensors",
+      "quantization": "NVFP4_MLP_FP8_ATTENTION_BF16_LM_HEAD",
+      "inventory": "strict_native_scanner",
+      "checkpoint_bytes": 23749063264,
+      "storage": {
+        "mapped_text_mtp_bytes": 22827603072,
+        "ignored_vision_bytes": 921460192,
+        "paged_tensor_class": "none"
+      }
+    },
+    {
+      "id": "qwen3.8-flash-next-nvfp4",
       "repo": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
       "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
       "architecture": "Qwen4ExpForConditionalGeneration",
@@ -46,51 +61,12 @@
       ]
     },
     {
-      "id": "glm53-flash-iq3-xxs",
-      "repo": "unsloth/GLM-5.3-Flash-GGUF",
-      "revision": "d45e959d75bf3e0e809e2c7e461f111a8efa1f83",
-      "architecture": "GLM5NextForConditionalGeneration",
-      "format": "gguf",
-      "quantization": "UD-IQ3_XXS",
-      "inventory": "complete_checkpoint",
-      "checkpoint_bytes": 120367571715,
-      "storage": {
-        "paged_tensor_class": "routed_expert"
-      },
-      "files": [
-        {
-          "path": "UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf",
-          "size": 9429859,
-          "sha256": "b3282af0711eec07a0462a6126dc75b32bc14b698a39efec1b3b34d3c4217dc5",
-          "role": "gguf_shard"
-        },
-        {
-          "path": "UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00002-of-00004.gguf",
-          "size": 49261511584,
-          "sha256": "a4dba331fe92ffbd71317839cc1452c57f0b5b3f971a9e96ee5107f9a615cdac",
-          "role": "gguf_shard"
-        },
-        {
-          "path": "UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00003-of-00004.gguf",
-          "size": 49075832480,
-          "sha256": "5b728b5b263c662201ef4a4a2b12fb509fe230d012418d0ed37c220a8a5aa230",
-          "role": "gguf_shard"
-        },
-        {
-          "path": "UD-IQ3_XXS/GLM-5.3-Flash-UD-IQ3_XXS-00004-of-00004.gguf",
-          "size": 22020797792,
-          "sha256": "4b6d16e0d1381e1b4b7eeb6c9799671bf98153a995be12e75e3da93cd97981d2",
-          "role": "gguf_shard"
-        }
-      ]
-    },
-    {
-      "id": "glm53-flash-ds4-q2",
+      "id": "glm-5.3-flash-q2",
       "repo": "antirez/glm-5.3-flash-gguf",
       "revision": "d0d6394cad1046c6d8ad87fa9b0939b4760cb94f",
       "architecture": "GLM5NextForConditionalGeneration",
       "format": "gguf",
-      "quantization": "DS4-Q2-IQ2_XXS-Q2_K",
+      "quantization": "DS4_Q2_IQ2_XXS_Q2_K",
       "inventory": "complete_checkpoint",
       "checkpoint_bytes": 96505816384,
       "storage": {

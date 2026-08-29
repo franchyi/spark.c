@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/sparkserve-runtime", "engines/qwen38-27b/native"]
+members = [
+    "models/qwen3.8-27b/native",
+    "models/qwen3.8-flash-next/native",
+]
 resolver = "2"
 
 [profile.release]

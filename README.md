@@ -1,355 +1,62 @@
-# SparkServe
+# Spark.C
 
-SparkServe is a lightweight GB10-native inference project for DGX Spark. The
-Qwen path is a Rust scheduler calling narrow C/CUDA ABIs. The first complete GLM
-release deliberately ships the pinned, model-specific ds4 Q2 server while the
-native scheduler continues independently. Python is tooling only and is never
-in either serving hot path. The project is deliberately not an SGLang fork;
-SGLang and llama.cpp remain correctness and performance oracles.
+Spark.C is a lightweight, model-specific inference project for one DGX Spark.
+It is not a general model framework: each supported model owns its graph,
+storage policy, kernels, build, server, and benchmarks.
 
-The ordered model targets are:
-
-1. `Qwen3.8-27B-SGLang-NVFP4` as the resident, measurable baseline.
-2. `RadixArk/Qwen3.8-Flash-Next-NVFP4` with its sparse PLE table on NVMe.
-3. `antirez/glm-5.3-flash-gguf:GLM-5.3-Flash-Q2.gguf` as the first complete GLM
-   service and GB10 performance baseline.
-4. `unsloth/GLM-5.3-Flash-GGUF:UD-IQ3_XXS` as the explicitly paged 3-bit MoE
-   profile; `UD-Q3_K_XL` follows as a higher-quality stretch target.
-
-## Three engines, one operational contract
-
-The first product layout is now under [`engines/`](engines/README.md):
-
-- [`qwen38-27b`](engines/qwen38-27b/README.md) pins the MiaAI-Lab SGLang Spark
-  recipe as the fast 27B oracle and isolates later native extraction.
-- [`qwen38-flash-next`](engines/qwen38-flash-next/README.md) owns the existing
-  SparkServe Rust/CUDA graph and pins the Blazux vLLM mmap deployment as an
-  independent oracle.
-- [`glm53-q2`](engines/glm53-q2/README.md) ships the accepted pristine ds4
-  C/CUDA service; Rust admission/scheduling can be added around its long-lived
-  model context only after measurement.
-
-The engines intentionally do not share a model abstraction or tensor registry.
-They share only the small build/serve/smoke/bench contract documented in
-[`engines/CONTRACT.md`](engines/CONTRACT.md). Run it through the optional thin
-dispatcher, for example `./engines/bin/spark-engine glm53-q2 provenance`.
-
-SparkServe intentionally has two checkpoint-format families: ModelOpt NVFP4 in
-safetensors and quantized GGUF blocks. Qwen4-exp and GLM5Next are model graphs
-inside the same runtime, not separate serving stacks.
-
-## Highlights
-
-- **One runtime copy:** GB10 CPU and GPU share coherent physical memory, so
-  SparkServe does not maintain separate host and device copies of model weights.
-- **Selective NVMe residency:** cold sparse tables and oversized GGUF blocks stay
-  in file-backed mappings; only touched pages enter DRAM.
-- **No PLE rewrite:** the 47.7 GiB PLE is addressed inside the original
-  safetensors shards rather than copied to a second backing file at every boot.
-- **Kernel-native mapped files:** an optional offline `sspack` format aligns hot
-  tensors for SM121 kernels when a source checkpoint's layout is unsuitable.
-- **Fused precision boundaries:** PLE gather, FP8 scaling, and BF16 accumulation
-  are one kernel; routed experts remain NVFP4 through Tensor Core MMA.
-- **Borrow kernels, not frameworks:** CUTLASS, selected FlashInfer/SGLang kernels,
-  and ggml CUDA kernels sit behind our small C ABI; their Python schedulers,
-  allocators, and servers are not runtime dependencies.
-- **Ship the complete GLM path first:** pristine ds4 revision `a60a2a0...` is
-  hash-checked and source-built for SM121; its Q2 server supplies the complete
-  tokenizer, graph, OpenAI APIs, and SSE without Python or SGLang at runtime.
-- **Isolate format risk:** Q2 service acceptance is independent from the later
-  IQ3 paging work, while reusable GGUF scheduling remains in SparkServe.
-
-## The key bet
-
-Flash-Next stores a 20-million-row, 2,560-wide PLE table in FP8. That table is
-about 47.7 GiB in the checkpoint and about 95.4 GiB if fully expanded to BF16,
-yet inference touches only 16 rows per token. SparkServe keeps the table compressed
-on NVMe, fetches only requested rows, and dequantizes into a small staging cache.
-The text-only base is 72.498 GiB and can stay resident; 4.856 GiB of MTP weights
-is admitted only when speculation is enabled, and the 0.836 GiB vision tower is
-excluded from text mode.
-
-This differs from CPU offload: on DGX Spark the CPU and GPU share the same 128 GB,
-so moving a tensor to "CPU memory" does not create capacity.
-
-## Try the executable memory gate
-
-```bash
-uv sync
-uv run sparkserve lock-check models.lock.json
-uv run sparkserve manifest RadixArk/Qwen3.8-Flash-Next-NVFP4
-uv run sparkserve plan qwen38-flash-next-nvfp4
-uv run pytest
-```
-
-Build the zero-copy PLE index directly over the downloaded checkpoint, then run
-the reference bounded-cache benchmark:
-
-```bash
-uv run sparkserve ple-index \
-  /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-  /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4/.sparkserve/ple.ssple \
-  --revision 7b719225242aacd3dbd3f9407468c2ee9a9d2594
-uv run sparkserve ple-bench \
-  /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4/.sparkserve/ple.ssple \
-  --model-root /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-  --cache-mib 8192 --workers 16
-```
-
-Add `--batch-tokens 1` to measure the latency-sensitive decode miss path rather
-than a fully coalesced prefill submission.
-
-`ple-index` reads only safetensors headers and the two-byte BF16 scale. The
-resulting index points at the original 47.7 GiB FP8 tensors on NVMe; it neither
-duplicates nor expands the weights. The Python reader is an offline correctness
-and storage benchmark. The shipping path consumes the same binary index from
-Rust and will replace `pread` workers with registered `io_uring` buffers.
-
-The same gate exists in the minimal standalone Rust runtime:
-
-```bash
-cargo test --workspace
-cargo run -p sparkserve-runtime -- plan qwen38-flash-next-nvfp4
-cargo run -p sparkserve-runtime -- checkpoint-plan \
-  /home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4
-cargo run -p sparkserve-runtime -- kernel-plan nvfp4-dense 1 4096 4096 121
-make test-cpp
-# Inside a CUDA 13 environment on Spark:
-make test-cuda-gdn
-scripts/fetch-kernel-sources.sh
-make test-cuda-nvfp4
-./scripts/test-coherent-uring.sh
-./scripts/test-qsa-rust-smoke.sh
-```
-
-The defaults reserve 8 GiB for KV cache, 12 GiB for the runtime, 8 GiB as a hard
-safety margin, and 2 GiB for sparse PLE rows. They are intentionally conservative
-and will be replaced by measurements from the target machine.
-
-## Build and run GLM-5.3 Q2 on Spark
-
-The GLM mainline now uses an isolated pristine ds4 checkout. Fetch the immutable
-MIT source through `ghfast.top` and build its SM121 server and benchmark:
-
-```bash
-./scripts/build-glm53-q2.sh
-```
-
-The locked model is one 89.88-GiB file. Download through the HF mirror at the
-immutable revision and verify it before loading:
-
-```bash
-mkdir -p /home/chaoyi/models/antirez/glm-5.3-flash-gguf
-curl -fL -C - \
-  -o /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf \
-  'https://hf-mirror.com/antirez/glm-5.3-flash-gguf/resolve/d0d6394cad1046c6d8ad87fa9b0939b4760cb94f/GLM-5.3-Flash-Q2.gguf?download=true'
-echo 'e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32  /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf' | sha256sum -c -
-```
-
-Resident Q2 is close to the 128-GB unified-memory limit. The validated 2K launch
-requires about 110 GiB `MemAvailable` before startup; its preflight refuses a
-lower value unless explicitly bypassed. On the measured Spark, pausing RAGFlow
-and Elasticsearch while retaining Redis, MySQL, and MinIO left enough memory.
-
-Start the service on `127.0.0.1:8010` and run its API smoke:
-
-```bash
-GLM53_Q2_VERIFY_SHA=1 ./scripts/run-glm53-q2.sh \
-  /home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf
-./scripts/smoke-glm53-q2-api.sh
-```
-
-The 2026-08-29 pristine run passed `/v1/models`, non-streaming Chat
-Completions, the Responses API, and Chat SSE. The exact ds4
-`promessi_sposi.txt` 2K/128 benchmark measured **523.02 prefill and 14.52
-generation tok/s**, versus the repository's **825.76/18.05** GB10 row. Run the
-same workload with `scripts/bench-glm53-q2.sh MODEL`.
-
-See [docs/glm53-q2.md](docs/glm53-q2.md) for deployment, memory, API, and
-benchmark details. IQ3 is explicitly deferred and cannot block Q2 serving.
-
-See [docs/architecture.md](docs/architecture.md) for the runtime design and gates.
-See [docs/acceptance.md](docs/acceptance.md) for the exact definition of done for
-both standalone models.
-The manifest command defaults to `https://hf-mirror.com` and downloads metadata
-only. See [docs/prior-art.md](docs/prior-art.md) for the measured one-Spark oracle.
-See [docs/kernel-sourcing.md](docs/kernel-sourcing.md) for the reuse boundary.
-See [docs/kernel-provenance.md](docs/kernel-provenance.md) for exact source pins,
-tensor contracts, and accuracy gates.
-
-## Current implementation status
-
-The dense-NVFP4 ABI now links one framework-free FlashInfer/CUTLASS SM121 tactic
-for BF16 output. SparkServe instantiates the donor's `128x128x256` arithmetic
-kernel directly and supplies only its raw-pointer adapter, validation, workspace,
-stream, and error translation. The GPU smoke test compiles and executes without
-Torch, TVM-FFI, Python, or SGLang. Its source and transitive CUTLASS commits,
-licenses, and critical hashes are locked in `third_party/flashinfer-nvfp4`.
-
-The ABI models the observed SGLang/ModelOpt contract: packed E2M1 weights and
-activations, FP8-E4M3 group-16 scales in CUTLASS 128x4 physical layout, separate
-packed-weight/scale padding, a GPU-addressable FP32 global alpha, and BF16 output.
-Activation scale allocation now includes the mandatory 128-row physical tile:
-for `M=1,K=4096` it is 32 KiB, not the 256-byte logical element count. The first
-real checkpoint fixture (`layer 0 / expert 0 / gate_proj`,
-`M=1,N=640,K=2560`) now matches the raw FlashInfer oracle bit-for-bit across all
-640 BF16 outputs.
-
-The routed-MoE arithmetic boundary now links FlashInfer's grouped SM120/121
-NVFP4 GEMMs, fused quantizers, route dispatch, and weighted finalize through raw
-C ABIs. Rust builds per-expert row ranges with separate four-row GEMM padding
-and 128-row scale padding, so fixed 512-expert graphs retain stable addresses
-even when most experts are empty. The real-weight routed subgraph is byte-exact.
-The preceding boundary now uses cuBLAS for the BF16 `[2560,512]` router and
-SGLang's workspace-free 512-expert normalized top-10 warp kernel. Its real
-layer-0 eight-token fixture has zero logit/id/weight error at 16.86 microseconds.
-Rust owns the persistent cuBLAS handle, stream/event, and one coherent allocation
-for logits, outputs, and the route map; it reads completed ids through the CPU
-alias and transactionally reserves fixed expert slots without a copy. The shared
-expert now also runs framework-free: cuBLAS projections plus SGLang-derived
-vector SiLU match every real layer-0 BF16 byte at 30.69 microseconds for eight
-tokens. Gate/up is loaded once into the oracle's merged resident layout. The
-deployed SGLang fused FP32 gate/sigmoid/multiply/add epilogue is borrowed as raw
-CUDA. One real token now traverses the exact router, ten experts stored in
-physical cache-slot order, both NVFP4 grouped GEMMs, the ungated BF16 shared
-expert, and final join with zero mismatches at every boundary. The sequential
-hot-cache chain averages 306.668 microseconds on GB10. Rust owns the overlap
-state machine: shared compute may run during expert reads, slot publication is
-transactional, and join cannot begin until both branch events complete.
-
-The adjacent mHC boundary is native as well. SparkServe borrows SGLang's grouped
-Gemma RMSNorm and fused combine reductions, uses cuBLAS for the two low-rank
-projections, and preserves the deterministic BF16 mix rounding points. Real
-layer-0 deterministic mix/combine is byte-exact; output remains within 0.015625
-BF16 of SGLang's faster atomic persistent mix. One-token mix and combine take
-41.217 and 8.213 microseconds respectively on GB10. The same native executable
-now composes mHC mix -> router/top-10 -> routed and shared experts -> fused join
--> mHC combine for one real layer-0 token. Every captured intermediate is
-byte-exact to SGLang, and the complete hot-cache MLP half-layer takes 418.123
-microseconds. This measures arithmetic with resident experts; NVMe miss service
-and Rust scheduling are intentionally measured separately.
-
-The first actual attention kernel is now present in `csrc/cuda/gdn_decode.cu`:
-a raw CUDA, single-token Qwen GDN recurrence for the checkpoint's real
-`H=16`, `HV=48`, `K=V=128` topology and BF16 K-last state pool. It has no Torch,
-Triton, CuTe DSL, or SGLang runtime dependency. Its C ABI validates on CPU, and
-the `sm_121a` GPU test compares updated state and output against an independent
-reference implementation. This is a correctness kernel; profiling and fusion
-with QKV extraction come after real-tensor parity with SGLang.
-
-QSA sparse decode now borrows its proven arithmetic rather than reimplementing
-attention. SGLang-derived fused index prep, TileLang-generated score MQA, radix
-top-k, block-to-token expansion, and selected-K/V pack feed FlashInfer's pinned
-BF16 XQA kernel through raw C ABIs. The exact score MMA and its 676-KiB MIT
-template-header subset are linked ahead of time; Torch, Python, TVM-FFI,
-TileLang JIT, and SGLang are absent at runtime. On GB10 the score fixture matches
-all 329 valid FP32 values bit-for-bit at 4.11 microseconds, expansion takes 4.10
-microseconds, and XQA takes 7.55 microseconds.
-
-Rust owns the six-stage order, fixed 64-token page tables, graph-bucket
-addresses, valid lengths, and 128-MiB workspace split. One max-batch coherent
-allocation backs every graph bucket. Its allocation-free lease machine rejects
-skipped, stale, and foreign completions, blocks reuse while a donor owns the
-mapping, and forces a semaphore reset after a failed XQA launch. A reusable
-CUDA fence publishes a stage only after its timing-disabled event completes;
-the native `mmap`/CUDA-registration owner keeps the stable mapping and scheduler
-alive together.
-
-The joined GB10 smoke now traverses index prep, score, top-k, expansion, K/V
-pack, and XQA from CUDA-registered coherent memory with no CPU-to-GPU copy.
-Q/state/RoPE, valid scores, selected block/token sets, packed K/V for the
-execution's selected order, and valid length all match their oracles exactly.
-Radix selection intentionally does not promise stable ordering; the resulting
-permutation changes BF16 reduction order but the final attention output remains
-within 0.015625 max absolute error. This validates the complete borrowed QSA
-arithmetic chain and Rust scheduling boundary; it does not yet claim a complete
-Qwen layer, whole-model token, or standalone server continuation.
-Rust now enforces that boundary with an allocation-free six-stage token
-scheduler: index-prep, score, block-top-k, selection-expand, K/V-pack, then XQA.
-No caller can jump from top-k directly to pack. One reusable CUDA fence
-owns each pending stage lease and publishes it only after event completion.
-Scratch-only failures retry from the last completed stage; partial persistent
-index/decode updates quarantine the token until its state checkpoint is restored.
-The scheduler and fixed pack/XQA arena are held by one coherent-memory owner, so
-the CUDA-registered mapping cannot outlive or be freed independently of policy.
-
-The Flash-Next storage path now has a cross-language `SSPLEIDX` contract, a
-zero-copy safetensors indexer, bounded Python and Rust caches, cross-page row
-assembly, batch-page admission limits, corruption checks, and a parallel Rust
-reader. On the target Spark, the Rust reference reached 3,525 storage-only
-prefill tokens/s and about 0.52 ms per all-miss decode lookup. See
-[docs/ple-nvme.md](docs/ple-nvme.md) for the format, measurements, and the pinned
-slab/`io_uring` kernel boundary.
-
-The standalone Rust checkpoint bootstrap now validates the exact Qwen4 topology,
-ModelOpt NVFP4 group contract, shard paths, safetensors bounds, and PLE FP8
-shapes without reading weight payloads. Against the real model it classified
-296,475 tensors into 72.498 GiB resident base weights, 47.684 GiB NVMe PLE,
-4.856 GiB deferred MTP, and 0.836 GiB ignored vision weights. Its only parsing
-dependency is `serde_json`; SGLang, Python, Torch, Triton, and TileLang remain
-oracle-only dependencies. The current stripped AArch64 musl release binary is
-580 KiB before CUDA kernels are linked.
-
-## Run the Flash-Next oracle on one Spark
-
-After the model download is complete, build the small SM121 compatibility layer
-over the pinned day-zero image and launch a conservative text-model-only smoke
-server on port 8890:
-
-```bash
-make docker-flash-next-sm121
-scripts/run-flash-next-smoke.sh
-docker logs -f qwen38-flash-next-smoke
-scripts/smoke-flash-next-api.sh
-```
-
-The smoke profile omits the visual tower, drops each checkpoint shard from the OS
-page cache after loading, and starts without speculative decoding. It disables
-CUDA graphs because the first NVMe adapter performs a live PLE lookup on every
-forward pass, and caps context at 32K. The NVMe profile defaults the
-static-memory fraction to 0.82: the non-PLE weights consume about 80 GiB, while
-the remaining headroom protects this shared unified-memory machine. Override it
-with `SPARKSERVE_MEM_FRACTION_STATIC`. This isolates base-model correctness
-before enabling the checkpoint's BF16 NEXTN/MTP tensors.
-The currently running Qwen3.8 27B service must be stopped first because both
-servers cannot safely reserve Spark unified memory at the same time.
-
-This container is a disposable correctness oracle. SGLang, PyTorch, Triton, and
-TileLang are not production dependencies of the standalone engine. Golden
-tokens and intermediate tensors from this path gate the native Rust + CUDA
+The repository is named **Spark.C**, not `ds4.c`, because ds4 is an independent
+upstream project and the GLM engine deliberately reuses its pinned C/CUDA
 implementation.
 
-## Why Rust plus CUDA, not a large Python stack or one C file?
+```text
+spark.c/
+├── common/                         # only shared HTTP + Qwen tokenizer code
+├── models/
+│   ├── qwen3.8-27b/                # native Rust/CUDA NVFP4 engine
+│   ├── qwen3.8-flash-next/         # native Rust/CUDA sparse engine
+│   └── glm-5.3-flash-q2/           # pinned ds4 C/CUDA GGUF engine
+├── vendor/                         # locked kernel/source provenance
+├── docs/                           # architecture and measured baselines
+└── handoff/                        # review material and pinned reference repos
+```
 
-- Rust owns HTTP/SSE, tokenization, request admission, manifests, async NVMe,
-  cache accounting, and the scheduler with memory safety and no garbage collector.
-- C++/CUDA owns only hot tensor operations and exposes opaque pointers plus CUDA
-  streams through a stable C ABI. Torch and Triton are not runtime dependencies.
-- Python/`uv` owns checkpoint inspection, conversion, benchmarks, and golden tests.
-- The GGUF path borrows the small, explicit spirit of `ds4.c`, but maps GGUF into
-  the same model IR and kernel ABI instead of growing a second server.
+There is intentionally no root `src/`, `csrc/`, model registry, tensor
+abstraction, Python serving stack, or general scheduler. The two Qwen engines
+are separate Rust/CUDA programs. GLM ships the complete model-specific ds4
+program rather than recreating its graph in Rust.
 
-Pure C remains valuable as a baseline and for tiny GGUF executors. Flash-Next has
-enough stateful and failure-sensitive machinery that Rust gives us a smaller
-operational system than hand-building networking, JSON, concurrency, and I/O
-safety around a monolithic C inference loop.
+## Models
 
-## After the resident GLM Q2 profile: paged IQ3
+| Directory | Checkpoint | Shipping implementation | Current gate |
+| --- | --- | --- | --- |
+| `qwen3.8-27b` | ModelOpt NVFP4 safetensors | native Rust/CUDA; FlashInfer/CUTLASS/cuBLAS donors | functional native MVP; optimize prefill/decode |
+| `qwen3.8-flash-next` | ModelOpt NVFP4 safetensors + FP8 PLE | native Rust/CUDA; model-local GDN/QSA/MoE/PLE graph | first-token/greedy continuation |
+| `glm-5.3-flash-q2` | ds4 Q2 GGUF | pinned ds4 C/CUDA server | accepted OpenAI service and benchmark |
 
-The first complete GLM target is the pinned ds4 Q2 GGUF above. Unsloth's
-`UD-IQ3_XXS` GGUF remains the second, explicitly paged profile. Its advertised
-120 GB file is about 111.8 GiB, leaving less than 10 GiB on the 121.7-GiB Spark
-after the weights alone. That is not enough for the OS, runtime,
-recurrent/attention state, workspaces, and KV cache, so whole-model residency is
-explicitly unsupported.
+SGLang and vLLM recipes are explicit Qwen oracles, never serving dependencies.
+GLM IQ3 paging is later work and is not part of these three shipping engines.
 
-The loader will keep the dense trunk, routers, KDA/DSA state, mHC parameters,
-and a measured hot-expert set resident. Remaining IQ3 expert blocks stay on NVMe
-and enter a fixed-size encoded-block cache after routing. The first acceptance
-gate is correctness plus deterministic memory use; performance is gated on
-measured cache hit rate and NVMe bytes/token. We will not claim that 18B active
-parameters make an out-of-core 321B model fast without those measurements.
+## Commands
 
-The current llama.cpp GLM5Next implementation is a draft semantic oracle, not a
-runtime dependency. We will freeze an exact revision only after its CUDA and
-quantized paths have reproducible fixtures on Spark.
+Run all compilation and model tests on the Spark host:
+
+```bash
+make list
+make qwen27-build
+make flash-build
+make flash-index-ple
+make glm-build
+
+make qwen27-serve     # native port 30000 by default
+make flash-serve      # native port 8020
+make glm-serve        # port 8010
+```
+
+Every root target is only a short redirect to the selected model Makefile.
+Direct model commands such as `make -C models/qwen3.8-27b smoke` are equivalent.
+Downloads use `https://hf-mirror.com`; GitHub source fetches use
+`https://ghfast.top/`; oracle images prefer `https://docker.1ms.run/`.
+
+See [models/README.md](models/README.md) for model status,
+[docs/architecture.md](docs/architecture.md) for the design boundary, and
+[models/SPARK_ACCEPTANCE.md](models/SPARK_ACCEPTANCE.md) for Spark validation.

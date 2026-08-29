@@ -1,0 +1,212 @@
+schema_version = 1
+
+[[source]]
+id = "flashinfer-mm-fp4"
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "external-oracle"
+status = "linked-framework-free-sm121-smoke-passed"
+entrypoint = "include/flashinfer/gemm/fp4_gemm_template_sm120.h"
+notes = "One upstream 128x128x256 tactic is explicitly instantiated behind Spark.C's raw C ABI. No Python, Torch, TVM-FFI, or SGLang runtime dependency."
+
+[[source]]
+id = "flashinfer-group-gemm-nvfp4"
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "external-oracle"
+status = "linked-framework-free-sm121-real-tensor-parity-passed"
+entrypoint = "include/flashinfer/gemm/group_gemm_nvfp4_groupwise_sm120.cuh"
+notes = "One upstream 128x128x256 non-swapped grouped tactic is instantiated behind a raw C ABI. Rust owns expert row layout and scheduling; two real Qwen experts match the FlashInfer oracle bit-for-bit."
+
+[[source]]
+id = "flashinfer-gdn-decode-oracle"
+
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "aot-kernel-donor"
+status = "linked-aot-sm121-real-state-bit-parity-passed"
+entrypoint = "flashinfer/gdn_kernels/gdn_decode_bf16_state.py"
+notes = "The pinned CuTe BF16-state T=1,H=16,HV=48,K=V=128 specialization is exported offline as a 101 KiB SM121 object and called through its TVM-FFI C ABI. Both the real 1.5 MiB recurrent state and 6,144-element output are byte-exact; the kernel averages 6.197 us. No Python, Torch, SGLang dispatcher, or JIT is present at serving time."
+
+[[source]]
+id = "sglang-qwen-gdn-block"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-real-attention-half-layer-bit-parity-passed"
+entrypoint = "python/sglang/kernels/ops/mamba/causal_conv1d_triton.py"
+notes = "cuBLAS owns four BF16 projections and the output projection. The raw CUDA adaptation preserves SGLang Triton's BF16 product rounding in width-four causal convolution and its FLA gated RMSNorm semantics. The complete mHC-wrapped real layer-0 GDN attention half-layer is byte-exact at every intermediate/state boundary and averages 693.755 us. Rust owns the five-stage order and paired-state checkpoint/restore policy."
+
+[[source]]
+id = "flashinfer-xqa-qsa-decode"
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "external-source-specialization"
+status = "linked-framework-free-sm121-bit-parity-passed"
+entrypoint = "csrc/xqa/mha.cu"
+notes = "BF16 Qwen QSA decode specialization: H=256, 24 query heads, two K/V heads, 64-token pages, batch-one output bit-exact at 7.55 us. FlashInfer auto resolves to XQA on SM121; forced trtllm-gen rejects the architecture. Rust owns fixed scratch, page tables, lengths, and scheduling."
+
+[[source]]
+id = "flashinfer-cute-silu-nvfp4"
+repository = "https://github.com/flashinfer-ai/flashinfer"
+revision = "906181e3f4cf4bcc81835fb480db4011bbd80b62"
+license = "Apache-2.0"
+mode = "aot-kernel-donor"
+status = "linked-aot-sm121-synthetic-bit-parity-passed"
+entrypoint = "flashinfer/quantization/kernels/nvfp4_quantize.py"
+notes = "Pinned CuTe-DSL 4.6.2 exports the BF16 K=640, 128x4, PDL-off, fused SiLU/multiply/NVFP4 kernel at build time. The server calls the 76 KiB object through TVM-FFI 0.1.11 and the 34 KiB CUDA-dialect support archive; no Python, Torch, SGLang, or JIT compiler is present at serving time."
+
+[[source]]
+id = "sglang-qwen38-27b-oracle"
+repository = "https://github.com/sgl-project/sglang"
+revision = "c4271c3fe1262fc2adbd162c33b25de5255251c5"
+license = "Apache-2.0"
+mode = "semantic-oracle"
+status = "running-remote"
+entrypoint = "sglang.srt.layers.quantization.modelopt_quant.ModelOptFp4LinearMethod"
+notes = "Defines padding, block-scale interleave, alpha, and activation quantization behavior."
+
+[[source]]
+id = "sglang-qwen4-exp-oracle"
+repository = "https://github.com/sgl-project/sglang"
+revision = "73a255206f916366c8d26d4022f82ddfb0ab558d"
+license = "Apache-2.0"
+mode = "semantic-oracle"
+status = "reference-image-pending"
+entrypoint = "python/sglang/srt/models/qwen4_exp.py"
+notes = "Initial Qwen3.8 Flash-Next implementation from PR 36497."
+
+[[source]]
+id = "sglang-io-uring-storage"
+repository = "https://github.com/sgl-project/sglang"
+revision = "e14d1c3cb62855e774475a55dac80baff45afbd4"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "adapted-pure-rust-fixed-buffer"
+entrypoint = "rust/sglang-storage/src/io_uring_reader.rs"
+notes = "Persistent bounded io_uring structure adapted without PyO3. Spark.C registers one caller-owned coherent slab and reads directly into disjoint CUDA-visible offsets instead of returning copied page vectors."
+
+[[source]]
+id = "sglang-qwen4-ple-gather"
+repository = "https://github.com/sgl-project/sglang"
+revision = "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+license = "Apache-2.0"
+mode = "semantic-oracle"
+status = "linked-raw-cuda-sm121-real-row-bit-parity-passed"
+entrypoint = "python/sglang/srt/models/qwen4_exp.py"
+notes = "Pinned-host Triton gather defines FP8-E4M3 load, BF16 conversion, and separate BF16 weight-scale multiplication. Spark.C consumes Rust-owned fragmented fixed-slab rows behind a raw CUDA ABI."
+
+[[source]]
+id = "sglang-qsa-radix-topk"
+repository = "https://github.com/sgl-project/sglang"
+revision = "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-selected-set-parity-passed"
+entrypoint = "python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh"
+notes = "Qwen QSA block-top-k 512 radix selection adapted verbatim at the arithmetic level. TVM-FFI, sgl-kernel wrappers, PDL dispatch, allocation, and framework ownership are removed; Rust owns score ranges and fixed output buffers."
+
+[[source]]
+id = "sglang-qwen-moe-topk"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-real-router-bit-parity-passed"
+entrypoint = "python/sglang/kernels/jit/csrc/moe/moe_topk_softmax.cuh"
+notes = "Workspace-free BF16 512-expert softmax/top-k-10 arithmetic follows the pinned SGLang warp kernel; cuBLAS supplies the preceding BF16 router projection. The real layer-0 eight-token fixture has zero BF16 logit, top-10 id, and FP32 weight mismatches at 16.86 us. Rust owns the persistent cuBLAS handle, coherent logits/outputs/route map, stream, event, and transactional expert scheduling."
+
+[[source]]
+id = "sglang-qwen-shared-expert"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-real-shared-expert-bit-parity-passed"
+entrypoint = "python/sglang/kernels/jit/csrc/elementwise/activation.cuh"
+notes = "cuBLAS owns the BF16 merged gate/up and down projections; adapted SGLang vector SiLU and sigmoid broadcast preserve precise Blackwell expf and BF16 rounding. Every real layer-0 intermediate/output byte matches at 30.69 us for eight tokens."
+
+[[source]]
+id = "sglang-qwen-moe-join"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-real-joined-moe-bit-parity-passed"
+entrypoint = "python/sglang/kernels/ops/elementwise/elementwise.py"
+notes = "Raw CUDA preserves SGLang's deployed 4096-wide FP32 gate reduction, sigmoid, shared multiply, routed add, and BF16 store. The full real one-token router -> ten fixed-slot NVFP4 experts plus ungated BF16 shared expert -> join chain is byte-exact at every boundary and averages 306.668 us sequential hot-cache on GB10."
+
+[[source]]
+id = "sglang-qwen-mhc"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-real-mhc-reference-bit-parity-passed"
+entrypoint = "python/sglang/kernels/jit/csrc/elementwise/hc_combine.cuh"
+notes = "SGLang grouped Gemma RMSNorm and combine reductions are adapted behind the raw ABI; cuBLAS supplies the HC=4,H=2560,R=320 low-rank projections. Deterministic mix and combine are byte-exact to the real layer-0 reference, while the deployed atomic persistent mix differs by at most 0.015625 BF16. One-token mix is 41.217 us and combine 8.213 us on GB10."
+
+[[source]]
+id = "sglang-qsa-block-expand"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-edge-fixture-parity-passed"
+entrypoint = "python/sglang/srt/layers/attention/qsa/kernel.py"
+notes = "Fixed Qwen compressed-block to logical-token expansion with ratio-four incomplete-tail insertion and contiguous valid-prefix output. Torch/Triton allocation and dispatch are removed; Rust owns coherent buffers and the selection-stage lease."
+
+[[source]]
+id = "sglang-tilelang-qsa-score"
+repository = "https://github.com/sgl-project/sglang"
+revision = "d91c3682b0b429e4c70df63cd57f819588ce29b0"
+license = "Apache-2.0 AND MIT"
+mode = "generated-source-vendor"
+status = "linked-aot-sm121-fixture-and-chain-parity-passed"
+entrypoint = "python/sglang/srt/layers/attention/qsa/mqa.py"
+notes = "Qwen QSA paged decode score generated by TileLang 0.1.11 at cd37ed5fc35ae7a60a1277c8eb49028174ac51e6. The exact generated MMA CUDA and 676 KiB MIT template header subset replace Torch, TVM-FFI, Python, and JIT. Its GB10 fixture has 0/329 score mismatches at 4.11 us, and Rust owns coherent inputs, logits, stream ordering, and the score-stage lease in the joined six-stage chain."
+
+[[source]]
+id = "sglang-qsa-index-prep"
+repository = "https://github.com/sgl-project/sglang"
+revision = "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-bit-parity-passed"
+entrypoint = "python/sglang/kernels/jit/csrc/attention/qsa_indexer.cuh"
+notes = "Locked BF16 H=128 Qwen specialization of SGLang's fused Q/K Gemma RMSNorm, NeoX RoPE, raw-key state store, four-token FP32 mean, and compressed-key store. It also zero-pads four extra query heads in the same launch for the score MMA contract. All output/state bits match the original JIT fixture; Rust owns locations and persistent pools."
+
+[[source]]
+id = "sglang-qsa-kv-pack"
+repository = "https://github.com/sgl-project/sglang"
+revision = "7c66045d71f067c1c5da2b85baad3c47d9a19cb7"
+license = "Apache-2.0"
+mode = "source-adaptation"
+status = "linked-raw-cuda-sm121-bit-parity-passed"
+entrypoint = "python/sglang/srt/layers/attention/qsa/sparse_attn.py"
+notes = "Locked BF16 Qwen selected-K/V pack: valid-count plus two-head, H=256 compaction into 33 fixed 64-token pages. Every output bit matches the SGLang fixture and four rows take 46.33 us on GB10. Triton and framework allocation are removed; Rust owns page tables, scratch addresses, graph buckets, and attention workspace."
+
+[[source]]
+id = "ds4-glm53-source-engine"
+repository = "https://github.com/antirez/ds4"
+revision = "a60a2a0d25137a849a101e04e86ea830a346073a"
+license = "MIT"
+mode = "pinned-model-engine"
+status = "source-hashed-sm121-service-and-benchmark-passed"
+entrypoint = "vendor/ds4-glm53/VENDOR.md"
+notes = "The complete GLM-5.3 Q2 tokenizer, graph, CUDA/MMQ kernels, OpenAI server, and session runtime ship together as the pinned ds4 executable. No duplicate Rust GLM graph or adapter is maintained here."
+
+[[source]]
+id = "cutlass-sm121-nvfp4"
+repository = "https://github.com/NVIDIA/cutlass"
+revision = "b46b16d003484063bca4ed365e44095c4c6ed633"
+license = "BSD-3-Clause"
+mode = "transitive-build-source"
+status = "pinned-via-flashinfer-submodule"
+entrypoint = "include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp"
+notes = "Exact FlashInfer submodule pin used by the linked dense and grouped NVFP4 tactics."

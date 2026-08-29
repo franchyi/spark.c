@@ -1,4 +1,4 @@
-# SparkServe handoff
+# Spark.C handoff
 
 Baseline commit: `9cef87c` (`Add model-specific Spark serving capsules`).
 
@@ -35,7 +35,7 @@ a general inference framework.
 
 | Engine | Runnable baseline | Lightweight path now |
 | --- | --- | --- |
-| Qwen3.8-27B | pinned MiaAI/SGLang recipe | baseline capsule only; native extraction is next |
+| Qwen3.8-27B | pinned MiaAI/SGLang recipe | functional native Rust/CUDA MVP; batched prefill and speed are next |
 | Qwen3.8 Flash-Next | pinned Blazux/vLLM plus SGLang oracle | GDN, QSA/XQA, mHC, NVFP4 MoE, PLE cache, Rust state/API are extracted; complete continuation/performance acceptance remains |
 | GLM-5.3 Q2 | pinned ds4 | ds4 already is the lightweight C/CUDA service; add a Rust admission wrapper only if measurement justifies it |
 
@@ -48,7 +48,7 @@ Recreate or verify them with:
 ```
 
 Exact URLs, revisions, licenses, and roles are in `sources.lock.toml`. Deployment
-commands and acceptance order are in `engines/SPARK_ACCEPTANCE.md`.
+commands and acceptance order are in `models/SPARK_ACCEPTANCE.md`.
 
 ## Next gates
 
@@ -57,5 +57,5 @@ commands and acceptance order are in `engines/SPARK_ACCEPTANCE.md`.
    Blazux/vLLM prefill and decode baseline.
 3. Keep the accepted GLM Q2 service unchanged while designing a thin long-lived
    ds4 context ABI for Rust scheduling.
-4. Move native source physically into its engine directory only after that path
-   passes Spark acceptance.
+4. Preserve the model-first `models/<exact-model>/` hierarchy while optimizing;
+   do not recreate root `src/`, `csrc/`, or framework-style registries.

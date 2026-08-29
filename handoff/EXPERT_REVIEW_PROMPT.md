@@ -1,15 +1,14 @@
 # Expert architecture review prompt
 
-You are reviewing SparkServe, a lightweight inference project for one NVIDIA
+You are reviewing Spark.C, a lightweight inference project for one NVIDIA
 DGX Spark: GB10/SM121, ARM64, 128 GB unified CPU/GPU memory, and local NVMe.
 
 Read these first:
 
 - `handoff/README.md` and `handoff/sources.lock.toml`
-- `docs/architecture.md`, `docs/acceptance.md`, and `docs/kernel-provenance.md`
-- `engines/CONTRACT.md` and all three `engines/*/{README,VENDOR}.md` files
-- Relevant implementation under `crates/sparkserve-runtime`, `csrc`, and
-  `scripts`
+- `docs/architecture.md`, `docs/kernels.md`, and `docs/benchmarks.md`
+- `models/CONTRACT.md` and all three `models/*/{README,VENDOR}.md` files
+- Relevant model-local implementation under `models/*/native` and `models/*/scripts`
 - The three pinned checkouts in `handoff/repos/`
 
 ## Objective
