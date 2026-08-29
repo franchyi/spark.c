@@ -7,6 +7,11 @@ cuda_image=${SPARKSERVE_CUDA_IMAGE:-sparkserve/sglang:qwen38flashnext-sm121}
 rust_image=${SPARKSERVE_RUST_IMAGE:-docker.1ms.run/rust:1.89.0}
 jobs=${JOBS:-4}
 target_host=${SPARKSERVE_RUST_TARGET:-${HOME}/.cache/sparkserve-rust-target}
+cuda_host_root=${SPARKSERVE_CUDA_HOST_ROOT:-$(readlink -f /usr/local/cuda)}
+if [[ ! -d "$cuda_host_root/lib64" ]]; then
+  echo "cannot locate the Spark CUDA toolkit at $cuda_host_root" >&2
+  exit 1
+fi
 expected_cuda_image_id=$(tr -d '[:space:]' < "$repo_root/third_party/qwen-native-build-image.id")
 actual_cuda_image_id=$(docker image inspect "$cuda_image" --format '{{.Id}}')
 if [[ "$actual_cuda_image_id" != "$expected_cuda_image_id" ]]; then
@@ -49,9 +54,10 @@ mkdir -p "$target_host"
 docker run --rm --network host \
   -v "$repo_root:/work" -w /work \
   -v "$target_host:/cargo-target" \
+  -v "$cuda_host_root:/usr/local/cuda:ro" \
   -e CARGO_HOME=/work/.cache/cargo-home \
   -e CARGO_TARGET_DIR=/cargo-target \
-  -e RUSTFLAGS='-L native=/work/build -l dylib=sparkserve-fabric -l dylib=sparkserve-qwen-runtime -l dylib=sparkserve-qsa' \
+  -e RUSTFLAGS='-L native=/work/build -l dylib=sparkserve-fabric -l dylib=sparkserve-qwen-runtime -l dylib=sparkserve-qsa -C link-arg=-Wl,-rpath-link,/work/build -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
   "$rust_image" \
   cargo build --release -p sparkserve-runtime --features native-fabric-smoke \
     --example qwen_first_token --example qwen_decode --example qwen_serve
