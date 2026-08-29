@@ -13,5 +13,9 @@ path = "src/main.rs"
 name = "q27-map-inspect"
 path = "src/map_main.rs"
 
+[[bin]]
+name = "q27-pack-scales"
+path = "src/scale_pack.rs"
+
 [dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

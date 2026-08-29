@@ -58,6 +58,21 @@ The two small BF16 A/B projections are likewise byte-exact against the real
 layer-0 SGLang result and take 40.169 microseconds together through one
 caller-owned cuBLAS handle.
 
+`q27-pack-scales` converts all 192 checkpoint E4M3 scale matrices into the
+CUTLASS 128x4 order once. Its revision-bound sidecar also stores each
+projection's `1/input_scale` and `input_scale*weight_scale_2`; decode maps those
+bytes directly and never repacks scales. The tool rejects a checkpoint if any
+gate/up activation-scale pair differs before enabling shared quantization.
+The locked checkpoint produces 192 entries / 1,069,555,264 bytes in 1.35
+seconds with 21.3 MiB peak RSS. Its SHA-256 is
+`7140e93b843b0f21005d6c1f988ddb0eb6163d8c5d939a2c7b2cb83369ccc568`;
+the layer-0 gate scale block is byte-identical to the FlashInfer oracle fixture.
+
+The pinned q27 NVFP4 path is byte-exact for packed activation, 128x4 scales,
+BF16 output, and CUDA graph replay. With gate/up sharing one quantization, the
+measured dense MLP cost is approximately 0.749 milliseconds per layer (20.9
+token/s MLP-only across 64 layers).
+
 ## Lightweight dependency rule
 
 The serving process may depend on CUDA, cuBLAS/cuBLASLt, and the tiny TVM-FFI C

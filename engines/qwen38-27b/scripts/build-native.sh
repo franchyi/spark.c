@@ -20,7 +20,8 @@ docker run --rm --network host --user "$user_id:$group_id" \
   -e CARGO_HOME=/cargo-home \
   -e CARGO_TARGET_DIR=/cargo-target \
   "$rust_image" \
-  cargo build --release -p sparkserve-q27 --bin q27-inspect --bin q27-map-inspect
+  cargo build --release -p sparkserve-q27 --bin q27-inspect --bin q27-map-inspect --bin q27-pack-scales
 cp "$target_host/release/q27-inspect" "$repo_root/build/bin/q27-inspect"
 cp "$target_host/release/q27-map-inspect" "$repo_root/build/bin/q27-map-inspect"
+cp "$target_host/release/q27-pack-scales" "$repo_root/build/bin/q27-pack-scales"
 echo "q27 checkpoint inspectors ready in $repo_root/build/bin"
