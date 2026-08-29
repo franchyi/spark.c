@@ -14,6 +14,9 @@ extern "C" {
 enum {
   Q27_PREFILL_ATTENTION_TILE_TOKENS = 128,
   Q27_PREFILL_ATTENTION_M512_TOKENS = 512,
+  Q27_PREFILL_ATTENTION_M2048_TOKENS = 2048,
+  Q27_PREFILL_ATTENTION_M4096_TOKENS = 4096,
+  Q27_PREFILL_ATTENTION_M8192_TOKENS = 8192,
   Q27_PREFILL_ATTENTION_MAX_CAPACITY = 262144,
 };
 
@@ -38,6 +41,42 @@ enum {
 #define Q27_PREFILL_ATTENTION_M512_METADATA_BYTES 768ULL
 #define Q27_PREFILL_ATTENTION_M512_WORKSPACE_BYTES(capacity) \
   (((Q27_PREFILL_ATTENTION_M512_METADATA_BYTES + \
+     (uint64_t)(capacity) * sizeof(int32_t)) + 255ULL) & ~255ULL)
+
+/* M=2048 lane. 192 plan tiles require 2,352 bytes of metadata. */
+#define Q27_PREFILL_ATTENTION_M2048_Q_GATE_BYTES \
+  (2048ULL * 24ULL * 2ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M2048_KV_INPUT_BYTES \
+  (2048ULL * 4ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M2048_QUERY_BYTES \
+  (2048ULL * 24ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M2048_METADATA_BYTES 2560ULL
+#define Q27_PREFILL_ATTENTION_M2048_WORKSPACE_BYTES(capacity) \
+  (((Q27_PREFILL_ATTENTION_M2048_METADATA_BYTES + \
+     (uint64_t)(capacity) * sizeof(int32_t)) + 255ULL) & ~255ULL)
+
+/* M=4096 lane. 384 plan tiles require 4,656 bytes, rounded to 4,864. */
+#define Q27_PREFILL_ATTENTION_M4096_Q_GATE_BYTES \
+  (4096ULL * 24ULL * 2ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M4096_KV_INPUT_BYTES \
+  (4096ULL * 4ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M4096_QUERY_BYTES \
+  (4096ULL * 24ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M4096_METADATA_BYTES 4864ULL
+#define Q27_PREFILL_ATTENTION_M4096_WORKSPACE_BYTES(capacity) \
+  (((Q27_PREFILL_ATTENTION_M4096_METADATA_BYTES + \
+     (uint64_t)(capacity) * sizeof(int32_t)) + 255ULL) & ~255ULL)
+
+/* M=8192 lane. 768 plan tiles require 9,264 bytes, rounded to 9,472. */
+#define Q27_PREFILL_ATTENTION_M8192_Q_GATE_BYTES \
+  (8192ULL * 24ULL * 2ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M8192_KV_INPUT_BYTES \
+  (8192ULL * 4ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M8192_QUERY_BYTES \
+  (8192ULL * 24ULL * 256ULL * 2ULL)
+#define Q27_PREFILL_ATTENTION_M8192_METADATA_BYTES 9472ULL
+#define Q27_PREFILL_ATTENTION_M8192_WORKSPACE_BYTES(capacity) \
+  (((Q27_PREFILL_ATTENTION_M8192_METADATA_BYTES + \
      (uint64_t)(capacity) * sizeof(int32_t)) + 255ULL) & ~255ULL)
 
 typedef enum q27_prefill_attention_status_code {
@@ -113,6 +152,18 @@ q27_prefill_attention_status q27_prefill_attention(
  * pinned FlashInfer causal prefill call for the whole valid prefix.
  */
 q27_prefill_attention_status q27_prefill_attention_m512(
+    const q27_prefill_attention_args* args);
+
+/* Fixed [2048,...] prompt lane; one FlashInfer call for the valid prefix. */
+q27_prefill_attention_status q27_prefill_attention_m2048(
+    const q27_prefill_attention_args* args);
+
+/* Fixed [4096,...] prompt lane; one FlashInfer call for the valid prefix. */
+q27_prefill_attention_status q27_prefill_attention_m4096(
+    const q27_prefill_attention_args* args);
+
+/* Fixed [8192,...] prompt lane; one FlashInfer call for the valid prefix. */
+q27_prefill_attention_status q27_prefill_attention_m8192(
     const q27_prefill_attention_args* args);
 
 /* Device pointer into the fixed metadata prefix of a valid workspace. */

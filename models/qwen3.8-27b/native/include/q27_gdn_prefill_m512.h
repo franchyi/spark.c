@@ -15,6 +15,8 @@ enum {
   Q27_GDN_PREFILL_M512_TOKENS = 512,
   Q27_GDN_PREFILL_M512_CHUNK_TOKENS = 128,
   Q27_GDN_PREFILL_M512_CHUNKS = 4,
+  Q27_GDN_PREFILL_M2048_TOKENS = 2048,
+  Q27_GDN_PREFILL_M2048_CHUNKS = 16,
   Q27_GDN_PREFILL_M512_HIDDEN = 5120,
   Q27_GDN_PREFILL_M512_QKVZ = 16384,
   Q27_GDN_PREFILL_M512_QKV = 10240,
@@ -56,7 +58,17 @@ typedef struct q27_gdn_prefill_m512_layout {
  * one M512 FP8 output projection.  The final post-attention norm is M512.
  * Rows valid_tokens..511 are padding and cannot mutate state.  The QKVZ and
  * output weights are each read by exactly one projection, never once per
- * recurrent chunk.
+ * recurrent chunk. Setting Q27_GDN_FUSED_SPLIT_NORM=1 selects the byte-exact
+ * two-launch split/causal-convolution/QK-normalization capsule inside each
+ * ordered M128 recurrence chunk; the default retains the five-launch oracle
+ * path until the full-model Spark promotion canary passes.
+ * Setting Q27_GDN_C427_AOT=1 before the layout query instead selects the
+ * donor-exact grid-wide c427 preparation and BF16 recurrence.
+ * Q27_GDN_C427_AOT_DIR must name the pinned, oracle-gated v2 cubin directory.
+ * Fused split, causal convolution, QKV split, and Q/K normalization run across
+ * the valid full tile, followed by the five recurrence stages across the
+ * complete physical M512 or M2048 tile. Capsules are loaded once and retained
+ * for the serving process lifetime.
  *
  * All pointers are caller-owned CUDA-visible storage.  qkvz_plan must have
  * shape (M,N,K)=(512,16384,5120), and output_plan must have
@@ -104,6 +116,20 @@ q27_gdn_prefill_m512_status q27_gdn_prefill_m512_query(
     q27_gdn_prefill_m512_layout* output);
 q27_gdn_prefill_m512_status q27_gdn_prefill_m512_forward(
     const q27_gdn_prefill_m512_args* args);
+
+/*
+ * True physical-M2048 prompt lane. The argument/layout ABIs are intentionally
+ * shared with M512: every row-major tensor is sized by the selected entry
+ * point, while persistent GDN state remains shape-invariant. QKVZ and output
+ * weights are each read by one M2048 projection; only the stateful recurrence
+ * is serialized as sixteen M128 chunks.
+ */
+typedef q27_gdn_prefill_m512_layout q27_gdn_prefill_m2048_layout;
+typedef q27_gdn_prefill_m512_args q27_gdn_prefill_m2048_args;
+q27_gdn_prefill_m512_status q27_gdn_prefill_m2048_query(
+    q27_gdn_prefill_m2048_layout* output);
+q27_gdn_prefill_m512_status q27_gdn_prefill_m2048_forward(
+    const q27_gdn_prefill_m2048_args* args);
 
 #ifdef __cplusplus
 }  // extern "C"

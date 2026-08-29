@@ -191,3 +191,33 @@ extern "C" q27_prefill_core_status q27_prefill_norm_m512(
     const q27_prefill_norm_args* args) {
   return Norm(args, Q27_PREFILL_CORE_M512_TOKENS);
 }
+
+extern "C" q27_prefill_core_status q27_prefill_embedding_m2048(
+    const q27_prefill_embedding_args* args) {
+  return Embedding(args, Q27_PREFILL_CORE_M2048_TOKENS);
+}
+
+extern "C" q27_prefill_core_status q27_prefill_norm_m2048(
+    const q27_prefill_norm_args* args) {
+  return Norm(args, Q27_PREFILL_CORE_M2048_TOKENS);
+}
+
+extern "C" q27_prefill_core_status q27_prefill_embedding_m4096(
+    const q27_prefill_embedding_args* args) {
+  return Embedding(args, Q27_PREFILL_CORE_M4096_TOKENS);
+}
+
+extern "C" q27_prefill_core_status q27_prefill_norm_m4096(
+    const q27_prefill_norm_args* args) {
+  return Norm(args, Q27_PREFILL_CORE_M4096_TOKENS);
+}
+
+extern "C" q27_prefill_core_status q27_prefill_embedding_m8192(
+    const q27_prefill_embedding_args* args) {
+  return Embedding(args, Q27_PREFILL_CORE_M8192_TOKENS);
+}
+
+extern "C" q27_prefill_core_status q27_prefill_norm_m8192(
+    const q27_prefill_norm_args* args) {
+  return Norm(args, Q27_PREFILL_CORE_M8192_TOKENS);
+}

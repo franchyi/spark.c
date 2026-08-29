@@ -1,4 +1,4 @@
-// Fixed-M128/M512, allocation-free Qwen3.8-27B target prefill composition.
+// Fixed-M128/M512/M2048/M4096/M8192 allocation-free Qwen target prefill.
 
 #include "q27_prefill_model.h"
 
@@ -80,22 +80,37 @@ uint64_t HiddenBytes(uint32_t tokens) {
 }
 
 uint64_t AttentionScratchBytes(uint32_t tokens) {
-  return tokens == Q27_PREFILL_MODEL_TOKENS
-             ? Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES
-             : Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES;
+  if (tokens == Q27_PREFILL_MODEL_TOKENS)
+    return Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES;
+  if (tokens == Q27_PREFILL_MODEL_M512_TOKENS)
+    return Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES;
+  if (tokens == Q27_PREFILL_MODEL_M2048_TOKENS)
+    return Q27_PREFILL_ATTENTION_LAYER_M2048_SCRATCH_BYTES;
+  if (tokens == Q27_PREFILL_MODEL_M4096_TOKENS)
+    return Q27_PREFILL_ATTENTION_LAYER_M4096_SCRATCH_BYTES;
+  return Q27_PREFILL_ATTENTION_LAYER_M8192_SCRATCH_BYTES;
 }
 
 uint64_t AttentionWorkspaceBytes(uint32_t tokens, uint32_t cache_capacity) {
-  return tokens == Q27_PREFILL_MODEL_TOKENS
-             ? Q27_PREFILL_ATTENTION_WORKSPACE_BYTES(cache_capacity)
-             : Q27_PREFILL_ATTENTION_M512_WORKSPACE_BYTES(cache_capacity);
+  if (tokens == Q27_PREFILL_MODEL_TOKENS)
+    return Q27_PREFILL_ATTENTION_WORKSPACE_BYTES(cache_capacity);
+  if (tokens == Q27_PREFILL_MODEL_M512_TOKENS)
+    return Q27_PREFILL_ATTENTION_M512_WORKSPACE_BYTES(cache_capacity);
+  if (tokens == Q27_PREFILL_MODEL_M2048_TOKENS)
+    return Q27_PREFILL_ATTENTION_M2048_WORKSPACE_BYTES(cache_capacity);
+  if (tokens == Q27_PREFILL_MODEL_M4096_TOKENS)
+    return Q27_PREFILL_ATTENTION_M4096_WORKSPACE_BYTES(cache_capacity);
+  return Q27_PREFILL_ATTENTION_M8192_WORKSPACE_BYTES(cache_capacity);
 }
 
 bool ConfigValid(const q27_prefill_model_config* config, uint32_t tokens) {
   return config != nullptr && config->struct_size >= sizeof(*config) &&
          config->abi_version == Q27_PREFILL_MODEL_ABI_VERSION &&
          (tokens == Q27_PREFILL_MODEL_TOKENS ||
-          tokens == Q27_PREFILL_MODEL_M512_TOKENS) &&
+          tokens == Q27_PREFILL_MODEL_M512_TOKENS ||
+          tokens == Q27_PREFILL_MODEL_M2048_TOKENS ||
+          tokens == Q27_PREFILL_MODEL_M4096_TOKENS ||
+          tokens == Q27_PREFILL_MODEL_M8192_TOKENS) &&
          config->cache_capacity >= tokens &&
          config->cache_capacity <= Q27_PREFILL_ATTENTION_MAX_CAPACITY &&
          config->fast_accum <= 1 &&
@@ -124,13 +139,25 @@ q27_prefill_model_status BuildLayout(const q27_prefill_model_config* config,
     gdn_scratch_bytes = gdn.scratch_bytes;
     gdn_recurrent_state_bytes = gdn.recurrent_state_bytes;
     gdn_convolution_state_bytes = gdn.convolution_state_bytes;
-  } else {
+  } else if (tokens == Q27_PREFILL_MODEL_M512_TOKENS) {
     q27_gdn_prefill_m512_layout gdn{sizeof(gdn),
                                     Q27_GDN_PREFILL_M512_ABI_VERSION};
     const q27_gdn_prefill_m512_status gs =
         q27_gdn_prefill_m512_query(&gdn);
     if (gs.code != Q27_GDN_PREFILL_M512_OK)
       return Error("query M512 GDN layer", gs.message);
+    gdn_scratch_bytes = gdn.scratch_bytes;
+    gdn_recurrent_state_bytes = gdn.recurrent_state_bytes;
+    gdn_convolution_state_bytes = gdn.convolution_state_bytes;
+  } else {
+    // M4096/M8192 preserve recurrent-state ordering with ordered physical
+    // M2048 GDN slices. Attention and MLP remain one larger physical call.
+    q27_gdn_prefill_m2048_layout gdn{sizeof(gdn),
+                                     Q27_GDN_PREFILL_M512_ABI_VERSION};
+    const q27_gdn_prefill_m512_status gs =
+        q27_gdn_prefill_m2048_query(&gdn);
+    if (gs.code != Q27_GDN_PREFILL_M512_OK)
+      return Error("query M2048 GDN layer", gs.message);
     gdn_scratch_bytes = gdn.scratch_bytes;
     gdn_recurrent_state_bytes = gdn.recurrent_state_bytes;
     gdn_convolution_state_bytes = gdn.convolution_state_bytes;
@@ -329,20 +356,34 @@ q27_prefill_model_status CreatePlan(const q27_prefill_model_config* config,
   plan->config = *config;
   plan->layout = layout;
   plan->tokens = tokens;
-  status = CreateFp8(tokens, 16384, 5120, *config, &plan->gdn_qkvz);
+  const uint32_t gdn_tokens =
+      tokens >= Q27_PREFILL_MODEL_M4096_TOKENS
+          ? Q27_PREFILL_MODEL_M2048_TOKENS
+          : tokens;
+  status = CreateFp8(gdn_tokens, 16384, 5120, *config, &plan->gdn_qkvz);
   if (status.code == Q27_PREFILL_MODEL_OK)
-    status = CreateFp8(tokens, 5120, 6144, *config, &plan->gdn_out);
+    status = CreateFp8(gdn_tokens, 5120, 6144, *config, &plan->gdn_out);
   if (status.code == Q27_PREFILL_MODEL_OK) {
     q27_prefill_attention_layer_plan_config ac{};
     ac.struct_size = sizeof(ac);
     ac.abi_version = Q27_PREFILL_ATTENTION_LAYER_ABI_VERSION;
     ac.fast_accum = config->fast_accum;
     ac.fp8_workspace_bytes = config->fp8_workspace_bytes;
-    const q27_prefill_attention_layer_status as =
-        tokens == Q27_PREFILL_MODEL_TOKENS
-            ? q27_prefill_attention_layer_plan_create(&ac, &plan->attention)
-            : q27_prefill_attention_layer_plan_create_m512(
-                  &ac, &plan->attention);
+    q27_prefill_attention_layer_status as{};
+    if (tokens == Q27_PREFILL_MODEL_TOKENS)
+      as = q27_prefill_attention_layer_plan_create(&ac, &plan->attention);
+    else if (tokens == Q27_PREFILL_MODEL_M512_TOKENS)
+      as = q27_prefill_attention_layer_plan_create_m512(
+          &ac, &plan->attention);
+    else if (tokens == Q27_PREFILL_MODEL_M2048_TOKENS)
+      as = q27_prefill_attention_layer_plan_create_m2048(
+          &ac, &plan->attention);
+    else if (tokens == Q27_PREFILL_MODEL_M4096_TOKENS)
+      as = q27_prefill_attention_layer_plan_create_m4096(
+          &ac, &plan->attention);
+    else
+      as = q27_prefill_attention_layer_plan_create_m8192(
+          &ac, &plan->attention);
     if (as.code != Q27_PREFILL_ATTENTION_LAYER_OK)
       status = Error("create attention layer plan", as.message);
   }
@@ -376,6 +417,21 @@ extern "C" q27_prefill_model_status q27_prefill_model_query_m512(
   return BuildLayout(config, output, Q27_PREFILL_MODEL_M512_TOKENS);
 }
 
+extern "C" q27_prefill_model_status q27_prefill_model_query_m2048(
+    const q27_prefill_model_config* config, q27_prefill_model_layout* output) {
+  return BuildLayout(config, output, Q27_PREFILL_MODEL_M2048_TOKENS);
+}
+
+extern "C" q27_prefill_model_status q27_prefill_model_query_m4096(
+    const q27_prefill_model_config* config, q27_prefill_model_layout* output) {
+  return BuildLayout(config, output, Q27_PREFILL_MODEL_M4096_TOKENS);
+}
+
+extern "C" q27_prefill_model_status q27_prefill_model_query_m8192(
+    const q27_prefill_model_config* config, q27_prefill_model_layout* output) {
+  return BuildLayout(config, output, Q27_PREFILL_MODEL_M8192_TOKENS);
+}
+
 extern "C" q27_prefill_model_status q27_prefill_model_plan_create(
     const q27_prefill_model_config* config, q27_prefill_model_plan** output) {
   return CreatePlan(config, output, Q27_PREFILL_MODEL_TOKENS);
@@ -384,6 +440,21 @@ extern "C" q27_prefill_model_status q27_prefill_model_plan_create(
 extern "C" q27_prefill_model_status q27_prefill_model_plan_create_m512(
     const q27_prefill_model_config* config, q27_prefill_model_plan** output) {
   return CreatePlan(config, output, Q27_PREFILL_MODEL_M512_TOKENS);
+}
+
+extern "C" q27_prefill_model_status q27_prefill_model_plan_create_m2048(
+    const q27_prefill_model_config* config, q27_prefill_model_plan** output) {
+  return CreatePlan(config, output, Q27_PREFILL_MODEL_M2048_TOKENS);
+}
+
+extern "C" q27_prefill_model_status q27_prefill_model_plan_create_m4096(
+    const q27_prefill_model_config* config, q27_prefill_model_plan** output) {
+  return CreatePlan(config, output, Q27_PREFILL_MODEL_M4096_TOKENS);
+}
+
+extern "C" q27_prefill_model_status q27_prefill_model_plan_create_m8192(
+    const q27_prefill_model_config* config, q27_prefill_model_plan** output) {
+  return CreatePlan(config, output, Q27_PREFILL_MODEL_M8192_TOKENS);
 }
 
 extern "C" void q27_prefill_model_plan_destroy(q27_prefill_model_plan* plan) {
@@ -410,10 +481,17 @@ q27_prefill_model_status Forward(q27_prefill_model_plan* plan,
   embedding.output_bf16 = arena.hidden;
   embedding.invalid_token_count_u32 = arena.invalid_count;
   embedding.cuda_stream = args->cuda_stream;
-  q27_prefill_core_status core =
-      tokens == Q27_PREFILL_MODEL_TOKENS
-          ? q27_prefill_embedding(&embedding)
-          : q27_prefill_embedding_m512(&embedding);
+  q27_prefill_core_status core{};
+  if (tokens == Q27_PREFILL_MODEL_TOKENS)
+    core = q27_prefill_embedding(&embedding);
+  else if (tokens == Q27_PREFILL_MODEL_M512_TOKENS)
+    core = q27_prefill_embedding_m512(&embedding);
+  else if (tokens == Q27_PREFILL_MODEL_M2048_TOKENS)
+    core = q27_prefill_embedding_m2048(&embedding);
+  else if (tokens == Q27_PREFILL_MODEL_M4096_TOKENS)
+    core = q27_prefill_embedding_m4096(&embedding);
+  else
+    core = q27_prefill_embedding_m8192(&embedding);
   if (core.code != Q27_PREFILL_CORE_OK)
     return Error("embedding", core.message);
 
@@ -512,10 +590,68 @@ q27_prefill_model_status Forward(q27_prefill_model_plan* plan,
         ga.output_plan = plan->gdn_out;
         ga.cublas_handle = plan->cublas;
         ga.cuda_stream = args->cuda_stream;
-        const q27_gdn_prefill_m512_status gs =
-            q27_gdn_prefill_m512_forward(&ga);
-        if (gs.code != Q27_GDN_PREFILL_M512_OK)
-          return Error("M512 GDN transformer layer", gs.message);
+        if (tokens <= Q27_PREFILL_MODEL_M2048_TOKENS) {
+          const q27_gdn_prefill_m512_status gs =
+              tokens == Q27_PREFILL_MODEL_M512_TOKENS
+                  ? q27_gdn_prefill_m512_forward(&ga)
+                  : q27_gdn_prefill_m2048_forward(&ga);
+          if (gs.code != Q27_GDN_PREFILL_M512_OK)
+            return Error("large-prefill GDN transformer layer", gs.message);
+        } else {
+          // Keep the stateful recurrence in strict token order while letting
+          // attention and both NVFP4 MLP projections consume one larger tile.
+          // The existing M2048 capsule owns one QKVZ/output projection pair;
+          // up to four ordered slices avoid inventing a second recurrence
+          // implementation and are byte-identical to the promoted M2048 path.
+          constexpr uint32_t kSliceTokens =
+              Q27_PREFILL_MODEL_M2048_TOKENS;
+          constexpr uint64_t kSliceBytes =
+              static_cast<uint64_t>(kSliceTokens) *
+              Q27_PREFILL_MODEL_HIDDEN * sizeof(__nv_bfloat16);
+          const uint32_t live_slices =
+              (args->valid_tokens + kSliceTokens - 1) / kSliceTokens;
+          for (uint32_t slice = 0; slice < live_slices; ++slice) {
+            const uint32_t row = slice * kSliceTokens;
+            ga.valid_tokens = std::min<uint32_t>(
+                kSliceTokens, args->valid_tokens - row);
+            ga.input_hidden_bf16 =
+                static_cast<const uint8_t*>(arena.hidden) +
+                static_cast<uint64_t>(slice) * kSliceBytes;
+            ga.input_residual_bf16 =
+                layer_index == 0
+                    ? nullptr
+                    : static_cast<const uint8_t*>(residual_in) +
+                          static_cast<uint64_t>(slice) * kSliceBytes;
+            ga.normalized_output_bf16 =
+                static_cast<uint8_t*>(arena.normalized) +
+                static_cast<uint64_t>(slice) * kSliceBytes;
+            ga.residual_output_bf16 =
+                static_cast<uint8_t*>(residual_out) +
+                static_cast<uint64_t>(slice) * kSliceBytes;
+            const q27_gdn_prefill_m512_status gs =
+                q27_gdn_prefill_m2048_forward(&ga);
+            if (gs.code != Q27_GDN_PREFILL_M512_OK)
+              return Error("large-M sliced GDN transformer layer", gs.message);
+          }
+          const uint32_t covered_tokens = live_slices * kSliceTokens;
+          if (covered_tokens < tokens) {
+            const uint64_t covered_bytes =
+                static_cast<uint64_t>(covered_tokens) *
+                Q27_PREFILL_MODEL_HIDDEN * sizeof(__nv_bfloat16);
+            const uint64_t padding_bytes =
+                hidden_bytes - covered_bytes;
+            cudaError_t cuda = cudaMemsetAsync(
+                static_cast<uint8_t*>(arena.normalized) + covered_bytes, 0,
+                padding_bytes, stream);
+            if (cuda != cudaSuccess)
+              return CudaError("clear large-M GDN normalized padding", cuda);
+            cuda = cudaMemsetAsync(
+                static_cast<uint8_t*>(residual_out) + covered_bytes, 0,
+                padding_bytes, stream);
+            if (cuda != cudaSuccess)
+              return CudaError("clear large-M GDN residual padding", cuda);
+          }
+        }
       }
     } else {
       q27_prefill_attention_layer_weights weights = layer.attention.weights;
@@ -554,11 +690,17 @@ q27_prefill_model_status Forward(q27_prefill_model_plan* plan,
       aa.attention_workspace_bytes =
           AttentionWorkspaceBytes(tokens, plan->config.cache_capacity);
       aa.cuda_stream = args->cuda_stream;
-      const q27_prefill_attention_layer_status as =
-          tokens == Q27_PREFILL_MODEL_TOKENS
-              ? q27_prefill_attention_layer_forward(plan->attention, &aa)
-              : q27_prefill_attention_layer_forward_m512(plan->attention,
-                                                          &aa);
+      q27_prefill_attention_layer_status as{};
+      if (tokens == Q27_PREFILL_MODEL_TOKENS)
+        as = q27_prefill_attention_layer_forward(plan->attention, &aa);
+      else if (tokens == Q27_PREFILL_MODEL_M512_TOKENS)
+        as = q27_prefill_attention_layer_forward_m512(plan->attention, &aa);
+      else if (tokens == Q27_PREFILL_MODEL_M2048_TOKENS)
+        as = q27_prefill_attention_layer_forward_m2048(plan->attention, &aa);
+      else if (tokens == Q27_PREFILL_MODEL_M4096_TOKENS)
+        as = q27_prefill_attention_layer_forward_m4096(plan->attention, &aa);
+      else
+        as = q27_prefill_attention_layer_forward_m8192(plan->attention, &aa);
       if (as.code != Q27_PREFILL_ATTENTION_LAYER_OK)
         return Error("attention transformer layer", as.message);
       const uint32_t* layer_invalid =
@@ -628,9 +770,16 @@ q27_prefill_model_status Forward(q27_prefill_model_plan* plan,
   final_norm.residual_output_bf16 = residual_out;
   final_norm.epsilon = 1.0e-6F;
   final_norm.cuda_stream = args->cuda_stream;
-  core = tokens == Q27_PREFILL_MODEL_TOKENS
-             ? q27_prefill_norm(&final_norm)
-             : q27_prefill_norm_m512(&final_norm);
+  if (tokens == Q27_PREFILL_MODEL_TOKENS)
+    core = q27_prefill_norm(&final_norm);
+  else if (tokens == Q27_PREFILL_MODEL_M512_TOKENS)
+    core = q27_prefill_norm_m512(&final_norm);
+  else if (tokens == Q27_PREFILL_MODEL_M2048_TOKENS)
+    core = q27_prefill_norm_m2048(&final_norm);
+  else if (tokens == Q27_PREFILL_MODEL_M4096_TOKENS)
+    core = q27_prefill_norm_m4096(&final_norm);
+  else
+    core = q27_prefill_norm_m8192(&final_norm);
   if (core.code != Q27_PREFILL_CORE_OK)
     return Error("final norm", core.message);
 
@@ -707,6 +856,21 @@ extern "C" q27_prefill_model_status q27_prefill_model_forward(
 extern "C" q27_prefill_model_status q27_prefill_model_forward_m512(
     q27_prefill_model_plan* plan, const q27_prefill_model_args* args) {
   return Forward(plan, args, Q27_PREFILL_MODEL_M512_TOKENS);
+}
+
+extern "C" q27_prefill_model_status q27_prefill_model_forward_m2048(
+    q27_prefill_model_plan* plan, const q27_prefill_model_args* args) {
+  return Forward(plan, args, Q27_PREFILL_MODEL_M2048_TOKENS);
+}
+
+extern "C" q27_prefill_model_status q27_prefill_model_forward_m4096(
+    q27_prefill_model_plan* plan, const q27_prefill_model_args* args) {
+  return Forward(plan, args, Q27_PREFILL_MODEL_M4096_TOKENS);
+}
+
+extern "C" q27_prefill_model_status q27_prefill_model_forward_m8192(
+    q27_prefill_model_plan* plan, const q27_prefill_model_args* args) {
+  return Forward(plan, args, Q27_PREFILL_MODEL_M8192_TOKENS);
 }
 
 extern "C" uint32_t* q27_prefill_model_invalid_count(

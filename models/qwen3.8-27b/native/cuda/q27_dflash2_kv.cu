@@ -139,15 +139,26 @@ __global__ void BuildRopeCache(uint64_t first_position, uint32_t token_count,
   }
 }
 
-__global__ void KNormNeoXRope(__nv_bfloat16* k,
-                              const __nv_bfloat16* gamma,
-                              const float* rope_cache, float epsilon) {
+/*
+ * Keep the projected K/V rows in scratch only until this kernel.  The old
+ * path normalized K in place and then launched a second, bandwidth-only
+ * kernel to read K and V again and publish them to the ring.  A token/head
+ * block already owns every element needed for both operations, so publish the
+ * normalized/rotated K and unmodified V directly.  This preserves the exact
+ * FP32 reduction and BF16 rounding points while removing one launch and one
+ * full K scratch write/read round trip per draft layer.
+ */
+__global__ void KNormNeoXRopeWriteRing(
+    const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* gamma, const float* rope_cache, float epsilon,
+    uint64_t first_position, uint32_t layer, __nv_bfloat16* key_cache,
+    __nv_bfloat16* value_cache, uint64_t* position_tags) {
   const uint32_t token = blockIdx.x / kKvHeads;
   const uint32_t head = blockIdx.x - token * kKvHeads;
   const uint32_t dimension = threadIdx.x;
-  const uint64_t base =
+  const uint64_t scratch_base =
       (static_cast<uint64_t>(token) * kKvHeads + head) * kHeadDim;
-  const float value = __bfloat162float(k[base + dimension]);
+  const float value = __bfloat162float(k[scratch_base + dimension]);
   float square_sum = WarpSum(value * value);
   __shared__ float warp_sums[kNormWarps];
   const uint32_t lane = dimension & 31U;
@@ -167,6 +178,15 @@ __global__ void KNormNeoXRope(__nv_bfloat16* k,
   normalized[dimension] = __float2bfloat16_rn(
       value * inverse_rms * __bfloat162float(gamma[dimension]));
   __syncthreads();
+
+  const uint64_t position = first_position + token;
+  const uint32_t slot =
+      static_cast<uint32_t>(position) & (Q27_DFLASH2_SLIDING_WINDOW - 1);
+  const uint64_t cache_base =
+      (static_cast<uint64_t>(layer) * Q27_DFLASH2_SLIDING_WINDOW + slot) *
+          kKvColumns +
+      static_cast<uint64_t>(head) * kHeadDim;
+  value_cache[cache_base + dimension] = v[scratch_base + dimension];
   if (dimension < kRotaryPairs) {
     const float first = __bfloat162float(normalized[dimension]);
     const float second =
@@ -175,34 +195,13 @@ __global__ void KNormNeoXRope(__nv_bfloat16* k,
         (static_cast<uint64_t>(token) * kRotaryPairs + dimension) * 2;
     const float cosine = rope_cache[rope];
     const float sine = rope_cache[rope + 1];
-    k[base + dimension] =
+    key_cache[cache_base + dimension] =
         __float2bfloat16_rn(first * cosine - second * sine);
-    k[base + dimension + kRotaryPairs] =
+    key_cache[cache_base + dimension + kRotaryPairs] =
         __float2bfloat16_rn(second * cosine + first * sine);
   }
-}
-
-__global__ void WriteRingKv(const __nv_bfloat16* k,
-                            const __nv_bfloat16* v, uint64_t first_position,
-                            uint32_t token_count, uint32_t layer,
-                            __nv_bfloat16* key_cache,
-                            __nv_bfloat16* value_cache,
-                            uint64_t* position_tags) {
-  const uint32_t elements = token_count * kKvColumns;
-  for (uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-       index < elements; index += blockDim.x * gridDim.x) {
-    const uint32_t token = index / kKvColumns;
-    const uint32_t within_token = index - token * kKvColumns;
-    const uint64_t position = first_position + token;
-    const uint32_t slot =
-        static_cast<uint32_t>(position) & (Q27_DFLASH2_SLIDING_WINDOW - 1);
-    const uint64_t cache =
-        (static_cast<uint64_t>(layer) * Q27_DFLASH2_SLIDING_WINDOW + slot) *
-            kKvColumns +
-        within_token;
-    key_cache[cache] = k[index];
-    value_cache[cache] = v[index];
-    if (within_token == 0) position_tags[slot] = position;
+  if (layer == 0 && head == 0 && dimension == 0) {
+    position_tags[slot] = position;
   }
 }
 
@@ -349,9 +348,6 @@ extern "C" q27_dflash2_status q27_dflash2_materialize_context_kv(
 
   const float epsilon =
       args->rms_epsilon > 0.0F ? args->rms_epsilon : kDefaultEpsilon;
-  const uint32_t copy_elements = args->token_count * kKvColumns;
-  const uint32_t copy_blocks =
-      (copy_elements + kCopyThreads - 1) / kCopyThreads;
   for (uint32_t layer = 0; layer < Q27_DFLASH2_LAYERS; ++layer) {
     const q27_dflash2_layer_weights& weights = args->weights->layers[layer];
     status = ProjectRows(handle, args->context_hidden_bf16,
@@ -364,24 +360,19 @@ extern "C" q27_dflash2_status q27_dflash2_materialize_context_kv(
                          args->token_count, kHidden, kKvColumns,
                          "DFlash2 context V projection");
     if (status.code != Q27_DFLASH2_OK) return status;
-    KNormNeoXRope<<<args->token_count * kKvHeads, kNormThreads, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(args->k_scratch_bf16),
-        static_cast<const __nv_bfloat16*>(weights.k_norm.data),
-        args->rope_cache_f32, epsilon);
-    error = cudaGetLastError();
-    if (error != cudaSuccess) {
-      return CudaError("DFlash2 context K norm/RoPE launch", error);
-    }
-    WriteRingKv<<<copy_blocks, kCopyThreads, 0, stream>>>(
+    KNormNeoXRopeWriteRing<<<args->token_count * kKvHeads, kNormThreads, 0,
+                            stream>>>(
         static_cast<const __nv_bfloat16*>(args->k_scratch_bf16),
         static_cast<const __nv_bfloat16*>(args->v_scratch_bf16),
-        args->first_position, args->token_count, layer,
+        static_cast<const __nv_bfloat16*>(weights.k_norm.data),
+        args->rope_cache_f32, epsilon, args->first_position, layer,
         static_cast<__nv_bfloat16*>(args->state->key_cache_bf16),
         static_cast<__nv_bfloat16*>(args->state->value_cache_bf16),
         args->state->position_tags_u64);
     error = cudaGetLastError();
     if (error != cudaSuccess) {
-      return CudaError("DFlash2 context KV ring write launch", error);
+      return CudaError("DFlash2 fused context K norm/RoPE/KV write launch",
+                       error);
     }
   }
   return Ok();

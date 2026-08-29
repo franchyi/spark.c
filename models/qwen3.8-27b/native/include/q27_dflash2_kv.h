@@ -30,7 +30,7 @@ typedef struct q27_dflash2_kv_reset_args {
  * Strict batch-one, contiguous-chunk context-KV reference. context_hidden is
  * the BF16 [token_count,5120] result of q27_dflash2_project_context. For each
  * of the five draft layers this call performs K-only and V-only BF16 GEMMs,
- * per-head K RMSNorm, full-dimension NeoX RoPE, and writes
+ * per-head K RMSNorm, full-dimension NeoX RoPE, and a fused K/V ring write
  * [layer, absolute_position%2048, 8,128] K/V plus the absolute position tag.
  *
  * token_count is 1..2048 so one call never has duplicate ring destinations.

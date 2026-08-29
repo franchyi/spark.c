@@ -64,15 +64,17 @@ bool AlignedBf16(const void* pointer) {
 /*
  * One block owns one Q or K head. Each lane owns exactly one convolution
  * channel, preserving the donor's per-channel recurrence. The block then
- * applies the identical 128-lane, stride-halving L2 reduction to the rounded
- * BF16 convolution result before advancing to the next token.
+ * applies the legacy 128-lane, stride-halving L2 reduction to the rounded
+ * BF16 convolution result before advancing to the next token. The pinned
+ * c427 Triton L2 reduction may differ from this fallback by 1--2 BF16 ULP.
  */
 __global__ void ConvNormalizeQK128(const __nv_bfloat16* fused,
                                    const __nv_bfloat16* weight,
                                    __nv_bfloat16* state,
                                    __nv_bfloat16* q_normalized,
                                    __nv_bfloat16* k_normalized,
-                                   uint32_t valid_tokens) {
+                                   uint32_t valid_tokens,
+                                   uint32_t source_row) {
   const int q_or_k = static_cast<int>(blockIdx.x) / Q27_GDN_FUSED_QK_HEADS;
   const int head = static_cast<int>(blockIdx.x) % Q27_GDN_FUSED_QK_HEADS;
   const int dimension = static_cast<int>(threadIdx.x);
@@ -103,7 +105,8 @@ __global__ void ConvNormalizeQK128(const __nv_bfloat16* fused,
     }
 
     const __nv_bfloat16 x =
-        fused[static_cast<uint64_t>(token) * Q27_GDN_FUSED_QKVZ_WIDTH +
+        fused[(static_cast<uint64_t>(source_row) + token) *
+                  Q27_GDN_FUSED_QKVZ_WIDTH +
               channel];
     const __nv_bfloat16 values[Q27_GDN_FUSED_CONV_KERNEL] = {h0, h1, h2,
                                                              x};
@@ -151,7 +154,8 @@ __global__ void ConvValueSplitZ128(const __nv_bfloat16* fused,
                                    __nv_bfloat16* state,
                                    __nv_bfloat16* value,
                                    __nv_bfloat16* projected_z,
-                                   uint32_t valid_tokens) {
+                                   uint32_t valid_tokens,
+                                   uint32_t source_row) {
   const int value_channel =
       static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (value_channel >= Q27_GDN_FUSED_Z_WIDTH) return;
@@ -168,7 +172,8 @@ __global__ void ConvValueSplitZ128(const __nv_bfloat16* fused,
 #pragma unroll 1
   for (int token = 0; token < Q27_GDN_FUSED_TOKENS; ++token) {
     const uint64_t fused_row =
-        static_cast<uint64_t>(token) * Q27_GDN_FUSED_QKVZ_WIDTH;
+        (static_cast<uint64_t>(source_row) + token) *
+        Q27_GDN_FUSED_QKVZ_WIDTH;
     const uint64_t value_index =
         static_cast<uint64_t>(token) * Q27_GDN_FUSED_Z_WIDTH + value_channel;
     projected_z[value_index] =
@@ -206,7 +211,7 @@ extern "C" q27_gdn_fused_split_norm_status q27_gdn_fused_split_norm(
     const q27_gdn_fused_split_norm_args* args) {
   if (args == nullptr || args->struct_size != sizeof(*args) ||
       args->abi_version != Q27_GDN_PREFILL_FUSED_SPLIT_NORM_ABI_VERSION ||
-      args->reserved != 0 || args->valid_tokens == 0 ||
+      args->valid_tokens == 0 ||
       args->valid_tokens > Q27_GDN_FUSED_TOKENS ||
       !AlignedBf16(args->fused_qkvz_bf16) ||
       !AlignedBf16(args->conv_weight_bf16) ||
@@ -215,7 +220,9 @@ extern "C" q27_gdn_fused_split_norm_status q27_gdn_fused_split_norm(
       !AlignedBf16(args->k_normalized_bf16) ||
       !AlignedBf16(args->value_bf16) ||
       !AlignedBf16(args->projected_z_bf16) ||
-      args->fused_qkvz_bytes < kFusedBytes ||
+      args->fused_qkvz_bytes <
+          (static_cast<uint64_t>(args->source_row) + Q27_GDN_FUSED_TOKENS) *
+              Q27_GDN_FUSED_QKVZ_WIDTH * kBf16Bytes ||
       args->conv_weight_bytes < kWeightBytes ||
       args->convolution_state_bytes < kStateBytes ||
       args->q_normalized_bytes < kQkBytes ||
@@ -232,7 +239,7 @@ extern "C" q27_gdn_fused_split_norm_status q27_gdn_fused_split_norm(
       static_cast<__nv_bfloat16*>(args->convolution_state_bf16),
       static_cast<__nv_bfloat16*>(args->q_normalized_bf16),
       static_cast<__nv_bfloat16*>(args->k_normalized_bf16),
-      args->valid_tokens);
+      args->valid_tokens, args->source_row);
   cudaError_t error = cudaPeekAtLastError();
   if (error != cudaSuccess)
     return CudaError("q27 fused GDN Q/K conv+norm: ", error);
@@ -246,7 +253,7 @@ extern "C" q27_gdn_fused_split_norm_status q27_gdn_fused_split_norm(
       static_cast<__nv_bfloat16*>(args->convolution_state_bf16),
       static_cast<__nv_bfloat16*>(args->value_bf16),
       static_cast<__nv_bfloat16*>(args->projected_z_bf16),
-      args->valid_tokens);
+      args->valid_tokens, args->source_row);
   error = cudaPeekAtLastError();
   return error == cudaSuccess
              ? Ok()

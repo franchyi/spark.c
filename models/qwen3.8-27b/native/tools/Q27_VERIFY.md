@@ -109,6 +109,71 @@ correctness-first MVP, not the final CUDA-graph verifier.
 returns `Q27_VERIFY_UNIMPLEMENTED`; callers must not confuse it with the
 model-level transaction.
 
+## Replay-elimination design
+
+The pinned FlashInfer revision already implements the state transaction used
+by c427 SGLang target verification. Its
+`gdn_decode_bf16_state.gated_delta_rule_mtp` T=8 specialization accepts a
+batch-scoped BF16 intermediate buffer `[B,8,48,128,128]`. With that buffer
+present, the kernel keeps the live recurrent state unchanged and writes the
+BF16-rounded states `h_1..h_8`; SGLang later selects
+`commit_length - 1`. This is not equivalent to asking the M128 chunk kernel
+for its two chunk-boundary states: the chunk kernel carries FP32 state across
+the whole active chunk and exposes no per-token checkpoints.
+
+The exact c427 call chain is
+`gdn_backend.py::forward_extend` (passes `intermediate_conv_window` to
+`causal_conv1d_update`),
+`gdn_flashinfer.py::FlashInferGDNKernel::target_verify` (calls T=8 with
+`intermediate_states_buffer` and `disable_state_update=True`), and
+`mamba_state_scatter_triton.py::scatter_mamba_states_after_mtp_verify`
+(selects the same `last_correct_step_indices` from both SSM and convolution
+journals). The pinned Mia launch uses `extra_buffer`, not ReplaySSM, so the
+full recurrent checkpoint interpretation is the relevant oracle.
+
+The source-only prototype consists of:
+
+- `include/q27_gdn_verify_t8.h`: narrow batch-one/T=8 raw C contracts;
+- `cuda/q27_gdn_verify_t8.cu`: non-mutating width-four convolution with
+  `state_1..state_8`, plus layer-major selected-row commit;
+- `cuda/q27_gdn_verify_t8_flashinfer.cc`: TVM-FFI adapter for the cached-state
+  AOT object; and
+- `vendor/tools/export-q27-gdn-verify-aot.py`: offline extraction of the
+  pinned SM121 specialization. Python/Torch/CuTe remain build-time only.
+
+For one request, layer-major journals occupy:
+
+- convolution: `48 * 8 * 10240 * 3 * 2 = 23,592,960` bytes;
+- recurrent: `48 * 8 * 48 * 128 * 128 * 2 = 603,979,776` bytes; and
+- combined: `627,572,736` bytes (598.5 MiB).
+
+The selected checkpoint copied to live state is 78,446,592 bytes. Because the
+new T=8 convolution and recurrence read but never mutate live state, the
+existing 78,446,592-byte base snapshot can be removed after promotion; net
+additional resident memory is 549,126,144 bytes (523.7 MiB). This exchanges a
+bounded state write/copy for a second 64-layer target forward.
+
+Integration is intentionally small but must be parity-gated on Spark:
+
+1. Export and link the cached T=8 AOT object. In the GDN branch of the
+   provisional verifier, retain the existing M128 input norm, fused QKVZ/A-B
+   projections, gated norm, output projection, residual path, and MLP, but
+   replace causal-conv + chunk-WY recurrence with the T=8 journal capsule.
+2. Pass each GDN layer its layer-major convolution/recurrent journal slice.
+   Do not mutate the live GDN state during the provisional forward.
+3. After greedy acceptance, publish journal row `commit_length - 1` with
+   `q27_gdn_verify_t8_commit`, set `model->position = base + commit_length`,
+   and delete the restore-plus-`RunPrefillTile(commit_length)` replay.
+4. Keep target attention KV untouched. The first forward already wrote all
+   eight FP8 rows at absolute positions `base..base+7`; `model->position` is
+   their visibility boundary. Rejected rows remain hidden and the next append
+   overwrites them. No attention checkpoint or copy is required.
+5. Promotion requires byte-exact per-row convolution and recurrent journals,
+   exact T=8 target top-1/feature outputs against c427, live-state immutability
+   before commit, and exact selected-state equality for every commit length
+   1..8. Until those gates pass, the prototype must not replace the joined
+   replay path.
+
 ## Spark-only isolated build
 
 From the repository root on the Spark host:

@@ -56,6 +56,9 @@ PREFILL_ATTENTION_LAYER_SHARED := \
 GDN_PREFILL_SHARED := $(BUILD_DIR)/libq27-gdn-prefill.so
 GDN_PREFILL_AB_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-ab.so
 GDN_PREFILL_WY_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-wy.so
+GDN_PREFILL_FUSED_SPLIT_NORM_SHARED := \
+	$(BUILD_DIR)/libq27-gdn-prefill-fused-split-norm.so
+GDN_PREFILL_C427_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-c427.so
 GDN_PREFILL_SUBLAYER_SHARED := \
 	$(BUILD_DIR)/libq27-gdn-prefill-sublayer.so
 GDN_PREFILL_LAYER_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-layer.so
@@ -65,7 +68,9 @@ PREFILL_SHARED := $(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) \
 	$(PREFILL_NVFP4_SHARED) $(PREFILL_MLP_SHARED) \
 	$(PREFILL_ATTENTION_SHARED) $(PREFILL_ATTENTION_LAYER_SHARED) \
 	$(GDN_PREFILL_SHARED) $(GDN_PREFILL_AB_SHARED) \
-	$(GDN_PREFILL_WY_SHARED) $(GDN_PREFILL_SUBLAYER_SHARED) \
+	$(GDN_PREFILL_WY_SHARED) $(GDN_PREFILL_FUSED_SPLIT_NORM_SHARED) \
+	$(GDN_PREFILL_C427_SHARED) \
+	$(GDN_PREFILL_SUBLAYER_SHARED) \
 	$(GDN_PREFILL_LAYER_SHARED) $(GDN_PREFILL_M512_SHARED) \
 	$(PREFILL_MODEL_SHARED)
 CAPSULE_SHARED := $(KERNEL_SHARED) $(MAPPING_SHARED) $(GDN_SHARED) \
@@ -260,6 +265,26 @@ $(GDN_PREFILL_WY_SHARED): cuda/q27_gdn_prefill_wy.cu \
 		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
 		-lcublas -lcudart $(ORIGIN_RPATH) -o $@
 
+$(GDN_PREFILL_FUSED_SPLIT_NORM_SHARED): \
+		cuda/q27_gdn_prefill_fused_split_norm.cu \
+		include/q27_gdn_prefill_fused_split_norm.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-lcudart $(ORIGIN_RPATH) -o $@
+
+$(GDN_PREFILL_C427_SHARED): cuda/q27_gdn_prefill_c427.cu \
+		cuda/q27_gdn_prefill_c427_prepare.cu \
+		cuda/q27_gdn_prefill_c427_aot.cc \
+		include/q27_gdn_prefill_c427.h \
+		include/q27_gdn_prefill_c427_prepare.h \
+		include/q27_gdn_prefill_c427_aot.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) \
+		cuda/q27_gdn_prefill_c427.cu \
+		cuda/q27_gdn_prefill_c427_prepare.cu \
+		cuda/q27_gdn_prefill_c427_aot.cc \
+		-lcuda -lcudart $(ORIGIN_RPATH) -o $@
+
 $(GDN_PREFILL_SUBLAYER_SHARED): cuda/q27_gdn_prefill_sublayer.cu \
 		include/q27_gdn_prefill_sublayer.h $(GDN_PREFILL_SHARED) \
 		$(GDN_PREFILL_AB_SHARED) $(GDN_PREFILL_WY_SHARED) \
@@ -280,13 +305,20 @@ $(GDN_PREFILL_LAYER_SHARED): cuda/q27_gdn_prefill_layer.cu \
 		$(ORIGIN_RPATH) -o $@
 
 $(GDN_PREFILL_M512_SHARED): cuda/q27_gdn_prefill_m512.cu \
-		include/q27_gdn_prefill_m512.h $(GDN_PREFILL_SHARED) \
+		include/q27_gdn_prefill_m512.h \
+		include/q27_gdn_prefill_c427.h \
+		include/q27_gdn_prefill_c427_prepare.h \
+		include/q27_gdn_prefill_fused_split_norm.h $(GDN_PREFILL_SHARED) \
 		$(GDN_PREFILL_AB_SHARED) $(GDN_PREFILL_WY_SHARED) \
+		$(GDN_PREFILL_FUSED_SPLIT_NORM_SHARED) \
+		$(GDN_PREFILL_C427_SHARED) \
 		$(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
 		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
 		-L$(BUILD_DIR) -lq27-gdn-prefill -lq27-gdn-prefill-ab \
-		-lq27-gdn-prefill-wy -lq27-prefill-core -lq27-prefill-fp8 \
+		-lq27-gdn-prefill-wy -lq27-gdn-prefill-fused-split-norm \
+		-lq27-gdn-prefill-c427 \
+		-lq27-prefill-core -lq27-prefill-fp8 \
 		-lcublasLt -lcublas -lcudart $(ORIGIN_RPATH) -o $@
 
 $(PREFILL_MODEL_SHARED): cuda/q27_prefill_model.cu \

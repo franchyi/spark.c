@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Qwen3.8-27B M=128/512 batched-prefill NVFP4 projection. Arithmetic is
+// Qwen3.8-27B M=128/512/2048/8192 batched-prefill NVFP4 projection. Arithmetic is
 // reused from pinned FlashInfer/CUTLASS; this file only freezes model shapes,
 // validates raw buffers, and dispatches one quantizer plus one GEMM per batch.
 
@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <string>
 
@@ -38,6 +40,13 @@ namespace flashinfer {
 namespace gemm {
 INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(__nv_bfloat16, 128, 32, 128,
                                      1, 1, 1, _1SM, true)
+// FlashInfer 0.6.18's SM121 CUTLASS fallback for an untuned fp4_gemm shape.
+// SGLang c427 only tunes M=1/2/4/8 during its DFlash2 warmup, so large prompt
+// chunks take this physical 128x128x256, non-swapped, DP path. Keep it as an
+// opt-in promotion candidate until the native correctness canary accepts the
+// different K-tile reduction order.
+INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(__nv_bfloat16, 128, 128, 256,
+                                     1, 1, 1, _1SM, false)
 }  // namespace gemm
 }  // namespace flashinfer
 
@@ -85,7 +94,10 @@ bool IsAligned(const void* pointer, uintptr_t alignment) {
 
 bool SupportedM(uint32_t m) {
   return m == Q27_PREFILL_NVFP4_M128 ||
-         m == Q27_PREFILL_NVFP4_M512;
+         m == Q27_PREFILL_NVFP4_M512 ||
+         m == Q27_PREFILL_NVFP4_M2048 ||
+         m == Q27_PREFILL_NVFP4_M4096 ||
+         m == Q27_PREFILL_NVFP4_M8192;
 }
 
 bool ResolveShape(uint32_t projection, uint32_t* n, uint32_t* k) {
@@ -108,7 +120,7 @@ bool ResolveShape(uint32_t projection, uint32_t* n, uint32_t* k) {
   }
 }
 
-CutlassGemmConfig PrefillConfig() {
+CutlassGemmConfig AcceptedPrefillConfig() {
   return CutlassGemmConfig(
       CutlassTileConfigSM120::CtaShape128x32x64B,
       MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
@@ -116,16 +128,57 @@ CutlassGemmConfig PrefillConfig() {
       /*swap_ab=*/true, /*use_stream_k=*/false);
 }
 
+CutlassGemmConfig SglangLargeMPrefillConfig() {
+  return CutlassGemmConfig(
+      CutlassTileConfigSM120::CtaShape128x128x128B,
+      MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+      flashinfer::gemm::ClusterShape::ClusterShape_1x1x1,
+      /*swap_ab=*/false, /*use_stream_k=*/false);
+}
+
+bool UseSglangLargeMTactic(int m) {
+  // Do not change the already promoted M=128 path. The exact SGLang/Mia GB10
+  // autotune cache contains only decode buckets (M=1/2/4/8); M=512/2048 are
+  // cache misses and therefore use FlashInfer's tactic=-1 fallback above.
+  // M8192 itself is an explicit experimental lane, so align it with that
+  // fallback without requiring a second independent opt-in switch.
+  if (m == Q27_PREFILL_NVFP4_M4096 ||
+      m == Q27_PREFILL_NVFP4_M8192)
+    return true;
+  static const bool enabled = [] {
+    const char* value = std::getenv("Q27_PREFILL_NVFP4_SGLANG_LARGE_M");
+    return value != nullptr &&
+           (std::strcmp(value, "1") == 0 ||
+            std::strcmp(value, "true") == 0 ||
+            std::strcmp(value, "on") == 0);
+  }();
+  static const bool mixed_tail_enabled = [] {
+    const char* value = std::getenv("Q27_PREFILL_M8192");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return (enabled || mixed_tail_enabled) &&
+         (m == Q27_PREFILL_NVFP4_M512 ||
+          m == Q27_PREFILL_NVFP4_M2048);
+}
+
 size_t RunGemm(void* output, const void* input, const void* weight,
                const void* input_scales, const void* weight_scales,
                const float* alpha, int m, int n, int k, char* workspace,
                size_t workspace_bytes, cudaStream_t stream) {
+  if (UseSglangLargeMTactic(m)) {
+    return flashinfer::gemm::genericFp4GemmKernelLauncher<
+        __nv_bfloat16, cute::Int<128>, cute::Int<128>, cute::Int<256>,
+        cute::Int<1>, cute::Int<1>, cute::Int<1>, flashinfer::gemm::_1SM,
+        false>(output, input, weight, input_scales, weight_scales, alpha, m,
+               n, k, /*l=*/1, SglangLargeMPrefillConfig(), workspace,
+               workspace_bytes, stream, nullptr);
+  }
   /* Batched prefill has ample M tiles; static persistent avoids Stream-K. */
   return flashinfer::gemm::genericFp4GemmKernelLauncher<
       __nv_bfloat16, cute::Int<128>, cute::Int<32>, cute::Int<128>,
       cute::Int<1>, cute::Int<1>, cute::Int<1>, flashinfer::gemm::_1SM,
       true>(output, input, weight, input_scales, weight_scales, alpha, m, n, k,
-            /*l=*/1, PrefillConfig(), workspace, workspace_bytes, stream,
+            /*l=*/1, AcceptedPrefillConfig(), workspace, workspace_bytes, stream,
             nullptr);
 }
 
@@ -137,7 +190,7 @@ q27_prefill_nvfp4_shape ExpectedShape(uint32_t m, uint32_t n, uint32_t k,
   shape.m = m;
   shape.n = n;
   shape.k = k;
-  /* Both supported M values are exact multiples of the 128-row tile. */
+  /* Every supported M is an exact multiple of the 128-row scale tile. */
   shape.padded_scale_rows = m;
   shape.scale_group = kScaleGroup;
   shape.input_bf16_bytes =
@@ -260,7 +313,8 @@ q27_prefill_nvfp4_status Query(uint32_t m, uint32_t projection,
       output->abi_version != Q27_PREFILL_NVFP4_ABI_VERSION)
     return Invalid("Q27 prefill NVFP4 shape output ABI mismatch");
   if (!SupportedM(m))
-    return Unsupported("Q27 prefill NVFP4 supports only M=128 or M=512");
+    return Unsupported(
+        "Q27 prefill NVFP4 supports only M=128, M=512, M=2048, M=4096, or M=8192");
   uint32_t n = 0;
   uint32_t k = 0;
   if (!ResolveShape(projection, &n, &k))

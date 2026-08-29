@@ -237,3 +237,112 @@ currently unvalidated T8/M128 verifier, not an acceptance or KV scheduling
 error. The retained JSON did not include token IDs, so the next correctness
 gate must capture the first block's candidates, target top-1 rows, and emitted
 IDs and compare them block-by-block with the pinned target/SGLang oracle.
+
+## Strict profiler alignment
+
+A subsequent matched Nsight Systems pass used the same 12,617-token prompt,
+checkpoint revisions, greedy request, and exact response hash on both engines.
+It retained one diagnostic sample per configuration:
+
+| configuration | TTFT | effective prefill | main NVFP4 calls / time | full-attention calls / time | recurrent calls per named stage |
+|---|---:|---:|---:|---:|---:|
+| native production M512 | 24.806546 s | 508.616 tok/s | 3,200 / 8.567 s | 400 / 2.115 s | 4,752 |
+| Mia/SGLang c427 | 13.238009 s | 953.089 tok/s | 256 / 4.699 s | 48 / 2.075 s | 96 |
+| native aligned experiment | 21.301503 s | 592.306 tok/s | 896 / 4.325 s | 112 / 2.086 s | 4,752 |
+| native c427 + M8192 | 18.193478 s | 693.490 tok/s | 256 / 5.598 s | 32 / 2.026 s | 336 |
+
+The aligned experiment enabled physical M2048 prefill, the fused GDN input
+capsule, and the c427-aligned large-M FlashInfer/CUTLASS tactic. It passed the
+prompt count, finish reason, and exact response hash gates and improved the
+matched native trace by 16.5%. It is not the default because the profiler still
+shows the native GDN implementation replaying every 128-token region from the
+host. SGLang maps the full set of 64-token GDN chunks over a grid-wide Triton
+FLA launch. The next performance gate is therefore the fixed-shape c427 BF16
+GDN AOT capsule; more Rust scheduling work or another general benchmark matrix
+would not address the measured gap.
+
+Profiler artifacts are retained on Spark under
+`/home/chaoyi/.cache/spark-c-q27-nsys/{native-m512-v1,sglang-dflash2-v1,native-aligned-v1,native-c427-m8192-v1}`.
+All profiler services and ports were stopped after capture.
+
+## c427 GDN + M8192 integrated canary
+
+The exact c427 BF16 recurrence was exported as fixed SM121 cubins and loaded by
+the native CUDA Driver capsule. Its isolated T512 and T2048 gates matched donor
+output and final recurrent state byte-for-byte with a nonzero initial state.
+The T2048 capsule took 2.091 ms versus 2.760 ms for the warmed donor call.
+
+One subsequent full-model canary combined:
+
+- `Q27_PREFILL_M8192=1`;
+- `Q27_GDN_C427_AOT=1` with the validated artifact directory;
+- the c427-aligned large-M FlashInfer/CUTLASS NVFP4 tactic.
+
+It produced the exact expected response hash
+`c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526`
+and is retained at
+`/home/chaoyi/.cache/spark-c-q27-bench/run-20260830-native-c427-m8192-v1`.
+
+| configuration | TTFT | effective prefill | relative to first native | relative to retained Mia baseline |
+|---|---:|---:|---:|---:|
+| first native M512 | 23.476939 s | 537.421 tok/s | baseline | 65.0% |
+| c427 GDN + M8192 | 17.841436 s | 707.174 tok/s | 1.316x | 85.5% |
+| retained Mia/SGLang | 15.260405 s | 826.780 tok/s | 1.538x | baseline |
+
+This closes most of the original prefill gap while preserving the lightweight
+runtime boundary. The final matched trace is retained in
+`/home/chaoyi/.cache/spark-c-q27-nsys/native-c427-m8192-v1`. It confirms that
+the c427 recurrence stages and FlashInfer attention now match the oracle in
+elapsed time. The largest remaining mismatches are the still-M128 GDN
+split/conv/QK preparation (2.519 s native versus roughly 0.38 s for c427's
+fused preparation) and padded-tail NVFP4 work (5.598 s native versus 4.699 s).
+No repeated benchmark matrix was run, and every service was stopped afterward.
+
+## Mixed-tail follow-up
+
+The two-M8192 trace above spent 5.598 seconds in 256 NVFP4 GEMMs because its
+4,425-token second tile still executed 8,192 physical rows. The opt-in lane now
+uses `M8192(valid=8192) + M4096(valid=4096) + M512(valid=329)`: 12,800
+physical rows rather than 16,384. Its schedule-derived counts are 384 NVFP4
+GEMMs and 48 attention-layer calls; no extra Nsight pass was run just to
+recount them.
+
+One minimum Spark canary passed the same prompt count, finish reason, and exact
+response hash gate:
+
+| configuration | TTFT | effective prefill | relative to retained Mia baseline |
+|---|---:|---:|---:|
+| c427 GDN + two M8192 | 17.841436 s | 707.174 tok/s | 85.5% |
+| c427 GDN + mixed tail | 15.860962 s | 795.475 tok/s | 96.2% |
+| retained Mia/SGLang | 15.260405 s | 826.780 tok/s | baseline |
+
+The mixed tail improves native effective prefill by 12.5% without changing the
+response hash. Its single-run artifact is retained at
+`/home/chaoyi/.cache/spark-c-q27-bench/run-20260830-native-c427-mixed-tail-v1`.
+The server was stopped immediately after the request.
+
+## Final c427 preparation + mixed-tail canary
+
+The fixed c427 preparation capsule replaces the remaining per-M128 QKVZ split,
+causal convolution, QKV split, and Q/K normalization. Its isolated physical
+T512/valid377 gate matched c427 Q/K/V/Z and final convolution state byte-for-byte,
+zeroed every invalid suffix row, and took 0.425504 ms. The old native fallback
+remains available; its Q/K normalization differs from c427 by one to two BF16
+ULPs, which is why the donor-exact capsule is the aligned path.
+
+One integrated canary combined the exact preparation and recurrence capsules
+with the mixed M8192/M4096/M512 tail schedule. It retained the same response
+hash and passed all request-level count and finish gates:
+
+| configuration | TTFT | effective prefill | relative to retained Mia baseline |
+|---|---:|---:|---:|
+| first native M512 | 23.476939 s | 537.421 tok/s | 65.0% |
+| c427 recurrence + mixed tail | 15.860962 s | 795.475 tok/s | 96.2% |
+| c427 preparation + recurrence + mixed tail | 13.618169 s | 926.483 tok/s | 112.1% |
+| retained Mia/SGLang | 15.260405 s | 826.780 tok/s | baseline |
+
+The final native configuration is 72.4% faster than the first native M512 run
+and 12.1% faster than the retained Mia/SGLang one-shot reference. Its artifact
+is `/home/chaoyi/.cache/spark-c-q27-bench/run-20260830-native-c427-prep-mixed-v1`.
+This remains a single-sample result rather than a repeated statistical claim.
+The service and profiler ports were stopped after the request.

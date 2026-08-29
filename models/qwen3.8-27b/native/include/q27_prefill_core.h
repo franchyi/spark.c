@@ -12,6 +12,9 @@ extern "C" {
 enum {
   Q27_PREFILL_CORE_TOKENS = 128,
   Q27_PREFILL_CORE_M512_TOKENS = 512,
+  Q27_PREFILL_CORE_M2048_TOKENS = 2048,
+  Q27_PREFILL_CORE_M4096_TOKENS = 4096,
+  Q27_PREFILL_CORE_M8192_TOKENS = 8192,
   Q27_PREFILL_CORE_HIDDEN = 5120,
   Q27_PREFILL_CORE_VOCAB = 248320,
 };
@@ -78,6 +81,24 @@ q27_prefill_core_status q27_prefill_norm(
 q27_prefill_core_status q27_prefill_embedding_m512(
     const q27_prefill_embedding_args* args);
 q27_prefill_core_status q27_prefill_norm_m512(
+    const q27_prefill_norm_args* args);
+
+/* Fixed M=2048 prompt lane; semantics are identical to the M512 lane. */
+q27_prefill_core_status q27_prefill_embedding_m2048(
+    const q27_prefill_embedding_args* args);
+q27_prefill_core_status q27_prefill_norm_m2048(
+    const q27_prefill_norm_args* args);
+
+/* Fixed M=4096 prompt lane; semantics are identical to the M2048 lane. */
+q27_prefill_core_status q27_prefill_embedding_m4096(
+    const q27_prefill_embedding_args* args);
+q27_prefill_core_status q27_prefill_norm_m4096(
+    const q27_prefill_norm_args* args);
+
+/* Fixed M=8192 prompt lane; semantics are identical to the M2048 lane. */
+q27_prefill_core_status q27_prefill_embedding_m8192(
+    const q27_prefill_embedding_args* args);
+q27_prefill_core_status q27_prefill_norm_m8192(
     const q27_prefill_norm_args* args);
 
 #ifdef __cplusplus

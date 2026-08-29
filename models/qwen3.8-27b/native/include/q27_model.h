@@ -136,6 +136,27 @@ typedef struct q27_model_dflash2_verify_result {
   uint64_t target_features_bytes;
 } q27_model_dflash2_verify_result;
 
+#define Q27_MODEL_DFLASH2_PROFILE_ABI_VERSION 1u
+
+/*
+ * Optional CUDA-event timings for the most recent successful target verify.
+ * Events are created once with the model when Q27_DFLASH2_PROFILE=1. All
+ * values remain zero and valid remains false in the default runtime.
+ */
+typedef struct q27_model_dflash2_profile_stats {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint64_t total_us;
+  uint64_t snapshot_us;
+  uint64_t speculative_pass_us;
+  uint64_t speculative_result_sync_us;
+  uint64_t rollback_us;
+  uint64_t committed_replay_us;
+  uint64_t committed_result_sync_us;
+  uint32_t enabled;
+  uint32_t valid;
+} q27_model_dflash2_profile_stats;
+
 /*
  * Borrowed view published once per target prompt tile. The callback runs on
  * the model owner thread after the tile has been enqueued. It may enqueue
@@ -179,10 +200,11 @@ q27_model_status q27_model_reset(q27_model* model);
  */
 q27_model_status q27_model_consume_token(q27_model* model, uint32_t token);
 /*
- * Reset and prefill one host sequence with M512 prompt tiles and an M128
- * fallback for short/tiny-capacity requests. Only one tile is copied at a
- * time. Intermediate tiles skip the LM head; the final tile returns the first
- * greedy completion token.
+ * Reset and prefill one host sequence largest-first with M512 then M128
+ * prompt lanes. The experimental M2048 lane is selected only when
+ * Q27_PREFILL_M2048=1; its first GB10 promotion canary did not clear M512.
+ * Only one tile is copied at a time. Intermediate tiles skip the LM head; the
+ * final tile returns the first greedy completion token.
  */
 q27_model_status q27_model_prefill_greedy(q27_model* model,
                                           const uint32_t* host_tokens,
@@ -216,6 +238,8 @@ q27_model_status q27_model_dflash2_verify(
     q27_model* model,
     const uint32_t host_candidates[Q27_MODEL_DFLASH2_BLOCK_SIZE],
     q27_model_dflash2_verify_result* output);
+q27_model_status q27_model_get_dflash2_profile_stats(
+    const q27_model* model, q27_model_dflash2_profile_stats* output);
 /* Diagnostic-only post-step copy; the decode hot path never performs it. */
 q27_model_status q27_model_copy_logits(const q27_model* model,
                                        float* host_logits,

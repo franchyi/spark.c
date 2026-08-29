@@ -18,6 +18,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -27,7 +29,7 @@
 namespace {
 
 constexpr uint64_t kAlignment = 256;
-constexpr uint32_t kFeatureTileTokens = 512;
+constexpr uint32_t kFeatureTileTokens = Q27_DFLASH2_KV_MAX_CHUNK_TOKENS;
 constexpr uint64_t kHiddenRowBytes = Q27_DFLASH2_HIDDEN_SIZE * 2ULL;
 constexpr uint64_t kBlockHiddenBytes =
     Q27_DFLASH2_BLOCK_SIZE * kHiddenRowBytes;
@@ -39,6 +41,15 @@ constexpr uint64_t kFeatureTileRopeBytes =
     kFeatureTileTokens * Q27_DFLASH2_KV_ROPE_CACHE_BYTES_PER_TOKEN;
 constexpr uint64_t kDraftWorkspaceBytes =
     Q27_DFLASH2_ATTENTION_SUBLAYER_WORKSPACE_BYTES;
+
+enum DFlash2EngineProfilePhase : uint32_t {
+  kProfilePrepareEmbed = 0,
+  kProfileDraftForward,
+  kProfileLmHeadTop16,
+  kProfileSelector,
+  kProfileProposalCopySync,
+  kProfilePhaseCount,
+};
 
 thread_local std::string g_error;
 
@@ -67,6 +78,11 @@ q27_dflash2_status CublasError(const char* operation, cublasStatus_t status) {
   g_error.append(": cuBLAS status ");
   g_error.append(std::to_string(static_cast<int>(status)));
   return {Q27_DFLASH2_CUDA_ERROR, g_error.c_str()};
+}
+
+bool ProfileRequested() {
+  const char* value = std::getenv("Q27_DFLASH2_PROFILE");
+  return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
 q27_dflash2_status ModelError(const char* operation,
@@ -209,6 +225,11 @@ struct q27_dflash2_engine {
   uint64_t emitted_tokens = 0;
   uint64_t last_prefill_us = 0;
   uint64_t last_block_us = 0;
+  bool profile_enabled = false;
+  bool profile_valid = false;
+  cudaEvent_t profile_begin[kProfilePhaseCount]{};
+  cudaEvent_t profile_end[kProfilePhaseCount]{};
+  q27_dflash2_profile_stats profile{};
   uint32_t position = 0;
   uint32_t next_anchor = 0;
   uint64_t host_prefix_staging = 0;
@@ -222,9 +243,77 @@ struct q27_dflash2_engine {
 
 namespace {
 
+q27_dflash2_status CreateProfileEvents(q27_dflash2_engine* engine) {
+  if (!engine->profile_enabled) return Ok();
+  for (uint32_t phase = 0; phase < kProfilePhaseCount; ++phase) {
+    cudaError_t error = cudaEventCreate(&engine->profile_begin[phase]);
+    if (error != cudaSuccess)
+      return CudaError("create DFlash2 profile begin event", error);
+    error = cudaEventCreate(&engine->profile_end[phase]);
+    if (error != cudaSuccess)
+      return CudaError("create DFlash2 profile end event", error);
+  }
+  return Ok();
+}
+
+void DestroyProfileEvents(q27_dflash2_engine* engine) {
+  for (uint32_t phase = 0; phase < kProfilePhaseCount; ++phase) {
+    if (engine->profile_begin[phase] != nullptr) {
+      cudaEventDestroy(engine->profile_begin[phase]);
+      engine->profile_begin[phase] = nullptr;
+    }
+    if (engine->profile_end[phase] != nullptr) {
+      cudaEventDestroy(engine->profile_end[phase]);
+      engine->profile_end[phase] = nullptr;
+    }
+  }
+}
+
+q27_dflash2_status RecordProfile(q27_dflash2_engine* engine,
+                                 DFlash2EngineProfilePhase phase,
+                                 bool begin) {
+  if (!engine->profile_enabled) return Ok();
+  cudaEvent_t event =
+      begin ? engine->profile_begin[phase] : engine->profile_end[phase];
+  const cudaError_t error = cudaEventRecord(event, engine->stream);
+  return error == cudaSuccess
+             ? Ok()
+             : CudaError("record DFlash2 profile event", error);
+}
+
+q27_dflash2_status CollectDraftProfile(q27_dflash2_engine* engine) {
+  if (!engine->profile_enabled) return Ok();
+  uint64_t elapsed[kProfilePhaseCount]{};
+  for (uint32_t phase = 0; phase < kProfilePhaseCount; ++phase) {
+    float milliseconds = 0.0F;
+    const cudaError_t error = cudaEventElapsedTime(
+        &milliseconds, engine->profile_begin[phase],
+        engine->profile_end[phase]);
+    if (error != cudaSuccess)
+      return CudaError("read DFlash2 profile event", error);
+    elapsed[phase] =
+        static_cast<uint64_t>(milliseconds * 1000.0F + 0.5F);
+  }
+  engine->profile.draft_prepare_embed_us = elapsed[kProfilePrepareEmbed];
+  engine->profile.draft_forward_us = elapsed[kProfileDraftForward];
+  engine->profile.lm_head_top16_us = elapsed[kProfileLmHeadTop16];
+  engine->profile.selector_us = elapsed[kProfileSelector];
+  engine->profile.proposal_copy_sync_us = elapsed[kProfileProposalCopySync];
+  return Ok();
+}
+
+void ClearProfile(q27_dflash2_engine* engine) {
+  engine->profile = {};
+  engine->profile.struct_size = sizeof(engine->profile);
+  engine->profile.abi_version = Q27_DFLASH2_PROFILE_ABI_VERSION;
+  engine->profile.enabled = engine->profile_enabled ? 1U : 0U;
+  engine->profile_valid = false;
+}
+
 void ReleaseEngine(q27_dflash2_engine* engine) {
   if (engine == nullptr) return;
   if (engine->stream != nullptr) cudaStreamSynchronize(engine->stream);
+  DestroyProfileEvents(engine);
   if (engine->target != nullptr) q27_model_destroy(engine->target);
   if (engine->scratch_arena != nullptr) cudaFree(engine->scratch_arena);
   if (engine->state_arena != nullptr) cudaFree(engine->state_arena);
@@ -465,6 +554,8 @@ extern "C" q27_dflash2_status q27_dflash2_engine_create(
   engine->rms_epsilon =
       args->rms_epsilon > 0.0F ? args->rms_epsilon : 1.0e-6F;
   engine->draft_weight_bytes = SumDraftWeightBytes(engine->draft_weights);
+  engine->profile_enabled = ProfileRequested();
+  ClearProfile(engine);
 
   cudaError_t cuda_status = cudaSetDevice(args->target_options->device_id);
   if (cuda_status != cudaSuccess) {
@@ -499,6 +590,11 @@ extern "C" q27_dflash2_status q27_dflash2_engine_create(
                                            cudaStreamNonBlocking);
   if (cuda_status != cudaSuccess) {
     status = CudaError("create DFlash2 stream", cuda_status);
+    ReleaseEngine(engine);
+    return status;
+  }
+  status = CreateProfileEvents(engine);
+  if (status.code != Q27_DFLASH2_OK) {
     ReleaseEngine(engine);
     return status;
   }
@@ -586,6 +682,7 @@ extern "C" q27_dflash2_status q27_dflash2_engine_reset(
   engine->emitted_tokens = 0;
   engine->last_prefill_us = 0;
   engine->last_block_us = 0;
+  ClearProfile(engine);
   engine->position = 0;
   engine->next_anchor = 0;
   engine->ready = false;
@@ -639,9 +736,13 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
   }
   const auto started = std::chrono::steady_clock::now();
   engine->ready = false;
+  ClearProfile(engine);
   engine->state.committed_length = engine->position;
   const uint32_t anchor_token = engine->next_anchor;
   engine->host_prefix_staging = engine->position;
+  q27_dflash2_status status =
+      RecordProfile(engine, kProfilePrepareEmbed, true);
+  if (status.code != Q27_DFLASH2_OK) return status;
   cudaError_t cuda_status = cudaMemcpyAsync(
       engine->anchor, &engine->next_anchor, sizeof(engine->next_anchor),
       cudaMemcpyHostToDevice, engine->stream);
@@ -664,7 +765,7 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
   prepare.cache_slots = engine->cache_slots;
   prepare.batch_size = 1;
   prepare.cuda_stream = engine->stream;
-  q27_dflash2_status status = q27_dflash2_prepare_block(&prepare);
+  status = q27_dflash2_prepare_block(&prepare);
   if (status.code != Q27_DFLASH2_OK) return status;
 
   cuda_status = cudaMemsetAsync(engine->embedding_invalid_count, 0,
@@ -680,6 +781,8 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
   cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess)
     return CudaError("gather DFlash2 embeddings", cuda_status);
+  status = RecordProfile(engine, kProfilePrepareEmbed, false);
+  if (status.code != Q27_DFLASH2_OK) return status;
 
   q27_dflash2_forward_args forward{};
   forward.struct_size = sizeof(forward);
@@ -700,7 +803,11 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
   forward.mlp_user_data = nullptr;
   forward.cublas_handle = engine->cublas;
   forward.cuda_stream = engine->stream;
+  status = RecordProfile(engine, kProfileDraftForward, true);
+  if (status.code != Q27_DFLASH2_OK) return status;
   status = q27_dflash2_forward(&forward);
+  if (status.code != Q27_DFLASH2_OK) return status;
+  status = RecordProfile(engine, kProfileDraftForward, false);
   if (status.code != Q27_DFLASH2_OK) return status;
 
   q27_dflash2_lm_head_topk_args topk{};
@@ -716,7 +823,11 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
   topk.unary_logits_f32 = engine->unary_logits;
   topk.cublas_handle = engine->cublas;
   topk.cuda_stream = engine->stream;
+  status = RecordProfile(engine, kProfileLmHeadTop16, true);
+  if (status.code != Q27_DFLASH2_OK) return status;
   status = q27_dflash2_lm_head_topk(&topk);
+  if (status.code != Q27_DFLASH2_OK) return status;
+  status = RecordProfile(engine, kProfileLmHeadTop16, false);
   if (status.code != Q27_DFLASH2_OK) return status;
 
   q27_dflash2_selector_projection_args selector_projection{};
@@ -728,6 +839,8 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
   selector_projection.token_count = Q27_DFLASH2_DRAFT_TOKENS;
   selector_projection.cublas_handle = engine->cublas;
   selector_projection.cuda_stream = engine->stream;
+  status = RecordProfile(engine, kProfileSelector, true);
+  if (status.code != Q27_DFLASH2_OK) return status;
   status = q27_dflash2_project_selector_hidden(&selector_projection);
   if (status.code != Q27_DFLASH2_OK) return status;
 
@@ -762,7 +875,11 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
                                 cudaMemcpyDeviceToDevice, engine->stream);
   if (cuda_status != cudaSuccess)
     return CudaError("join DFlash2 candidate block", cuda_status);
+  status = RecordProfile(engine, kProfileSelector, false);
+  if (status.code != Q27_DFLASH2_OK) return status;
 
+  status = RecordProfile(engine, kProfileProposalCopySync, true);
+  if (status.code != Q27_DFLASH2_OK) return status;
   cuda_status = cudaMemcpyAsync(
       engine->host_candidates_staging, engine->block_tokens,
       sizeof(engine->host_candidates_staging), cudaMemcpyDeviceToHost,
@@ -795,6 +912,8 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
       engine->stream);
   if (cuda_status != cudaSuccess)
     return CudaError("copy DFlash2 attention counter", cuda_status);
+  status = RecordProfile(engine, kProfileProposalCopySync, false);
+  if (status.code != Q27_DFLASH2_OK) return status;
   cuda_status = cudaStreamSynchronize(engine->stream);
   if (cuda_status != cudaSuccess)
     return CudaError("complete DFlash2 proposal", cuda_status);
@@ -803,6 +922,8 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
       engine->host_attention_invalid_staging != 0) {
     return Invalid("DFlash2 proposal failed a vocabulary or KV invariant");
   }
+  status = CollectDraftProfile(engine);
+  if (status.code != Q27_DFLASH2_OK) return status;
 
   q27_model_dflash2_verify_result verify{};
   verify.struct_size = sizeof(verify);
@@ -811,6 +932,28 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
       engine->target, engine->host_candidates_staging, &verify);
   if (model_status.code != Q27_MODEL_OK) {
     return ModelError("verify DFlash2 target block", model_status);
+  }
+  if (engine->profile_enabled) {
+    q27_model_dflash2_profile_stats target_profile{};
+    target_profile.struct_size = sizeof(target_profile);
+    target_profile.abi_version = Q27_MODEL_DFLASH2_PROFILE_ABI_VERSION;
+    model_status = q27_model_get_dflash2_profile_stats(
+        engine->target, &target_profile);
+    if (model_status.code != Q27_MODEL_OK)
+      return ModelError("query DFlash2 target profile", model_status);
+    if (target_profile.enabled == 0 || target_profile.valid == 0)
+      return Invalid("DFlash2 target profile was not published");
+    engine->profile.target_verify_total_us = target_profile.total_us;
+    engine->profile.target_snapshot_us = target_profile.snapshot_us;
+    engine->profile.target_speculative_pass_us =
+        target_profile.speculative_pass_us;
+    engine->profile.target_speculative_result_sync_us =
+        target_profile.speculative_result_sync_us;
+    engine->profile.target_rollback_us = target_profile.rollback_us;
+    engine->profile.target_committed_replay_us =
+        target_profile.committed_replay_us;
+    engine->profile.target_committed_result_sync_us =
+        target_profile.committed_result_sync_us;
   }
   status = MaterializeVerifiedFeatures(engine, verify);
   if (status.code != Q27_DFLASH2_OK) return status;
@@ -845,6 +988,36 @@ extern "C" q27_dflash2_status q27_dflash2_engine_decode_block(
   engine->accepted_drafts += verify.accept_length;
   engine->emitted_tokens += verify.commit_length;
   engine->last_block_us = elapsed_us;
+  engine->profile_valid = engine->profile_enabled;
+  engine->profile.valid = engine->profile_valid ? 1U : 0U;
+  if (engine->profile_enabled) {
+    std::fprintf(
+        stderr,
+        "q27_dflash2_profile_block block=%llu commit=%u accepted=%u "
+        "full_accept=%u\n",
+        static_cast<unsigned long long>(engine->verify_calls),
+        verify.commit_length, verify.accept_length,
+        verify.commit_length == Q27_DFLASH2_BLOCK_SIZE ? 1U : 0U);
+  }
+  if (engine->profile_enabled && engine->verify_calls == 1) {
+    std::fprintf(
+        stderr,
+        "q27_dflash2_profile_trace base_position=%u commit_length=%u "
+        "accepted_draft_tokens=%u candidates=%u,%u,%u,%u,%u,%u,%u,%u "
+        "target_top1=%u,%u,%u,%u,%u,%u,%u,%u\n",
+        verify.base_position, verify.commit_length, verify.accept_length,
+        engine->host_candidates_staging[0],
+        engine->host_candidates_staging[1],
+        engine->host_candidates_staging[2],
+        engine->host_candidates_staging[3],
+        engine->host_candidates_staging[4],
+        engine->host_candidates_staging[5],
+        engine->host_candidates_staging[6],
+        engine->host_candidates_staging[7], verify.target_top1[0],
+        verify.target_top1[1], verify.target_top1[2], verify.target_top1[3],
+        verify.target_top1[4], verify.target_top1[5], verify.target_top1[6],
+        verify.target_top1[7]);
+  }
   engine->position = verify.new_position;
   engine->next_anchor = verify.bonus_token;
   engine->ready = true;
@@ -888,6 +1061,21 @@ extern "C" q27_dflash2_status q27_dflash2_engine_get_stats(
   return Ok();
 }
 
+extern "C" q27_dflash2_status q27_dflash2_engine_get_profile_stats(
+    const q27_dflash2_engine* engine, q27_dflash2_profile_stats* output) {
+  if (engine == nullptr || output == nullptr ||
+      output->struct_size < sizeof(*output) ||
+      output->abi_version != Q27_DFLASH2_PROFILE_ABI_VERSION)
+    return Invalid("invalid DFlash2 profile stats arguments");
+  q27_dflash2_profile_stats profile = engine->profile;
+  profile.struct_size = sizeof(profile);
+  profile.abi_version = Q27_DFLASH2_PROFILE_ABI_VERSION;
+  profile.enabled = engine->profile_enabled ? 1U : 0U;
+  profile.valid = engine->profile_valid ? 1U : 0U;
+  *output = profile;
+  return Ok();
+}
+
 extern "C" q27_dflash2_status q27_dflash2_engine_destroy(
     q27_dflash2_engine* engine) {
   if (engine == nullptr) return Ok();
@@ -900,6 +1088,7 @@ extern "C" q27_dflash2_status q27_dflash2_engine_destroy(
   engine->state_arena = nullptr;
   cublasStatus_t cublas_status = cublasDestroy(engine->cublas);
   engine->cublas = nullptr;
+  DestroyProfileEvents(engine);
   cudaError_t destroy_stream_status = cudaStreamDestroy(engine->stream);
   engine->stream = nullptr;
   delete engine;

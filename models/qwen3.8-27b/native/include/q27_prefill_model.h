@@ -17,6 +17,9 @@ enum {
   Q27_PREFILL_MODEL_ATTENTION_LAYERS = 16,
   Q27_PREFILL_MODEL_TOKENS = 128,
   Q27_PREFILL_MODEL_M512_TOKENS = 512,
+  Q27_PREFILL_MODEL_M2048_TOKENS = 2048,
+  Q27_PREFILL_MODEL_M4096_TOKENS = 4096,
+  Q27_PREFILL_MODEL_M8192_TOKENS = 8192,
   Q27_PREFILL_MODEL_HIDDEN = 5120,
   Q27_PREFILL_MODEL_VOCAB = 248320,
   Q27_PREFILL_MODEL_GDN = 0,
@@ -175,14 +178,32 @@ q27_prefill_model_status q27_prefill_model_query(
  */
 q27_prefill_model_status q27_prefill_model_query_m512(
     const q27_prefill_model_config* config, q27_prefill_model_layout* output);
+q27_prefill_model_status q27_prefill_model_query_m2048(
+    const q27_prefill_model_config* config, q27_prefill_model_layout* output);
+q27_prefill_model_status q27_prefill_model_query_m4096(
+    const q27_prefill_model_config* config, q27_prefill_model_layout* output);
+q27_prefill_model_status q27_prefill_model_query_m8192(
+    const q27_prefill_model_config* config, q27_prefill_model_layout* output);
 q27_prefill_model_status q27_prefill_model_plan_create(
     const q27_prefill_model_config* config, q27_prefill_model_plan** output);
 q27_prefill_model_status q27_prefill_model_plan_create_m512(
+    const q27_prefill_model_config* config, q27_prefill_model_plan** output);
+q27_prefill_model_status q27_prefill_model_plan_create_m2048(
+    const q27_prefill_model_config* config, q27_prefill_model_plan** output);
+q27_prefill_model_status q27_prefill_model_plan_create_m4096(
+    const q27_prefill_model_config* config, q27_prefill_model_plan** output);
+q27_prefill_model_status q27_prefill_model_plan_create_m8192(
     const q27_prefill_model_config* config, q27_prefill_model_plan** output);
 void q27_prefill_model_plan_destroy(q27_prefill_model_plan* plan);
 q27_prefill_model_status q27_prefill_model_forward(
     q27_prefill_model_plan* plan, const q27_prefill_model_args* args);
 q27_prefill_model_status q27_prefill_model_forward_m512(
+    q27_prefill_model_plan* plan, const q27_prefill_model_args* args);
+q27_prefill_model_status q27_prefill_model_forward_m2048(
+    q27_prefill_model_plan* plan, const q27_prefill_model_args* args);
+q27_prefill_model_status q27_prefill_model_forward_m4096(
+    q27_prefill_model_plan* plan, const q27_prefill_model_args* args);
+q27_prefill_model_status q27_prefill_model_forward_m8192(
     q27_prefill_model_plan* plan, const q27_prefill_model_args* args);
 
 /* Device diagnostics inside a valid arena, readable after stream completion. */

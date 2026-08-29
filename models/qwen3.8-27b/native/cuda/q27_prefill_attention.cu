@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Fixed Qwen3.8 target M=128/M=512 paged-FP8 causal prefill attention.
+// Fixed Qwen3.8 target M=128/512/2048/8192 paged-FP8 causal prefill attention.
 
 #include "q27_prefill_attention.h"
 
@@ -78,10 +78,55 @@ constexpr AttentionLayout kM512Layout{
     432,
     Q27_PREFILL_ATTENTION_M512_METADATA_BYTES,
 };
+
+constexpr AttentionLayout kM2048Layout{
+    Q27_PREFILL_ATTENTION_M2048_TOKENS,
+    192,
+    Q27_PREFILL_ATTENTION_M2048_Q_GATE_BYTES,
+    Q27_PREFILL_ATTENTION_M2048_KV_INPUT_BYTES,
+    Q27_PREFILL_ATTENTION_M2048_QUERY_BYTES,
+    Q27_PREFILL_ATTENTION_M2048_METADATA_BYTES,
+    48,
+    816,
+    1584,
+    Q27_PREFILL_ATTENTION_M2048_METADATA_BYTES,
+};
+
+constexpr AttentionLayout kM4096Layout{
+    Q27_PREFILL_ATTENTION_M4096_TOKENS,
+    384,
+    Q27_PREFILL_ATTENTION_M4096_Q_GATE_BYTES,
+    Q27_PREFILL_ATTENTION_M4096_KV_INPUT_BYTES,
+    Q27_PREFILL_ATTENTION_M4096_QUERY_BYTES,
+    Q27_PREFILL_ATTENTION_M4096_METADATA_BYTES,
+    48,
+    1584,
+    3120,
+    Q27_PREFILL_ATTENTION_M4096_METADATA_BYTES,
+};
+
+constexpr AttentionLayout kM8192Layout{
+    Q27_PREFILL_ATTENTION_M8192_TOKENS,
+    768,
+    Q27_PREFILL_ATTENTION_M8192_Q_GATE_BYTES,
+    Q27_PREFILL_ATTENTION_M8192_KV_INPUT_BYTES,
+    Q27_PREFILL_ATTENTION_M8192_QUERY_BYTES,
+    Q27_PREFILL_ATTENTION_M8192_METADATA_BYTES,
+    48,
+    3120,
+    6192,
+    Q27_PREFILL_ATTENTION_M8192_METADATA_BYTES,
+};
 static_assert(144ULL + 12ULL * sizeof(int32_t) <=
               Q27_PREFILL_ATTENTION_METADATA_BYTES);
 static_assert(432ULL + 48ULL * sizeof(int32_t) <=
               Q27_PREFILL_ATTENTION_M512_METADATA_BYTES);
+static_assert(1584ULL + 192ULL * sizeof(int32_t) <=
+              Q27_PREFILL_ATTENTION_M2048_METADATA_BYTES);
+static_assert(3120ULL + 384ULL * sizeof(int32_t) <=
+              Q27_PREFILL_ATTENTION_M4096_METADATA_BYTES);
+static_assert(6192ULL + 768ULL * sizeof(int32_t) <=
+              Q27_PREFILL_ATTENTION_M8192_METADATA_BYTES);
 
 thread_local std::string g_error;
 
@@ -520,4 +565,19 @@ extern "C" q27_prefill_attention_status q27_prefill_attention(
 extern "C" q27_prefill_attention_status q27_prefill_attention_m512(
     const q27_prefill_attention_args* args) {
   return Run(args, kM512Layout);
+}
+
+extern "C" q27_prefill_attention_status q27_prefill_attention_m2048(
+    const q27_prefill_attention_args* args) {
+  return Run(args, kM2048Layout);
+}
+
+extern "C" q27_prefill_attention_status q27_prefill_attention_m4096(
+    const q27_prefill_attention_args* args) {
+  return Run(args, kM4096Layout);
+}
+
+extern "C" q27_prefill_attention_status q27_prefill_attention_m8192(
+    const q27_prefill_attention_args* args) {
+  return Run(args, kM8192Layout);
 }

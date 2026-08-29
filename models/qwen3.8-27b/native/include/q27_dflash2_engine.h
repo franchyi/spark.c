@@ -70,6 +70,28 @@ typedef struct q27_dflash2_engine_stats {
   uint32_t ready_to_decode;
 } q27_dflash2_engine_stats;
 
+#define Q27_DFLASH2_PROFILE_ABI_VERSION 1u
+
+/* Opt-in CUDA-event breakdown for the most recent successful verify block. */
+typedef struct q27_dflash2_profile_stats {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint64_t draft_prepare_embed_us;
+  uint64_t draft_forward_us;
+  uint64_t lm_head_top16_us;
+  uint64_t selector_us;
+  uint64_t proposal_copy_sync_us;
+  uint64_t target_verify_total_us;
+  uint64_t target_snapshot_us;
+  uint64_t target_speculative_pass_us;
+  uint64_t target_speculative_result_sync_us;
+  uint64_t target_rollback_us;
+  uint64_t target_committed_replay_us;
+  uint64_t target_committed_result_sync_us;
+  uint32_t enabled;
+  uint32_t valid;
+} q27_dflash2_profile_stats;
+
 q27_dflash2_status q27_dflash2_engine_create(
     const q27_dflash2_engine_create_args* args,
     q27_dflash2_engine** output);
@@ -93,6 +115,8 @@ q27_dflash2_status q27_dflash2_engine_decode_block(
 
 q27_dflash2_status q27_dflash2_engine_get_stats(
     const q27_dflash2_engine* engine, q27_dflash2_engine_stats* output);
+q27_dflash2_status q27_dflash2_engine_get_profile_stats(
+    const q27_dflash2_engine* engine, q27_dflash2_profile_stats* output);
 
 q27_dflash2_status q27_dflash2_engine_destroy(
     q27_dflash2_engine* engine);

@@ -44,8 +44,8 @@ typedef struct q27_prefill_mlp_layout {
  *     -> BF16 round(SiLU(gate) * up) [M,17408]
  *     -> ModelOpt NVFP4 down [M,5120]
  *
- * M is exactly 128 or 512. Gate/up weights and 128x4 scale matrices are the
- * load-time contiguous merge already required by the decode capsule. All
+ * M is exactly 128, 512, 2048, 4096, or 8192. Gate/up weights and 128x4 scale
+ * matrices are the load-time contiguous merge already required by the decode capsule. All
  * pointers and byte capacities are caller-owned CUDA-visible memory. The hot
  * call allocates and synchronizes nothing and has no M=1 fallback.
  */

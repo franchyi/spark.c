@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Fixed M=128/512 Qwen3.8-27B dense prefill MLP coordinator.
+// Fixed M=128/512/2048 Qwen3.8-27B dense prefill MLP coordinator.
 
 #include "q27_prefill_mlp.h"
 

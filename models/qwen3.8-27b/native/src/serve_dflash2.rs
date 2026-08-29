@@ -32,6 +32,7 @@ use std::time::Instant;
 use tokenizer::NativeQwenTokenizer;
 
 const DFLASH2_ENGINE_ABI_VERSION: u32 = 1;
+const DFLASH2_PROFILE_ABI_VERSION: u32 = 1;
 const DFLASH2_BLOCK_SIZE: usize = 8;
 const DFLASH2_DRAFT_TOKENS: u32 = 7;
 const DFLASH2_MAX_POSITION: u32 = 262_144;
@@ -139,6 +140,37 @@ impl DFlash2EngineStats {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DFlash2ProfileStats {
+    struct_size: u32,
+    abi_version: u32,
+    draft_prepare_embed_us: u64,
+    draft_forward_us: u64,
+    lm_head_top16_us: u64,
+    selector_us: u64,
+    proposal_copy_sync_us: u64,
+    target_verify_total_us: u64,
+    target_snapshot_us: u64,
+    target_speculative_pass_us: u64,
+    target_speculative_result_sync_us: u64,
+    target_rollback_us: u64,
+    target_committed_replay_us: u64,
+    target_committed_result_sync_us: u64,
+    enabled: u32,
+    valid: u32,
+}
+
+impl DFlash2ProfileStats {
+    fn empty() -> Self {
+        // SAFETY: this C aggregate contains only integer fields.
+        let mut stats: Self = unsafe { std::mem::zeroed() };
+        stats.struct_size = size_of::<Self>() as u32;
+        stats.abi_version = DFLASH2_PROFILE_ABI_VERSION;
+        stats
+    }
+}
+
 #[link(name = "q27-dflash2-engine")]
 unsafe extern "C" {
     fn q27_dflash2_engine_create(
@@ -159,6 +191,10 @@ unsafe extern "C" {
     fn q27_dflash2_engine_get_stats(
         engine: *const NativeDFlash2Engine,
         output: *mut DFlash2EngineStats,
+    ) -> DFlash2Status;
+    fn q27_dflash2_engine_get_profile_stats(
+        engine: *const NativeDFlash2Engine,
+        output: *mut DFlash2ProfileStats,
     ) -> DFlash2Status;
     fn q27_dflash2_engine_destroy(engine: *mut NativeDFlash2Engine) -> DFlash2Status;
 }
@@ -387,6 +423,8 @@ fn run_generation(engine: &EngineGuard, context_capacity: u32, command: EngineCo
     let prompt_tokens = request.prompt_token_ids.len();
     let max_new_tokens = request.max_new_tokens;
     let started = Instant::now();
+    let profile_requested =
+        env::var("Q27_DFLASH2_PROFILE").ok().as_deref() == Some("1");
     let result = drive_dflash2(
         request,
         context_capacity,
@@ -456,6 +494,36 @@ fn run_generation(engine: &EngineGuard, context_capacity: u32, command: EngineCo
                 "q27 DFlash2 request failed after {:.3}s: {error}",
                 started.elapsed().as_secs_f64()
             );
+        }
+    }
+
+    if profile_requested {
+        let mut profile = DFlash2ProfileStats::empty();
+        match native_status(unsafe {
+            q27_dflash2_engine_get_profile_stats(engine.0.as_ptr(), &mut profile)
+        }) {
+            Ok(()) if profile.enabled != 0 && profile.valid != 0 => {
+                eprintln!(
+                    "q27_dflash2_profile draft_prepare_embed_ms={:.3} draft_forward_ms={:.3} lm_head_top16_ms={:.3} selector_ms={:.3} proposal_copy_sync_ms={:.3} target_verify_total_ms={:.3} target_snapshot_ms={:.3} target_speculative_pass_ms={:.3} target_speculative_result_sync_ms={:.3} target_rollback_ms={:.3} target_committed_replay_ms={:.3} target_committed_result_sync_ms={:.3}",
+                    profile.draft_prepare_embed_us as f64 / 1_000.0,
+                    profile.draft_forward_us as f64 / 1_000.0,
+                    profile.lm_head_top16_us as f64 / 1_000.0,
+                    profile.selector_us as f64 / 1_000.0,
+                    profile.proposal_copy_sync_us as f64 / 1_000.0,
+                    profile.target_verify_total_us as f64 / 1_000.0,
+                    profile.target_snapshot_us as f64 / 1_000.0,
+                    profile.target_speculative_pass_us as f64 / 1_000.0,
+                    profile.target_speculative_result_sync_us as f64 / 1_000.0,
+                    profile.target_rollback_us as f64 / 1_000.0,
+                    profile.target_committed_replay_us as f64 / 1_000.0,
+                    profile.target_committed_result_sync_us as f64 / 1_000.0,
+                );
+            }
+            Ok(()) => eprintln!(
+                "q27_dflash2_profile enabled={} valid={}",
+                profile.enabled, profile.valid
+            ),
+            Err(error) => eprintln!("q27 DFlash2 profile stats failed: {error}"),
         }
     }
 

@@ -34,6 +34,15 @@ static_assert(Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES % 256 == 0);
 static_assert(Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES % 256 == 0);
 static_assert(Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES ==
               4ULL * Q27_PREFILL_ATTENTION_LAYER_SCRATCH_BYTES);
+static_assert(Q27_PREFILL_ATTENTION_LAYER_M2048_SCRATCH_BYTES % 256 == 0);
+static_assert(Q27_PREFILL_ATTENTION_LAYER_M2048_SCRATCH_BYTES ==
+              4ULL * Q27_PREFILL_ATTENTION_LAYER_M512_SCRATCH_BYTES);
+static_assert(Q27_PREFILL_ATTENTION_LAYER_M4096_SCRATCH_BYTES % 256 == 0);
+static_assert(Q27_PREFILL_ATTENTION_LAYER_M4096_SCRATCH_BYTES ==
+              2ULL * Q27_PREFILL_ATTENTION_LAYER_M2048_SCRATCH_BYTES);
+static_assert(Q27_PREFILL_ATTENTION_LAYER_M8192_SCRATCH_BYTES % 256 == 0);
+static_assert(Q27_PREFILL_ATTENTION_LAYER_M8192_SCRATCH_BYTES ==
+              2ULL * Q27_PREFILL_ATTENTION_LAYER_M4096_SCRATCH_BYTES);
 thread_local std::string g_error;
 
 struct LayerLayout {
@@ -85,6 +94,57 @@ constexpr LayerLayout kM512Layout{
     Q27_PREFILL_ATTENTION_LAYER_M512_PROJECTED_OFFSET,
     Q27_PREFILL_ATTENTION_LAYER_M512_QUANTIZED_OFFSET,
     Q27_PREFILL_ATTENTION_M512_METADATA_BYTES,
+};
+
+constexpr LayerLayout kM2048Layout{
+    Q27_PREFILL_CORE_M2048_TOKENS,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_HIDDEN_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_SCRATCH_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_NORMALIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_INPUT_RESIDUAL_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_Q_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_KEY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_VALUE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_QUERY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_CONTEXT_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_PROJECTED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M2048_QUANTIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_M2048_METADATA_BYTES,
+};
+
+constexpr LayerLayout kM4096Layout{
+    Q27_PREFILL_CORE_M4096_TOKENS,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_HIDDEN_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_SCRATCH_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_NORMALIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_INPUT_RESIDUAL_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_Q_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_KEY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_VALUE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_QUERY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_CONTEXT_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_PROJECTED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M4096_QUANTIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_M4096_METADATA_BYTES,
+};
+
+constexpr LayerLayout kM8192Layout{
+    Q27_PREFILL_CORE_M8192_TOKENS,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_HIDDEN_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_SCRATCH_BYTES,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_NORMALIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_INPUT_RESIDUAL_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_Q_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_KEY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_VALUE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_QUERY_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_GATE_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_CONTEXT_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_PROJECTED_OFFSET,
+    Q27_PREFILL_ATTENTION_LAYER_M8192_QUANTIZED_OFFSET,
+    Q27_PREFILL_ATTENTION_M8192_METADATA_BYTES,
 };
 
 q27_prefill_attention_layer_status Ok() {
@@ -385,6 +445,27 @@ q27_prefill_attention_layer_plan_create_m512(
   return CreatePlan(config, output, kM512Layout);
 }
 
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_plan_create_m2048(
+    const q27_prefill_attention_layer_plan_config* config,
+    q27_prefill_attention_layer_plan** output) {
+  return CreatePlan(config, output, kM2048Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_plan_create_m4096(
+    const q27_prefill_attention_layer_plan_config* config,
+    q27_prefill_attention_layer_plan** output) {
+  return CreatePlan(config, output, kM4096Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_plan_create_m8192(
+    const q27_prefill_attention_layer_plan_config* config,
+    q27_prefill_attention_layer_plan** output) {
+  return CreatePlan(config, output, kM8192Layout);
+}
+
 extern "C" void q27_prefill_attention_layer_plan_destroy(
     q27_prefill_attention_layer_plan* plan) {
   Destroy(plan);
@@ -402,6 +483,27 @@ q27_prefill_attention_layer_scratch_m512(
     void* scratch, uint64_t scratch_bytes,
     q27_prefill_attention_layer_scratch_view* output) {
   return Scratch(scratch, scratch_bytes, output, kM512Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_scratch_m2048(
+    void* scratch, uint64_t scratch_bytes,
+    q27_prefill_attention_layer_scratch_view* output) {
+  return Scratch(scratch, scratch_bytes, output, kM2048Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_scratch_m4096(
+    void* scratch, uint64_t scratch_bytes,
+    q27_prefill_attention_layer_scratch_view* output) {
+  return Scratch(scratch, scratch_bytes, output, kM4096Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_scratch_m8192(
+    void* scratch, uint64_t scratch_bytes,
+    q27_prefill_attention_layer_scratch_view* output) {
+  return Scratch(scratch, scratch_bytes, output, kM8192Layout);
 }
 
 extern "C" uint32_t* q27_prefill_attention_layer_invalid_page_count(
@@ -440,7 +542,13 @@ q27_prefill_attention_layer_status Forward(
   const q27_prefill_core_status norm_status =
       layout.tokens == Q27_PREFILL_CORE_TOKENS
           ? q27_prefill_norm(&input_norm)
-          : q27_prefill_norm_m512(&input_norm);
+          : layout.tokens == Q27_PREFILL_CORE_M512_TOKENS
+                ? q27_prefill_norm_m512(&input_norm)
+                : layout.tokens == Q27_PREFILL_CORE_M2048_TOKENS
+                      ? q27_prefill_norm_m2048(&input_norm)
+                      : layout.tokens == Q27_PREFILL_CORE_M4096_TOKENS
+                            ? q27_prefill_norm_m4096(&input_norm)
+                            : q27_prefill_norm_m8192(&input_norm);
   if (norm_status.code != Q27_PREFILL_CORE_OK) {
     return Error(Q27_PREFILL_ATTENTION_LAYER_KERNEL_ERROR,
                  "Q27 target input norm", norm_status.message);
@@ -515,7 +623,13 @@ q27_prefill_attention_layer_status Forward(
   const q27_prefill_attention_status attention_status =
       layout.tokens == Q27_PREFILL_CORE_TOKENS
           ? q27_prefill_attention(&attention)
-          : q27_prefill_attention_m512(&attention);
+          : layout.tokens == Q27_PREFILL_CORE_M512_TOKENS
+                ? q27_prefill_attention_m512(&attention)
+                : layout.tokens == Q27_PREFILL_CORE_M2048_TOKENS
+                      ? q27_prefill_attention_m2048(&attention)
+                      : layout.tokens == Q27_PREFILL_CORE_M4096_TOKENS
+                            ? q27_prefill_attention_m4096(&attention)
+                            : q27_prefill_attention_m8192(&attention);
   if (attention_status.code != Q27_PREFILL_ATTENTION_OK) {
     return Error(Q27_PREFILL_ATTENTION_LAYER_KERNEL_ERROR,
                  "Q27 target prefill attention", attention_status.message);
@@ -547,7 +661,13 @@ q27_prefill_attention_layer_status Forward(
   const q27_prefill_core_status post_status =
       layout.tokens == Q27_PREFILL_CORE_TOKENS
           ? q27_prefill_norm(&post_norm)
-          : q27_prefill_norm_m512(&post_norm);
+          : layout.tokens == Q27_PREFILL_CORE_M512_TOKENS
+                ? q27_prefill_norm_m512(&post_norm)
+                : layout.tokens == Q27_PREFILL_CORE_M2048_TOKENS
+                      ? q27_prefill_norm_m2048(&post_norm)
+                      : layout.tokens == Q27_PREFILL_CORE_M4096_TOKENS
+                            ? q27_prefill_norm_m4096(&post_norm)
+                            : q27_prefill_norm_m8192(&post_norm);
   return post_status.code == Q27_PREFILL_CORE_OK
              ? Ok()
              : Error(Q27_PREFILL_ATTENTION_LAYER_KERNEL_ERROR,
@@ -569,4 +689,25 @@ q27_prefill_attention_layer_forward_m512(
     q27_prefill_attention_layer_plan* plan,
     const q27_prefill_attention_layer_args* args) {
   return Forward(plan, args, kM512Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_forward_m2048(
+    q27_prefill_attention_layer_plan* plan,
+    const q27_prefill_attention_layer_args* args) {
+  return Forward(plan, args, kM2048Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_forward_m4096(
+    q27_prefill_attention_layer_plan* plan,
+    const q27_prefill_attention_layer_args* args) {
+  return Forward(plan, args, kM4096Layout);
+}
+
+extern "C" q27_prefill_attention_layer_status
+q27_prefill_attention_layer_forward_m8192(
+    q27_prefill_attention_layer_plan* plan,
+    const q27_prefill_attention_layer_args* args) {
+  return Forward(plan, args, kM8192Layout);
 }

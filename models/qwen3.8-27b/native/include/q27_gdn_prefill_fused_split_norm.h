@@ -35,17 +35,20 @@ typedef struct q27_gdn_fused_split_norm_status {
 /*
  * Fixed-M128 projection-boundary fusion for the Qwen3.8-27B GDN layer.
  *
- * fused_qkvz is the BF16 [128,16384] output of the model's fused QKVZ
- * projection. The first 10240 features enter the donor-exact width-4 causal
- * convolution; features 10240..16383 are the raw Z gate. Outputs are:
+ * fused_qkvz is a BF16 [source_rows,16384] output of the model's fused QKVZ
+ * projection. source_row selects one physical M128 slice without first
+ * materializing a private copy. The first 10240 features enter the donor-exact
+ * width-4 causal convolution; features 10240..16383 are the raw Z gate.
+ * Outputs are:
  *
  *   q_normalized [128,16,128] BF16
  *   k_normalized [128,16,128] BF16
  *   value        [128,48,128] BF16, after causal convolution
  *   projected_z  [128,48,128] BF16, copied before convolution
  *
- * Q/K L2 normalization occurs after causal convolution, with epsilon 1e-6
- * and the same 128-thread reduction tree as the pinned c427 donor path.
+ * Q/K L2 normalization occurs after causal convolution, with epsilon 1e-6.
+ * This compatibility fallback uses a 128-thread reduction tree and can differ
+ * from the pinned c427 Triton reduction by 1--2 BF16 ULP.
  * Convolution products round to BF16 before FP32 accumulation. Rows at or
  * above valid_tokens produce zero Q/K/V and cannot update state; Z remains a
  * byte-exact split of the projection buffer, matching the current unfused
@@ -57,7 +60,7 @@ typedef struct q27_gdn_fused_split_norm_args {
   uint32_t struct_size;
   uint32_t abi_version;
   uint32_t valid_tokens;
-  uint32_t reserved;
+  uint32_t source_row;
   const void* fused_qkvz_bf16;
   uint64_t fused_qkvz_bytes;
   const void* conv_weight_bf16;
