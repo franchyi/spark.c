@@ -115,8 +115,10 @@ __global__ __launch_bounds__(kNormThreads) void GatedRmsNorm(
     const float z = __bfloat162float(gate[begin + column]);
     const float normalized = values[item] * inverse_rms *
                              __bfloat162float(weight[column]);
-    output[begin + column] = __float2bfloat16_rn(
-        normalized * (1.0F / (1.0F + expf(-z))));
+    // Qwen3.8's configured GDN output gate is SiLU, not sigmoid.  SGLang's
+    // FusedRMSNormGated normalizes first, then multiplies by z*sigmoid(z).
+    const float silu_z = z * (1.0F / (1.0F + expf(-z)));
+    output[begin + column] = __float2bfloat16_rn(normalized * silu_z);
   }
 }
 

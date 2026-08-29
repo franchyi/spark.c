@@ -7,7 +7,8 @@ checkpoint=${SPARK_ENGINE_MODEL:?set SPARK_ENGINE_MODEL to the Qwen3.8-27B snaps
 sidecar=${SPARK_ENGINE_SIDECAR:?set SPARK_ENGINE_SIDECAR to q27-scales-v1.bin}
 token=${SPARK_ENGINE_TOKEN:-248045}
 capacity=${SPARK_ENGINE_CONTEXT_CAPACITY:-1}
+steps=${SPARK_ENGINE_STEPS:-1}
 
 export LD_LIBRARY_PATH="$repo_root/build/q27:${LD_LIBRARY_PATH:-}"
 exec "$repo_root/build/bin/q27-eager" \
-  "$checkpoint" "$sidecar" "$token" "$capacity"
+  "$checkpoint" "$sidecar" "$token" "$capacity" "$steps"

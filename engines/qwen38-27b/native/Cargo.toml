@@ -21,5 +21,9 @@ path = "src/scale_pack.rs"
 name = "q27-inspect-scales"
 path = "src/scale_inspect.rs"
 
+[[bin]]
+name = "q27-eager"
+path = "src/eager.rs"
+
 [dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

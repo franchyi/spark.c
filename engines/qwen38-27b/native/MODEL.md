@@ -45,18 +45,38 @@ file-page copy, not an additional device allocation.
 Direct execution from that device alias is fixture-exact, but it is not the
 shipping decode layout: the real layer-0 FP8 QKV projection measured 338.799
 microseconds (154.75 GB/s) from registered file pages versus 216.246
-microseconds (242.45 GB/s) from CUDA-resident storage. Model load therefore
-uses the mapping as the source for a one-time resident arena/scale preparation,
-then unregisters it and advises the source pages away. Steady state still keeps
-one RAM copy while avoiding the measured 36% decode penalty.
+microseconds (242.45 GB/s) from CUDA-resident storage. The first eager MVP uses
+the mapping as the source for three aligned resident arenas: all 192 packed MLP
+matrices, all 208 FP8 matrices, and the BF16 LM head. They total
+18,313,379,840 bytes (17.056 GiB). This is required because the checkpoint has
+8-byte-aligned matrix bases while CUTLASS TMA and the fixed FP8 `float4` loads
+require 16-byte alignment; cuBLAS also rejects the mapped LM-head base.
+
+The MVP intentionally keeps the source mappings alive for embeddings, norms,
+small BF16 GDN weights, scales, and scalar metadata, so the promoted 17.056 GiB
+is temporarily duplicated. Releasing/unregistering the source pages after a
+complete resident plan, followed by `fadvise`, is the next load-time memory
+optimization; it is not yet implemented.
 
 The decode GDN capsule reuses the pinned FlashInfer SM121 recurrence object and
-keeps its causal convolution and gated RMSNorm as fixed q27 CUDA kernels. The
-real-checkpoint fixture is byte-exact at all five oracle boundaries and takes
-40.781 microseconds per layer excluding projections.
-The two small BF16 A/B projections are likewise byte-exact against the real
-layer-0 SGLang result and take 40.169 microseconds together through one
-caller-owned cuBLAS handle.
+keeps its causal convolution and SiLU-gated RMSNorm as fixed q27 CUDA kernels.
+Its five-boundary fixture is a FlashInfer decode self-oracle, not the SGLang
+Triton initial-token path. Against the actual pinned SGLang oracle, layer-0
+QKV/A/B, causal-convolution output/state, and the ModelOpt-requantized Z
+projection are byte-exact. The final gated-norm result has cosine 0.999994 and
+maximum BF16 error 0.015625; the output projection has cosine 0.999997 and
+maximum error 0.0078125. The two small BF16 A/B projections take 40.169
+microseconds together through one caller-owned cuBLAS handle.
+
+The first end-to-end Spark acceptance input, token 248045, produces greedy
+token 8678 and the same ordered top-5 token IDs as SGLang:
+`8678, 846, 1156, 1785, 2244`. Full-logit cosine is 0.999481 (maximum absolute
+error 0.584895); the remaining drift is the pinned FlashInfer-decode versus
+Triton-prefill recurrence rounding accumulated over 64 layers. An eight-step
+eager run measures 0.1072 seconds per warm step (9.33 token/s), with 17.056 GiB
+resident promoted weights, 75.062 MiB state at context capacity eight, and
+129.344 MiB scratch. This is a correctness baseline, not the graph-captured
+performance target.
 
 `q27-pack-scales` converts all 192 checkpoint E4M3 scale matrices into the
 CUTLASS 128x4 order once. Its revision-bound sidecar also stores each
