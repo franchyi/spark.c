@@ -42,6 +42,14 @@ the strict safetensors offsets. CUDA registration makes those file-backed pages
 resident (22.22 GiB maximum RSS in the measured startup), so this is one
 file-page copy, not an additional device allocation.
 
+Direct execution from that device alias is fixture-exact, but it is not the
+shipping decode layout: the real layer-0 FP8 QKV projection measured 338.799
+microseconds (154.75 GB/s) from registered file pages versus 216.246
+microseconds (242.45 GB/s) from CUDA-resident storage. Model load therefore
+uses the mapping as the source for a one-time resident arena/scale preparation,
+then unregisters it and advises the source pages away. Steady state still keeps
+one RAM copy while avoiding the measured 36% decode penalty.
+
 The decode GDN capsule reuses the pinned FlashInfer SM121 recurrence object and
 keeps its causal convolution and gated RMSNorm as fixed q27 CUDA kernels. The
 real-checkpoint fixture is byte-exact at all five oracle boundaries and takes
