@@ -84,6 +84,16 @@ step (9.66 token/s), with
 eight, and 129.344 MiB scratch. This is a correctness baseline, not the
 graph-captured performance target.
 
+The additive `q27_model_consume_token` ABI advances the same fixed 64-layer
+body and all recurrent/KV state for non-final prompt tokens, but skips final
+norm, LM head, logits, and argmax. The final prompt token still takes the full
+greedy path, so generation semantics are unchanged. On Spark, an eight-token
+teacher-forced trace fell from 903.959 ms to 752.213 ms (16.787%); its final
+token remained 2528 and all 248,320 FP32 logits were bit-exact. A 53-token
+OpenAI prompt plus one completion completed in 5.136 seconds. The native ABI
+rejects stale diagnostic-logit reads after reset or consume, and the service
+bounds the sole-slot command and SSE event queues to one buffered item each.
+
 The opt-in `Q27_PROFILE_STAGES=1` CUDA-event path profiles only the first warm
 token and is disabled by default. On Spark it measured 105.010 ms wall time
 and 104.300 ms of staged GPU work: MLP 50.651 ms, GDN blocks 29.660 ms,

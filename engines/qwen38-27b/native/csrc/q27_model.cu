@@ -159,6 +159,10 @@ __global__ void RequantizeFp8(__nv_fp8_e4m3* values, uint64_t elements,
   values[index] = __nv_fp8_e4m3(static_cast<float>(values[index]) * ratio);
 }
 
+__global__ void SetSequenceLength(uint32_t* destination, uint32_t value) {
+  destination[0] = value;
+}
+
 }  // namespace
 
 struct q27_model {
@@ -170,6 +174,7 @@ struct q27_model {
   uint64_t scratch_bytes = 0;
   uint64_t resident_weight_bytes = 0;
   uint64_t last_decode_us = 0;
+  bool logits_valid = false;
 
   cudaStream_t stream = nullptr;
   cublasHandle_t cublas = nullptr;
@@ -921,6 +926,80 @@ q27_model_status MlpLayer(q27_model* model, uint32_t layer) {
              : Kernel("q27 MLP block: ", status.message);
 }
 
+q27_model_status RunLayers(q27_model* model, uint32_t token,
+                           StageProfiler& profiler) {
+  const uint32_t sequence_length = model->position + 1;
+  SetSequenceLength<<<1, 1, 0, model->stream>>>(
+      model->attention_sequence_length, sequence_length);
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) return Cuda("q27 sequence length write: ", error);
+
+  q27_embedding_args embedding = {};
+  embedding.struct_size = sizeof(embedding);
+  embedding.abi_version = Q27_KERNEL_ABI_VERSION;
+  embedding.token = token;
+  embedding.vocabulary = kVocabulary;
+  embedding.hidden_size = kHidden;
+  embedding.weight_bf16 = model->weights.embedding_bf16;
+  embedding.output_bf16 = model->hidden;
+  embedding.cuda_stream = model->stream;
+  size_t profile_span = profiler.Start("embedding");
+  q27_kernel_status kernel = q27_embedding(&embedding);
+  profiler.Stop(profile_span);
+  if (kernel.code != Q27_KERNEL_OK)
+    return Kernel("q27 embedding: ", kernel.message);
+  q27_model_status status = DumpBoundary(
+      model, UINT32_MAX, "embedding", model->hidden, kHiddenBytes);
+  if (status.code != Q27_MODEL_OK) return status;
+
+  for (uint32_t layer = 0; layer < Q27_MODEL_LAYERS; ++layer) {
+    profile_span = profiler.Start("norm");
+    status = Norm(model, model->hidden, layer == 0 ? nullptr : model->residual,
+                  model->layers[layer].input_norm_bf16, model->normalized,
+                  model->residual, layer != 0);
+    profiler.Stop(profile_span);
+    if (status.code != Q27_MODEL_OK) return status;
+    status = DumpBoundary(model, layer, "input_norm", model->normalized,
+                          kHiddenBytes);
+    if (status.code != Q27_MODEL_OK) return status;
+    status = DumpBoundary(model, layer, "input_residual", model->residual,
+                          kHiddenBytes);
+    if (status.code != Q27_MODEL_OK) return status;
+    profile_span = profiler.Start(IsAttention(layer) ? "attention" : "gdn");
+    status = IsAttention(layer) ? AttentionLayer(model, layer)
+                                : GdnLayer(model, layer);
+    profiler.Stop(profile_span);
+    if (status.code != Q27_MODEL_OK) return status;
+    if (!IsAttention(layer)) {
+      status = DumpGdnInternals(model, layer);
+      if (status.code != Q27_MODEL_OK) return status;
+    }
+    status = DumpBoundary(model, layer, "sublayer_output", model->hidden,
+                          kHiddenBytes);
+    if (status.code != Q27_MODEL_OK) return status;
+    profile_span = profiler.Start("norm");
+    status = Norm(model, model->hidden, model->residual,
+                  model->layers[layer].post_attention_norm_bf16,
+                  model->normalized, model->residual, true);
+    profiler.Stop(profile_span);
+    if (status.code != Q27_MODEL_OK) return status;
+    status = DumpBoundary(model, layer, "post_norm", model->normalized,
+                          kHiddenBytes);
+    if (status.code != Q27_MODEL_OK) return status;
+    status = DumpBoundary(model, layer, "post_residual", model->residual,
+                          kHiddenBytes);
+    if (status.code != Q27_MODEL_OK) return status;
+    profile_span = profiler.Start("mlp");
+    status = MlpLayer(model, layer);
+    profiler.Stop(profile_span);
+    if (status.code != Q27_MODEL_OK) return status;
+    status = DumpBoundary(model, layer, "mlp_output", model->hidden,
+                          kHiddenBytes);
+    if (status.code != Q27_MODEL_OK) return status;
+  }
+  return Ok();
+}
+
 }  // namespace
 
 extern "C" q27_model_status q27_model_create(
@@ -987,6 +1066,7 @@ extern "C" q27_model_status q27_model_reset(q27_model* model) {
   if (model == nullptr) return Invalid("q27 model is required");
   model->position = 0;
   model->last_decode_us = 0;
+  model->logits_valid = false;
   cudaError_t error = cudaMemsetAsync(
       model->gdn_convolution_state, 0,
       model->gdn_conv_stride * Q27_MODEL_GDN_LAYERS, model->stream);
@@ -1005,6 +1085,20 @@ extern "C" q27_model_status q27_model_reset(q27_model* model) {
   return error == cudaSuccess ? Ok() : Cuda("q27 value cache reset: ", error);
 }
 
+extern "C" q27_model_status q27_model_consume_token(q27_model* model,
+                                                       uint32_t token) {
+  if (model == nullptr || token >= kVocabulary)
+    return Invalid("invalid q27 consume token arguments");
+  if (model->position >= model->capacity)
+    return Invalid("q27 context capacity exhausted");
+  StageProfiler profiler(model->stream, false);
+  model->logits_valid = false;
+  q27_model_status status = RunLayers(model, token, profiler);
+  if (status.code != Q27_MODEL_OK) return status;
+  ++model->position;
+  return Ok();
+}
+
 extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
                                                        uint32_t token,
                                                        uint32_t* output_token) {
@@ -1016,75 +1110,12 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   StageProfiler profiler(
       model->stream,
       model->position == 1 && std::getenv("Q27_PROFILE_STAGES") != nullptr);
-  const uint32_t sequence_length = model->position + 1;
-  cudaError_t error = cudaMemcpyAsync(
-      model->attention_sequence_length, &sequence_length,
-      sizeof(sequence_length), cudaMemcpyHostToDevice, model->stream);
-  if (error != cudaSuccess) return Cuda("q27 sequence length copy: ", error);
-
-  q27_embedding_args embedding = {};
-  embedding.struct_size = sizeof(embedding);
-  embedding.abi_version = Q27_KERNEL_ABI_VERSION;
-  embedding.token = token;
-  embedding.vocabulary = kVocabulary;
-  embedding.hidden_size = kHidden;
-  embedding.weight_bf16 = model->weights.embedding_bf16;
-  embedding.output_bf16 = model->hidden;
-  embedding.cuda_stream = model->stream;
-  size_t profile_span = profiler.Start("embedding");
-  q27_kernel_status kernel = q27_embedding(&embedding);
-  profiler.Stop(profile_span);
-  if (kernel.code != Q27_KERNEL_OK)
-    return Kernel("q27 embedding: ", kernel.message);
-  q27_model_status status = DumpBoundary(
-      model, UINT32_MAX, "embedding", model->hidden, kHiddenBytes);
+  model->logits_valid = false;
+  q27_model_status status = RunLayers(model, token, profiler);
   if (status.code != Q27_MODEL_OK) return status;
-
-  for (uint32_t layer = 0; layer < Q27_MODEL_LAYERS; ++layer) {
-    profile_span = profiler.Start("norm");
-    status = Norm(model, model->hidden, layer == 0 ? nullptr : model->residual,
-                  model->layers[layer].input_norm_bf16, model->normalized,
-                  model->residual, layer != 0);
-    profiler.Stop(profile_span);
-    if (status.code != Q27_MODEL_OK) return status;
-    status = DumpBoundary(model, layer, "input_norm", model->normalized,
-                          kHiddenBytes);
-    if (status.code != Q27_MODEL_OK) return status;
-    status = DumpBoundary(model, layer, "input_residual", model->residual,
-                          kHiddenBytes);
-    if (status.code != Q27_MODEL_OK) return status;
-    profile_span = profiler.Start(IsAttention(layer) ? "attention" : "gdn");
-    status = IsAttention(layer) ? AttentionLayer(model, layer)
-                                : GdnLayer(model, layer);
-    profiler.Stop(profile_span);
-    if (status.code != Q27_MODEL_OK) return status;
-    if (!IsAttention(layer)) {
-      status = DumpGdnInternals(model, layer);
-      if (status.code != Q27_MODEL_OK) return status;
-    }
-    status = DumpBoundary(model, layer, "sublayer_output", model->hidden,
-                          kHiddenBytes);
-    if (status.code != Q27_MODEL_OK) return status;
-    profile_span = profiler.Start("norm");
-    status = Norm(model, model->hidden, model->residual,
-                  model->layers[layer].post_attention_norm_bf16,
-                  model->normalized, model->residual, true);
-    profiler.Stop(profile_span);
-    if (status.code != Q27_MODEL_OK) return status;
-    status = DumpBoundary(model, layer, "post_norm", model->normalized,
-                          kHiddenBytes);
-    if (status.code != Q27_MODEL_OK) return status;
-    status = DumpBoundary(model, layer, "post_residual", model->residual,
-                          kHiddenBytes);
-    if (status.code != Q27_MODEL_OK) return status;
-    profile_span = profiler.Start("mlp");
-    status = MlpLayer(model, layer);
-    profiler.Stop(profile_span);
-    if (status.code != Q27_MODEL_OK) return status;
-    status = DumpBoundary(model, layer, "mlp_output", model->hidden,
-                          kHiddenBytes);
-    if (status.code != Q27_MODEL_OK) return status;
-  }
+  size_t profile_span = 0;
+  q27_kernel_status kernel = {};
+  cudaError_t error = cudaSuccess;
 
   profile_span = profiler.Start("norm");
   status = Norm(model, model->hidden, model->residual,
@@ -1142,6 +1173,7 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   *output_token = static_cast<uint32_t>(result);
   ++model->position;
   model->last_decode_us = elapsed_us;
+  model->logits_valid = true;
   return Ok();
 }
 
@@ -1164,7 +1196,7 @@ extern "C" q27_model_status q27_model_copy_logits(const q27_model* model,
                                                      float* host_logits,
                                                      uint32_t elements) {
   if (model == nullptr || host_logits == nullptr || elements != kVocabulary ||
-      model->position == 0)
+      !model->logits_valid)
     return Invalid("invalid q27 diagnostic logits copy");
   const cudaError_t error = cudaMemcpy(host_logits, model->logits,
                                        static_cast<uint64_t>(elements) *

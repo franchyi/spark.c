@@ -1,9 +1,9 @@
 //! Model-specific OpenAI service for the native Qwen3.8-27B capsule.
 //!
 //! This process owns exactly one long-lived native model and one serialized
-//! generation queue. Prompt prefill is the native decode-only MVP: after a
-//! reset, each prompt token is fed in order and the final prompt step produces
-//! the first completion token. There is no Python or framework runtime.
+//! generation queue. Prompt prefill advances recurrent/KV state without an LM
+//! head for every non-final prompt token; the final prompt step produces the
+//! first completion token. There is no Python or framework runtime.
 
 mod checkpoint;
 mod mapping;
@@ -62,6 +62,7 @@ unsafe extern "C" {
         output: *mut *mut NativeModel,
     ) -> ModelStatus;
     fn q27_model_reset(model: *mut NativeModel) -> ModelStatus;
+    fn q27_model_consume_token(model: *mut NativeModel, token: u32) -> ModelStatus;
     fn q27_model_decode_greedy(
         model: *mut NativeModel,
         token: u32,
@@ -103,13 +104,14 @@ enum EngineEvent {
 
 struct EngineCommand {
     request: GenerationRequest,
-    events: mpsc::Sender<EngineEvent>,
+    events: mpsc::SyncSender<EngineEvent>,
 }
 
 /// Clone-free backend handle shared by the small HTTP worker threads. CUDA,
 /// mmaps, recurrent state, and KV cache never leave the single owner thread.
 struct Q27Backend {
     model_id: String,
+    context_capacity: u32,
     commands: mpsc::SyncSender<EngineCommand>,
 }
 
@@ -174,7 +176,11 @@ impl Q27Backend {
             .recv()
             .map_err(|_| GenerationError::new("q27 owner exited during initialization"))?
             .map_err(GenerationError::new)?;
-        Ok(Self { model_id, commands })
+        Ok(Self {
+            model_id,
+            context_capacity,
+            commands,
+        })
     }
 }
 
@@ -183,12 +189,42 @@ impl TokenGenerator for Q27Backend {
         &self.model_id
     }
 
+    fn default_temperature(&self) -> f32 {
+        0.0
+    }
+
+    fn max_in_flight_requests(&self) -> usize {
+        2
+    }
+
+    fn validate_generation(&self, request: &GenerationRequest) -> Result<(), GenerationError> {
+        if request.temperature != 0.0 || request.top_p != 1.0 {
+            return Err(GenerationError::new(
+                "q27 native service requires temperature=0 and top_p=1",
+            ));
+        }
+        let required = request
+            .prompt_token_ids
+            .len()
+            .checked_add(request.max_new_tokens as usize)
+            .ok_or_else(|| GenerationError::new("q27 context length overflow"))?;
+        if required > self.context_capacity as usize {
+            return Err(GenerationError::new(format!(
+                "q27 request requires {required} tokens but this service slot has capacity {}",
+                self.context_capacity
+            )));
+        }
+        Ok(())
+    }
+
     fn generate(
         &self,
         request: GenerationRequest,
         emit: &mut dyn FnMut(u32) -> Result<(), GenerationError>,
     ) -> Result<FinishReason, GenerationError> {
-        let (events, receiver) = mpsc::channel();
+        // Bound generated-token buffering so a slow/disconnected HTTP client
+        // cannot make the single-slot engine accumulate an unbounded queue.
+        let (events, receiver) = mpsc::sync_channel(1);
         self.commands
             .send(EngineCommand { request, events })
             .map_err(|_| GenerationError::new("q27 owner is unavailable"))?;
@@ -216,6 +252,10 @@ fn run_generation(model: &ModelGuard, context_capacity: u32, command: EngineComm
         || {
             // SAFETY: all calls are serialized on the model's owner thread.
             native_status(unsafe { q27_model_reset(model.0.as_ptr()) })
+        },
+        |token| {
+            // SAFETY: all calls are serialized on the model's owner thread.
+            native_status(unsafe { q27_model_consume_token(model.0.as_ptr(), token) })
         },
         |token| {
             let mut output = 0_u32;
@@ -252,6 +292,7 @@ fn drive_greedy(
     request: GenerationRequest,
     context_capacity: u32,
     mut reset: impl FnMut() -> Result<(), String>,
+    mut consume: impl FnMut(u32) -> Result<(), String>,
     mut decode: impl FnMut(u32) -> Result<u32, String>,
     mut emit: impl FnMut(u32) -> Result<(), String>,
 ) -> Result<FinishReason, String> {
@@ -273,10 +314,14 @@ fn drive_greedy(
     }
 
     reset()?;
-    let mut candidate = 0_u32;
-    for token in request.prompt_token_ids {
-        candidate = decode(token)?;
+    let (final_prompt, prompt_prefix) = request
+        .prompt_token_ids
+        .split_last()
+        .expect("empty prompt was rejected above");
+    for &token in prompt_prefix {
+        consume(token)?;
     }
+    let mut candidate = decode(*final_prompt)?;
     for generated in 0..request.max_new_tokens {
         if request.stop_token_ids.contains(&candidate) {
             return Ok(FinishReason::Stop);
@@ -363,6 +408,7 @@ mod tests {
 
     #[test]
     fn sequential_prefill_returns_final_prompt_prediction_first() {
+        let mut consumed_inputs = Vec::new();
         let mut decoded_inputs = Vec::new();
         let mut emitted = Vec::new();
         let mut resets = 0;
@@ -371,6 +417,10 @@ mod tests {
             8,
             || {
                 resets += 1;
+                Ok(())
+            },
+            |token| {
+                consumed_inputs.push(token);
                 Ok(())
             },
             |token| {
@@ -384,7 +434,8 @@ mod tests {
         )
         .expect("greedy sequence");
         assert_eq!(resets, 1);
-        assert_eq!(decoded_inputs, [10, 20, 21, 22]);
+        assert_eq!(consumed_inputs, [10]);
+        assert_eq!(decoded_inputs, [20, 21, 22]);
         assert_eq!(emitted, [21, 22, 23]);
         assert_eq!(finish, FinishReason::Length);
     }
@@ -396,6 +447,7 @@ mod tests {
             request(&[10, 20], 3, &[21]),
             8,
             || Ok(()),
+            |_| Ok(()),
             |token| Ok(token + 1),
             |token| {
                 emitted.push(token);
@@ -411,18 +463,85 @@ mod tests {
     fn rejects_sampling_and_slot_overflow_before_reset() {
         let mut sampling = request(&[1], 1, &[]);
         sampling.temperature = 0.5;
-        let error = drive_greedy(sampling, 2, || panic!("must not reset"), |_| Ok(2), |_| Ok(()))
-            .expect_err("sampling rejection");
+        let error = drive_greedy(
+            sampling,
+            2,
+            || panic!("must not reset"),
+            |_| panic!("must not consume"),
+            |_| Ok(2),
+            |_| Ok(()),
+        )
+        .expect_err("sampling rejection");
         assert!(error.contains("temperature=0"));
 
         let error = drive_greedy(
             request(&[1, 2], 2, &[]),
             3,
             || panic!("must not reset"),
+            |_| panic!("must not consume"),
             |_| Ok(2),
             |_| Ok(()),
         )
         .expect_err("capacity rejection");
         assert!(error.contains("requires 4 tokens"));
+    }
+
+    #[test]
+    fn backend_validation_rejects_unsupported_work_before_admission() {
+        let (commands, _receiver) = mpsc::sync_channel(1);
+        let backend = Q27Backend {
+            model_id: "q27-test".to_owned(),
+            context_capacity: 3,
+            commands,
+        };
+        let mut sampling = request(&[1], 1, &[]);
+        sampling.top_p = 0.9;
+        assert!(
+            backend
+                .validate_generation(&sampling)
+                .expect_err("sampling rejection")
+                .to_string()
+                .contains("top_p=1")
+        );
+        assert!(
+            backend
+                .validate_generation(&request(&[1, 2], 2, &[]))
+                .expect_err("capacity rejection")
+                .to_string()
+                .contains("requires 4 tokens")
+        );
+        backend
+            .validate_generation(&request(&[1, 2], 1, &[]))
+            .expect("request at capacity");
+    }
+
+    #[test]
+    fn consume_failure_stops_before_final_prompt_decode() {
+        let mut decoded = false;
+        let mut emitted = false;
+        let error = drive_greedy(
+            request(&[10, 20, 30], 1, &[]),
+            8,
+            || Ok(()),
+            |token| {
+                if token == 20 {
+                    Err("consume failed".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                decoded = true;
+                Ok(31)
+            },
+            |_| {
+                emitted = true;
+                Ok(())
+            },
+        )
+        .expect_err("consume failure");
+        assert_eq!(error, "consume failed");
+        assert!(!decoded);
+        assert!(!emitted);
     }
 }
