@@ -159,15 +159,9 @@ def _validate_top5(step: dict[str, Any], logits: array, label: str) -> None:
     )
     actual_max = max(logits)
     _require(recorded_values[0] == actual_max, f"{label} recorded top1 is not the logit maximum")
-
-    # Torch may choose either token at an exactly tied cutoff.  Require every
-    # strictly-better token and permit any member of the boundary tie.
-    cutoff = heapq.nlargest(TOP_K, logits)[-1]
-    strictly_better = {index for index, value in enumerate(logits) if value > cutoff}
     _require(
-        strictly_better.issubset(set(token_ids))
-        and all(value >= cutoff for value in recorded_values),
-        f"{label} top5 omits a token above its cutoff",
+        token_ids == _top_indices(logits, TOP_K),
+        f"{label} top5 differs from deterministic value/token-id ordering",
     )
 
 
