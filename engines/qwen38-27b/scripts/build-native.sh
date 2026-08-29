@@ -10,6 +10,7 @@ user_id=$(id -u)
 group_id=$(id -g)
 
 mkdir -p "$repo_root/build/bin" "$target_host" "$cargo_home"
+make -C "$repo_root/engines/qwen38-27b/native" kernels
 docker run --rm --network host --user "$user_id:$group_id" \
   -v "$repo_root:/work" -w /work \
   -v "$target_host:/cargo-target" \
