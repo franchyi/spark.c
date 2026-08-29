@@ -95,11 +95,15 @@ rejects stale diagnostic-logit reads after reset or consume, and the service
 bounds the sole-slot command and SSE event queues to one buffered item each.
 
 Real-ChatML promotion capture is explicitly opt-in. Setting
-`SPARK_ENGINE_TOKEN_TRACE_PATH` makes the single GPU-owner thread append and
-flush one `sparkserve.q27.token-trace.v1` JSONL record per completed request,
-containing only exact prompt token IDs, emitted generated token IDs, and the
-finish reason. With the variable unset, no trace file is opened and no prompt
-or generated IDs are retained; user text is never written by this hook.
+`SPARK_ENGINE_TOKEN_TRACE_PATH` makes the single GPU-owner thread create a new
+Unix-mode-0600 file and write one `sparkserve.q27.token-trace.v1` JSONL record
+per completed model generation. Each record has a monotonic sequence ID, exact
+prompt and emitted generated token IDs, finish reason, and any suppressed
+terminal stop token. Token IDs can reconstruct user content and the trace must
+therefore be handled as sensitive data; it does not prove final HTTP delivery.
+The service refuses an existing/shared path and disables further writes after
+any write failure, 1,024 records, or 64 MiB. With the variable unset, no trace
+file is opened and no prompt or generated IDs are retained.
 
 The opt-in `Q27_PROFILE_STAGES=1` CUDA-event path profiles only the first warm
 token and is disabled by default. On Spark it measured 105.010 ms wall time

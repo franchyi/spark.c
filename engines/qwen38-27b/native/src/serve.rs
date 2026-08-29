@@ -26,7 +26,8 @@ use std::env;
 use std::error::Error;
 use std::ffi::{CStr, c_char};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::{Arc, mpsc};
@@ -38,6 +39,8 @@ const DEFAULT_BIND: &str = "0.0.0.0:30000";
 const DEFAULT_MODEL_ID: &str = "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead";
 const DEFAULT_CONTEXT_CAPACITY: u32 = 4096;
 const TOKEN_TRACE_PATH_ENV: &str = "SPARK_ENGINE_TOKEN_TRACE_PATH";
+const TOKEN_TRACE_MAX_RECORDS: u64 = 1024;
+const TOKEN_TRACE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[repr(C)]
 struct ModelStatus {
@@ -114,24 +117,41 @@ struct EngineCommand {
 #[derive(Serialize)]
 struct TokenTraceRecord<'a> {
     schema: &'static str,
+    record_id: u64,
     prompt_token_ids: &'a [u32],
     generated_token_ids: &'a [u32],
     finish_reason: &'static str,
+    terminal_stop_token_id: Option<u32>,
 }
 
 struct TokenTrace {
-    output: BufWriter<File>,
+    output: File,
+    records_written: u64,
+    bytes_written: u64,
+    max_records: u64,
+    max_bytes: u64,
+    disabled: bool,
 }
 
 impl TokenTrace {
     fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_limits(path, TOKEN_TRACE_MAX_RECORDS, TOKEN_TRACE_MAX_BYTES)
+    }
+
+    fn open_with_limits(path: &Path, max_records: u64, max_bytes: u64) -> Result<Self, String> {
         let output = OpenOptions::new()
-            .create(true)
-            .append(true)
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
             .open(path)
             .map_err(|error| format!("cannot open q27 token trace {}: {error}", path.display()))?;
         Ok(Self {
-            output: BufWriter::new(output),
+            output,
+            records_written: 0,
+            bytes_written: 0,
+            max_records,
+            max_bytes,
+            disabled: false,
         })
     }
 
@@ -139,32 +159,79 @@ impl TokenTrace {
         &mut self,
         prompt_token_ids: &[u32],
         generated_token_ids: &[u32],
-        finish_reason: FinishReason,
+        outcome: GreedyOutcome,
     ) -> Result<(), String> {
-        let line = format_token_trace(prompt_token_ids, generated_token_ids, finish_reason)
+        if self.disabled {
+            return Err("q27 token trace is disabled after an earlier failure".to_owned());
+        }
+        if self.records_written >= self.max_records {
+            self.disabled = true;
+            return Err(format!(
+                "q27 token trace reached its {}-record limit",
+                self.max_records
+            ));
+        }
+        let line = format_token_trace(
+            self.records_written,
+            prompt_token_ids,
+            generated_token_ids,
+            outcome,
+        )
             .map_err(|error| format!("cannot encode q27 token trace: {error}"))?;
-        self.output
-            .write_all(line.as_bytes())
-            .and_then(|()| self.output.write_all(b"\n"))
-            .and_then(|()| self.output.flush())
-            .map_err(|error| format!("cannot write q27 token trace: {error}"))
+        let mut record = line.into_bytes();
+        record.push(b'\n');
+        let record_bytes = record.len() as u64;
+        let Some(total_bytes) = self.bytes_written.checked_add(record_bytes) else {
+            self.disabled = true;
+            return Err("q27 token trace byte count overflow".to_owned());
+        };
+        if total_bytes > self.max_bytes {
+            self.disabled = true;
+            return Err(format!(
+                "q27 token trace reached its {}-byte limit",
+                self.max_bytes
+            ));
+        }
+        if let Err(error) = self
+            .output
+            .write_all(&record)
+            .and_then(|()| self.output.sync_data())
+        {
+            // A failed write may have left a partial final line. Never append
+            // another record after that point, so later JSON cannot be folded
+            // into the damaged line and mistaken for a valid request.
+            self.disabled = true;
+            return Err(format!("cannot write q27 token trace: {error}"));
+        }
+        self.bytes_written = total_bytes;
+        self.records_written += 1;
+        Ok(())
     }
 }
 
 fn format_token_trace(
+    record_id: u64,
     prompt_token_ids: &[u32],
     generated_token_ids: &[u32],
-    finish_reason: FinishReason,
+    outcome: GreedyOutcome,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string(&TokenTraceRecord {
         schema: "sparkserve.q27.token-trace.v1",
+        record_id,
         prompt_token_ids,
         generated_token_ids,
-        finish_reason: match finish_reason {
+        finish_reason: match outcome.finish_reason {
             FinishReason::Stop => "stop",
             FinishReason::Length => "length",
         },
+        terminal_stop_token_id: outcome.terminal_stop_token_id,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GreedyOutcome {
+    finish_reason: FinishReason,
+    terminal_stop_token_id: Option<u32>,
 }
 
 /// Clone-free backend handle shared by the small HTTP worker threads. CUDA,
@@ -330,10 +397,10 @@ fn run_generation(
     let EngineCommand { request, events } = command;
     let prompt_tokens = request.prompt_token_ids.len();
     let max_new_tokens = request.max_new_tokens;
-    let prompt_token_ids = token_trace
+    let trace_enabled = token_trace
         .as_ref()
-        .map(|_| request.prompt_token_ids.clone());
-    let trace_enabled = token_trace.is_some();
+        .is_some_and(|trace| !trace.disabled);
+    let prompt_token_ids = trace_enabled.then(|| request.prompt_token_ids.clone());
     let mut generated_token_ids = Vec::new();
     let started = Instant::now();
     let result = drive_greedy(
@@ -365,16 +432,22 @@ fn run_generation(
         },
     );
     match result {
-        Ok(reason) => {
+        Ok(outcome) => {
+            // This record means native model generation completed. It does
+            // not claim that the HTTP client received the final response.
             if let (Some(trace), Some(prompt_token_ids)) =
                 (token_trace.as_mut(), prompt_token_ids.as_deref())
             {
-                if let Err(error) =
-                    trace.write_completed(prompt_token_ids, &generated_token_ids, reason)
+                if let Err(error) = trace.write_completed(
+                    prompt_token_ids,
+                    &generated_token_ids,
+                    outcome,
+                )
                 {
                     eprintln!("q27 token trace failed: {error}");
                 }
             }
+            let reason = outcome.finish_reason;
             eprintln!(
                 "q27 request prompt_tokens={prompt_tokens} max_new_tokens={max_new_tokens} elapsed_seconds={:.3} finish={reason:?}",
                 started.elapsed().as_secs_f64(),
@@ -397,7 +470,7 @@ fn drive_greedy(
     mut consume: impl FnMut(u32) -> Result<(), String>,
     mut decode: impl FnMut(u32) -> Result<u32, String>,
     mut emit: impl FnMut(u32) -> Result<(), String>,
-) -> Result<FinishReason, String> {
+) -> Result<GreedyOutcome, String> {
     if request.prompt_token_ids.is_empty() {
         return Err("q27 prompt cannot be empty".to_owned());
     }
@@ -426,15 +499,24 @@ fn drive_greedy(
     let mut candidate = decode(*final_prompt)?;
     for generated in 0..request.max_new_tokens {
         if request.stop_token_ids.contains(&candidate) {
-            return Ok(FinishReason::Stop);
+            return Ok(GreedyOutcome {
+                finish_reason: FinishReason::Stop,
+                terminal_stop_token_id: Some(candidate),
+            });
         }
         emit(candidate)?;
         if generated + 1 == request.max_new_tokens {
-            return Ok(FinishReason::Length);
+            return Ok(GreedyOutcome {
+                finish_reason: FinishReason::Length,
+                terminal_stop_token_id: None,
+            });
         }
         candidate = decode(candidate)?;
     }
-    Ok(FinishReason::Length)
+    Ok(GreedyOutcome {
+        finish_reason: FinishReason::Length,
+        terminal_stop_token_id: None,
+    })
 }
 
 fn usage(program: &Path) -> String {
@@ -500,6 +582,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TRACE_PATH: AtomicU64 = AtomicU64::new(0);
+
+    fn trace_path(label: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "sparkserve-q27-{label}-{}-{}.jsonl",
+            std::process::id(),
+            NEXT_TRACE_PATH.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
 
     fn request(prompt: &[u32], maximum: u32, stops: &[u32]) -> GenerationRequest {
         GenerationRequest {
@@ -543,7 +638,8 @@ mod tests {
         assert_eq!(consumed_inputs, [10]);
         assert_eq!(decoded_inputs, [20, 21, 22]);
         assert_eq!(emitted, [21, 22, 23]);
-        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(finish.finish_reason, FinishReason::Length);
+        assert_eq!(finish.terminal_stop_token_id, None);
     }
 
     #[test]
@@ -562,7 +658,13 @@ mod tests {
         )
         .expect("stop");
         assert!(emitted.is_empty());
-        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(
+            finish,
+            GreedyOutcome {
+                finish_reason: FinishReason::Stop,
+                terminal_stop_token_id: Some(21),
+            }
+        );
     }
 
     #[test]
@@ -654,16 +756,103 @@ mod tests {
     #[test]
     fn token_trace_is_one_stable_jsonl_record_without_prompt_text() {
         let line = format_token_trace(
+            7,
             &[248_045, 9707, 151_644],
             &[8678, 198],
-            FinishReason::Length,
+            GreedyOutcome {
+                finish_reason: FinishReason::Length,
+                terminal_stop_token_id: None,
+            },
         )
         .expect("token trace");
         assert_eq!(
             line,
-            r#"{"schema":"sparkserve.q27.token-trace.v1","prompt_token_ids":[248045,9707,151644],"generated_token_ids":[8678,198],"finish_reason":"length"}"#
+            r#"{"schema":"sparkserve.q27.token-trace.v1","record_id":7,"prompt_token_ids":[248045,9707,151644],"generated_token_ids":[8678,198],"finish_reason":"length","terminal_stop_token_id":null}"#
         );
         assert!(!line.contains("content"));
         assert!(!line.contains('\n'));
+
+        let stopped = format_token_trace(
+            8,
+            &[248_045],
+            &[],
+            GreedyOutcome {
+                finish_reason: FinishReason::Stop,
+                terminal_stop_token_id: Some(248_046),
+            },
+        )
+        .expect("stop trace");
+        assert_eq!(
+            stopped,
+            r#"{"schema":"sparkserve.q27.token-trace.v1","record_id":8,"prompt_token_ids":[248045],"generated_token_ids":[],"finish_reason":"stop","terminal_stop_token_id":248046}"#
+        );
+    }
+
+    #[test]
+    fn token_trace_is_private_refuses_existing_and_stops_at_record_limit() {
+        let path = trace_path("private");
+        let mut trace = TokenTrace::open_with_limits(&path, 2, 4096).expect("private trace");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("trace metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(TokenTrace::open(&path).is_err());
+
+        let outcome = GreedyOutcome {
+            finish_reason: FinishReason::Length,
+            terminal_stop_token_id: None,
+        };
+        trace
+            .write_completed(&[1, 2], &[3], outcome)
+            .expect("first record");
+        trace
+            .write_completed(
+                &[4],
+                &[],
+                GreedyOutcome {
+                    finish_reason: FinishReason::Stop,
+                    terminal_stop_token_id: Some(248_046),
+                },
+            )
+            .expect("second record");
+        assert!(trace.write_completed(&[5], &[6], outcome).is_err());
+        assert!(trace.disabled);
+        let payload = fs::read_to_string(&path).expect("trace payload");
+        let records = payload
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSONL record"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["record_id"], 0);
+        assert_eq!(records[1]["record_id"], 1);
+        assert_eq!(records[0]["terminal_stop_token_id"], serde_json::Value::Null);
+        assert_eq!(records[1]["terminal_stop_token_id"], 248_046);
+        drop(trace);
+        fs::remove_file(path).expect("remove trace");
+    }
+
+    #[test]
+    fn token_trace_stops_before_exceeding_byte_limit() {
+        let path = trace_path("bytes");
+        let mut trace = TokenTrace::open_with_limits(&path, 10, 1).expect("bounded trace");
+        let error = trace
+            .write_completed(
+                &[1],
+                &[2],
+                GreedyOutcome {
+                    finish_reason: FinishReason::Length,
+                    terminal_stop_token_id: None,
+                },
+            )
+            .expect_err("byte limit");
+        assert!(error.contains("1-byte limit"));
+        assert!(trace.disabled);
+        assert_eq!(fs::metadata(&path).expect("trace metadata").len(), 0);
+        drop(trace);
+        fs::remove_file(path).expect("remove trace");
     }
 }
