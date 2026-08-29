@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::tokenizer::{
-    ChatMessage, ChatRole, ChatTemplateOptions, NativeQwenTokenizer, QWEN_IM_END_ID,
-    QWEN_MODEL_MAX_LENGTH, ReasoningEffort, TokenizerError,
+    ChatMessage, ChatRole, ChatTemplateOptions, NativeQwenTokenizer, QWEN_END_OF_TEXT_ID,
+    QWEN_IM_END_ID, QWEN_MODEL_MAX_LENGTH, ReasoningEffort, TokenizerError,
 };
 
 const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
@@ -76,6 +76,14 @@ impl std::error::Error for GenerationError {}
 pub trait TokenGenerator: Send + Sync + 'static {
     fn model_id(&self) -> &str;
 
+    /// Sampling default used only when the wire request omits `temperature`.
+    /// Stochastic backends keep the OpenAI-compatible default; greedy-only
+    /// capsules override this with zero instead of rejecting an ordinary
+    /// request after admission.
+    fn default_temperature(&self) -> f32 {
+        1.0
+    }
+
     fn generate(
         &self,
         request: GenerationRequest,
@@ -118,7 +126,8 @@ impl OpenAiTokenizer for NativeQwenTokenizer {
     }
 
     fn stop_token_ids(&self) -> Vec<u32> {
-        vec![QWEN_IM_END_ID]
+        // The pinned Qwen generation_config.json declares both tokens as EOS.
+        vec![QWEN_IM_END_ID, QWEN_END_OF_TEXT_ID]
     }
 }
 
@@ -306,7 +315,9 @@ impl<T: OpenAiTokenizer, B: TokenGenerator> OpenAiServer<T, B> {
                 Some("max_tokens"),
             ));
         }
-        let temperature = request.temperature.unwrap_or(1.0);
+        let temperature = request
+            .temperature
+            .unwrap_or_else(|| self.backend.default_temperature());
         if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
             return Err(ApiError::invalid(
                 "temperature must be finite and between 0 and 2",
@@ -1423,6 +1434,26 @@ mod tests {
         }
     }
 
+    struct GreedyDefaultBackend;
+
+    impl TokenGenerator for GreedyDefaultBackend {
+        fn model_id(&self) -> &str {
+            "qwen3.8-27b-native"
+        }
+
+        fn default_temperature(&self) -> f32 {
+            0.0
+        }
+
+        fn generate(
+            &self,
+            _request: GenerationRequest,
+            _emit: &mut dyn FnMut(u32) -> Result<(), GenerationError>,
+        ) -> Result<FinishReason, GenerationError> {
+            unreachable!("prepare-only test backend")
+        }
+    }
+
     fn tokenizer() -> Arc<NativeQwenTokenizer> {
         let model = WordLevel::builder()
             .vocab(
@@ -1440,6 +1471,43 @@ mod tests {
         let mut tokenizer = Tokenizer::new(model);
         tokenizer.with_pre_tokenizer(Some(Whitespace));
         Arc::new(NativeQwenTokenizer::from_inner(tokenizer))
+    }
+
+    #[test]
+    fn qwen_stop_ids_match_pinned_generation_config() {
+        assert_eq!(
+            OpenAiTokenizer::stop_token_ids(tokenizer().as_ref()),
+            [QWEN_IM_END_ID, QWEN_END_OF_TEXT_ID]
+        );
+    }
+
+    #[test]
+    fn backend_temperature_default_applies_only_when_wire_value_is_absent() {
+        let service = OpenAiServer::new(tokenizer(), Arc::new(GreedyDefaultBackend));
+        let omitted: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "qwen3.8-27b-native",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "chat_template_kwargs": {"enable_thinking": false}
+        }))
+        .expect("request without temperature");
+        assert_eq!(
+            service.prepare(omitted).expect("prepared").generation.temperature,
+            0.0
+        );
+
+        let explicit: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "qwen3.8-27b-native",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "temperature": 0.25,
+            "chat_template_kwargs": {"enable_thinking": false}
+        }))
+        .expect("request with temperature");
+        assert_eq!(
+            service.prepare(explicit).expect("prepared").generation.temperature,
+            0.25
+        );
     }
 
     #[test]
