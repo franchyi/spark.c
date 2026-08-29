@@ -45,15 +45,18 @@ MLP_SHARED := $(BUILD_DIR)/libq27-mlp.so
 ATTENTION_SHARED := $(BUILD_DIR)/libq27-attention.so
 GDN_BLOCK_SHARED := $(BUILD_DIR)/libq27-gdn-block.so
 MODEL_SHARED := $(BUILD_DIR)/libq27-model.so
+LM_HEAD_BF16_SHARED := $(BUILD_DIR)/libq27-lm-head-bf16.so
 CAPSULE_SHARED := $(KERNEL_SHARED) $(MAPPING_SHARED) $(GDN_SHARED) \
 	$(NVFP4_SHARED) $(MLP_SHARED) $(ATTENTION_SHARED) $(GDN_BLOCK_SHARED) \
-	$(MODEL_SHARED)
+	$(LM_HEAD_BF16_SHARED) $(MODEL_SHARED)
 
 FP8_FIXTURE_TEST := $(BUILD_DIR)/q27-fp8-fixture-test
 CORE_FIXTURE_TEST := $(BUILD_DIR)/q27-core-fixture-test
+LM_HEAD_BENCH := $(BUILD_DIR)/q27-lm-head-bench
 
 .PHONY: all capsule-shared kernels mapping gdn nvfp4 mlp attention \
-	gdn-block model verify-aot verify-linkage test-core test-fp8 clean
+	gdn-block model lm-head-bf16 lm-head-bench verify-aot verify-linkage \
+	test-core test-fp8 clean
 
 all: capsule-shared
 
@@ -67,6 +70,8 @@ mlp: $(MLP_SHARED)
 attention: $(ATTENTION_SHARED)
 gdn-block: $(GDN_BLOCK_SHARED)
 model: $(MODEL_SHARED)
+lm-head-bf16: $(LM_HEAD_BF16_SHARED)
+lm-head-bench: $(LM_HEAD_BENCH)
 verify-aot: $(AOT_STAMP)
 
 verify-linkage: capsule-shared
@@ -152,12 +157,27 @@ $(GDN_BLOCK_SHARED): csrc/q27_gdn_block.cc include/q27_gdn_block.h \
 		-L$(BUILD_DIR) -lq27-gdn -lq27-kernels $(ORIGIN_RPATH) -o $@
 
 $(MODEL_SHARED): csrc/q27_model.cu include/q27_model.h $(KERNEL_SHARED) \
-		$(GDN_BLOCK_SHARED) $(MLP_SHARED) $(ATTENTION_SHARED) | $(BUILD_DIR)
+		$(GDN_BLOCK_SHARED) $(MLP_SHARED) $(ATTENTION_SHARED) \
+		$(LM_HEAD_BF16_SHARED) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
 		-Xlinker=-soname -Xlinker=$(notdir $@) csrc/q27_model.cu \
 		-L$(BUILD_DIR) -lq27-gdn-block -lq27-gdn -lq27-mlp \
-		-lq27-nvfp4 -lq27-attention -lq27-kernels -lcublas \
+		-lq27-nvfp4 -lq27-attention -lq27-lm-head-bf16 -lq27-kernels \
+		-lcublas \
 		$(ORIGIN_RPATH) -o $@
+
+$(LM_HEAD_BF16_SHARED): csrc/q27_lm_head_bf16.cu \
+		include/q27_lm_head_bf16.h include/q27_kernels.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) \
+		csrc/q27_lm_head_bf16.cu -o $@
+
+$(LM_HEAD_BENCH): fixtures/q27_lm_head_bench.cu \
+		include/q27_lm_head_bf16.h include/q27_mapping.h include/q27_kernels.h \
+		$(LM_HEAD_BF16_SHARED) $(KERNEL_SHARED) $(MAPPING_SHARED) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) fixtures/q27_lm_head_bench.cu \
+		-L$(BUILD_DIR) -lq27-lm-head-bf16 -lq27-kernels -lq27-mapping \
+		-lcublas $(ORIGIN_RPATH) -o $@
 
 $(FP8_FIXTURE_TEST): fixtures/q27_fp8_fixture_test.cu \
 		include/q27_kernels.h $(KERNEL_SHARED) | $(BUILD_DIR)

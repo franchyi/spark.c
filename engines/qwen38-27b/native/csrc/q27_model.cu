@@ -6,6 +6,7 @@
 #include "q27_gdn.h"
 #include "q27_gdn_block.h"
 #include "q27_kernels.h"
+#include "q27_lm_head_bf16.h"
 #include "q27_mlp.h"
 
 #include <cublas_v2.h>
@@ -1000,9 +1001,9 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   lm_head.logits_f32 = model->logits;
   lm_head.cublas_handle = model->cublas;
   lm_head.cuda_stream = model->stream;
-  kernel = q27_lm_head(&lm_head);
+  kernel = q27_lm_head_bf16_stream(&lm_head);
   if (kernel.code != Q27_KERNEL_OK)
-    return Kernel("q27 LM head: ", kernel.message);
+    return Kernel("q27 streaming LM head: ", kernel.message);
 
   q27_argmax_args argmax = {};
   argmax.struct_size = sizeof(argmax);

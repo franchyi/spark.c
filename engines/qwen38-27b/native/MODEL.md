@@ -78,7 +78,8 @@ raw greedy tokens match SGLang exactly:
 `system\n# Tools\n\nYou have access`. The eight complete SGLang hidden/logit
 traces are retained on the acceptance Spark at
 `/home/chaoyi/.cache/sparkserve-q27-greedy-oracle/run-20260829-8token-v1`.
-That eager run measures 0.1072 seconds per warm step (9.33 token/s), with
+With the streaming LM head, that eager run measures 0.1035 seconds per warm
+step (9.66 token/s), with
 17.056 GiB resident promoted weights, 75.062 MiB state at context capacity
 eight, and 129.344 MiB scratch. This is a correctness baseline, not the
 graph-captured performance target.
@@ -98,6 +99,13 @@ BF16 output, and CUDA graph replay. With gate/up sharing one quantization, the
 measured dense MLP cost is approximately 0.749 milliseconds per layer (20.9
 token/s MLP-only across 64 layers).
 
+The resident BF16 LM head uses the model-specific streaming GEMV adapted from
+the pinned MIT-licensed ds4 CUDA path. On the exact SGLang final hidden it takes
+10.815 milliseconds versus 15.236 milliseconds for cuBLAS GemmEx (1.409x),
+preserves the complete top-ten set, and has `9.53674316e-06` maximum raw FP32
+logit drift. The isolated fixture keeps cuBLAS as the numerical reference; the
+shipping model calls only the allocation-free streaming path.
+
 ## Lightweight dependency rule
 
 The serving process may depend on CUDA, cuBLAS/cuBLASLt, and the tiny TVM-FFI C
@@ -114,7 +122,7 @@ byte totals before native code maps any payload.
 
 `scripts/build-q27-capsule.sh` accepts only the digest-pinned SM121 CUDA image,
 verifies the pinned FlashInfer/CUTLASS checkout, exports and hashes the three
-model-specific AOT objects, and builds the eight native shared libraries in
+model-specific AOT objects, and builds the nine native shared libraries in
 `build/q27`. The build container uses Python/Torch only to export the fixed GDN
 and activation-quantizer objects. The resulting serving linkage is CUDA,
 cuBLAS, system libraries, the model-local `libq27-*.so` set, and the copied
