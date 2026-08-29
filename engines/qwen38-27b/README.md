@@ -29,6 +29,8 @@ default because it is the simpler acceptance baseline.
 ```bash
 make build       # build the native q27 tools
 SPARK_ENGINE_MODEL=/path/to/snapshot make inspect
+SPARK_ENGINE_MODEL=/path/to/snapshot \
+  SPARK_ENGINE_SIDECAR=/path/to/q27-scales-v1.bin make eager
 make oracle-serve # explicit parity oracle only
 make oracle-smoke
 make oracle-bench

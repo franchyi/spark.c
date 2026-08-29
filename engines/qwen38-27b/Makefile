@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: build inspect test-fp8 serve smoke bench stop provenance fetch-oracle \
+.PHONY: build inspect eager test-fp8 serve smoke bench stop provenance fetch-oracle \
 	oracle-serve oracle-smoke oracle-bench oracle-stop
 
 build:
@@ -8,6 +8,9 @@ build:
 
 inspect:
 	@./scripts/inspect-native.sh
+
+eager:
+	@./scripts/run-eager.sh
 
 test-fp8:
 	@$(MAKE) -C native test-fp8

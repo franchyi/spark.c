@@ -84,3 +84,14 @@ registries, and framework schedulers are forbidden from the shipping process.
 `q27-inspect` validates the revision, graph, quantization target sets, all 1,858
 text/MTP tensor names, shapes and dtypes, three safetensors headers, and exact
 byte totals before native code maps any payload.
+
+## Reproducible Spark build
+
+`scripts/build-q27-capsule.sh` accepts only the digest-pinned SM121 CUDA image,
+verifies the pinned FlashInfer/CUTLASS checkout, exports and hashes the three
+model-specific AOT objects, and builds the eight native shared libraries in
+`build/q27`. The build container uses Python/Torch only to export the fixed GDN
+and activation-quantizer objects. The resulting serving linkage is CUDA,
+cuBLAS, system libraries, the model-local `libq27-*.so` set, and the copied
+`libtvm_ffi.so`; it contains no Python, Torch, SGLang, vLLM, or JIT dependency.
+`build/q27/manifest.sha256` records the exact resulting shared-library bytes.

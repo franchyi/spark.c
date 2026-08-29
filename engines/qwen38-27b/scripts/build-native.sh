@@ -10,19 +10,20 @@ user_id=$(id -u)
 group_id=$(id -g)
 
 mkdir -p "$repo_root/build/bin" "$target_host" "$cargo_home"
-make -C "$repo_root/engines/qwen38-27b/native" kernels mapping
+"$repo_root/scripts/build-q27-capsule.sh"
 docker run --rm --network host --user "$user_id:$group_id" \
   -v "$repo_root:/work" -w /work \
   -v /usr/local/cuda:/usr/local/cuda:ro \
   -v "$target_host:/cargo-target" \
   -v "$cargo_home:/cargo-home" \
-  -e HOME=/tmp/sparkserve-q27-home \
   -e CARGO_HOME=/cargo-home \
   -e CARGO_TARGET_DIR=/cargo-target \
+  -e 'RUSTFLAGS=-L native=/work/build/q27 -C link-arg=-Wl,-rpath,$ORIGIN/../q27 -C link-arg=-Wl,-rpath-link,/work/build/q27 -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
   "$rust_image" \
-  cargo build --release -p sparkserve-q27 --bin q27-inspect --bin q27-map-inspect --bin q27-pack-scales --bin q27-inspect-scales
+  cargo build --release -p sparkserve-q27 --bin q27-inspect --bin q27-map-inspect --bin q27-pack-scales --bin q27-inspect-scales --bin q27-eager
 cp "$target_host/release/q27-inspect" "$repo_root/build/bin/q27-inspect"
 cp "$target_host/release/q27-map-inspect" "$repo_root/build/bin/q27-map-inspect"
 cp "$target_host/release/q27-pack-scales" "$repo_root/build/bin/q27-pack-scales"
 cp "$target_host/release/q27-inspect-scales" "$repo_root/build/bin/q27-inspect-scales"
-echo "q27 checkpoint inspectors ready in $repo_root/build/bin"
+cp "$target_host/release/q27-eager" "$repo_root/build/bin/q27-eager"
+echo "q27 native tools ready in $repo_root/build/bin"
