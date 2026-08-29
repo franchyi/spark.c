@@ -112,7 +112,7 @@ typedef struct q27_model_stats {
 
 typedef struct q27_model q27_model;
 
-/* One model, one slot, decode-only MVP. No allocation occurs in decode. */
+/* One model, one slot. No allocation occurs in prefill or decode. */
 q27_model_status q27_model_create(const q27_model_weights* weights,
                                   const q27_model_options* options,
                                   q27_model** output);
@@ -123,6 +123,15 @@ q27_model_status q27_model_reset(q27_model* model);
  * reported by the next synchronizing call (normally decode_greedy).
  */
 q27_model_status q27_model_consume_token(q27_model* model, uint32_t token);
+/*
+ * Reset and prefill one host sequence in physical M=128 tiles.
+ * Only one 128-token host tile is copied at a time. Intermediate tiles skip
+ * the LM head; the final tile returns the first greedy completion token.
+ */
+q27_model_status q27_model_prefill_greedy(q27_model* model,
+                                          const uint32_t* host_tokens,
+                                          uint32_t count,
+                                          uint32_t* output_token);
 q27_model_status q27_model_decode_greedy(q27_model* model, uint32_t token,
                                          uint32_t* output_token);
 /* Diagnostic-only post-step copy; the decode hot path never performs it. */

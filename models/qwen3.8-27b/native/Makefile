@@ -46,21 +46,42 @@ ATTENTION_SHARED := $(BUILD_DIR)/libq27-attention.so
 GDN_BLOCK_SHARED := $(BUILD_DIR)/libq27-gdn-block.so
 MODEL_SHARED := $(BUILD_DIR)/libq27-model.so
 LM_HEAD_BF16_SHARED := $(BUILD_DIR)/libq27-lm-head-bf16.so
+PREFILL_CORE_SHARED := $(BUILD_DIR)/libq27-prefill-core.so
+PREFILL_FP8_SHARED := $(BUILD_DIR)/libq27-prefill-fp8.so
+PREFILL_NVFP4_SHARED := $(BUILD_DIR)/libq27-prefill-nvfp4.so
+PREFILL_MLP_SHARED := $(BUILD_DIR)/libq27-prefill-mlp.so
+PREFILL_ATTENTION_SHARED := $(BUILD_DIR)/libq27-prefill-attention.so
+PREFILL_ATTENTION_LAYER_SHARED := \
+	$(BUILD_DIR)/libq27-prefill-attention-layer.so
+GDN_PREFILL_SHARED := $(BUILD_DIR)/libq27-gdn-prefill.so
+GDN_PREFILL_AB_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-ab.so
+GDN_PREFILL_WY_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-wy.so
+GDN_PREFILL_SUBLAYER_SHARED := \
+	$(BUILD_DIR)/libq27-gdn-prefill-sublayer.so
+GDN_PREFILL_LAYER_SHARED := $(BUILD_DIR)/libq27-gdn-prefill-layer.so
+PREFILL_MODEL_SHARED := $(BUILD_DIR)/libq27-prefill-model.so
+PREFILL_SHARED := $(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) \
+	$(PREFILL_NVFP4_SHARED) $(PREFILL_MLP_SHARED) \
+	$(PREFILL_ATTENTION_SHARED) $(PREFILL_ATTENTION_LAYER_SHARED) \
+	$(GDN_PREFILL_SHARED) $(GDN_PREFILL_AB_SHARED) \
+	$(GDN_PREFILL_WY_SHARED) $(GDN_PREFILL_SUBLAYER_SHARED) \
+	$(GDN_PREFILL_LAYER_SHARED) $(PREFILL_MODEL_SHARED)
 CAPSULE_SHARED := $(KERNEL_SHARED) $(MAPPING_SHARED) $(GDN_SHARED) \
 	$(NVFP4_SHARED) $(MLP_SHARED) $(ATTENTION_SHARED) $(GDN_BLOCK_SHARED) \
-	$(LM_HEAD_BF16_SHARED) $(MODEL_SHARED)
+	$(LM_HEAD_BF16_SHARED) $(MODEL_SHARED) $(PREFILL_SHARED)
 
 FP8_FIXTURE_TEST := $(BUILD_DIR)/q27-fp8-fixture-test
 CORE_FIXTURE_TEST := $(BUILD_DIR)/q27-core-fixture-test
 LM_HEAD_BENCH := $(BUILD_DIR)/q27-lm-head-bench
 
-.PHONY: all capsule-shared kernels mapping gdn nvfp4 mlp attention \
+.PHONY: all capsule-shared prefill-shared kernels mapping gdn nvfp4 mlp attention \
 	gdn-block model lm-head-bf16 lm-head-bench verify-aot verify-linkage \
 	test-core test-fp8 clean
 
 all: capsule-shared
 
 capsule-shared: $(CAPSULE_SHARED)
+prefill-shared: $(PREFILL_SHARED)
 
 kernels: $(KERNEL_SHARED)
 mapping: $(MAPPING_SHARED)
@@ -158,12 +179,13 @@ $(GDN_BLOCK_SHARED): cuda/q27_gdn_block.cc include/q27_gdn_block.h \
 
 $(MODEL_SHARED): cuda/q27_model.cu include/q27_model.h $(KERNEL_SHARED) \
 		$(GDN_BLOCK_SHARED) $(MLP_SHARED) $(ATTENTION_SHARED) \
-		$(LM_HEAD_BF16_SHARED) | $(BUILD_DIR)
+		$(LM_HEAD_BF16_SHARED) $(PREFILL_MODEL_SHARED) \
+		$(PREFILL_NVFP4_SHARED) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
 		-Xlinker=-soname -Xlinker=$(notdir $@) cuda/q27_model.cu \
 		-L$(BUILD_DIR) -lq27-gdn-block -lq27-gdn -lq27-mlp \
 		-lq27-nvfp4 -lq27-attention -lq27-lm-head-bf16 -lq27-kernels \
-		-lcublas \
+		-lq27-prefill-model -lq27-prefill-nvfp4 -lcublas \
 		$(ORIGIN_RPATH) -o $@
 
 $(LM_HEAD_BF16_SHARED): cuda/q27_lm_head_bf16.cu \
@@ -171,6 +193,101 @@ $(LM_HEAD_BF16_SHARED): cuda/q27_lm_head_bf16.cu \
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
 		-Xlinker=-soname -Xlinker=$(notdir $@) \
 		cuda/q27_lm_head_bf16.cu -o $@
+
+$(PREFILL_CORE_SHARED): cuda/q27_prefill_core.cu \
+		include/q27_prefill_core.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< -lcudart -o $@
+
+$(PREFILL_FP8_SHARED): cuda/q27_prefill_fp8.cu \
+		include/q27_prefill_fp8.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-lcublasLt -lcublas -lcudart -o $@
+
+$(PREFILL_NVFP4_SHARED): cuda/q27_prefill_nvfp4.cu \
+		include/q27_prefill_nvfp4.h $(AOT_STAMP) | $(BUILD_DIR)
+	test -n "$(TVM_FFI_ROOT)"
+	test -n "$(CUDA_DIALECT_ARCHIVE)"
+	test -f "$(CUDA_DIALECT_ARCHIVE)"
+	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_FLAGS) $(INCLUDES) \
+		$(CCCL_INCLUDES) $(FLASHINFER_INCLUDES) \
+		-I$(TVM_FFI_ROOT)/include $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		$(NVFP4_K5120_AOT_OBJECT) $(NVFP4_K17408_AOT_OBJECT) \
+		$(CUDA_DIALECT_ARCHIVE) -L$(TVM_FFI_ROOT)/lib -ltvm_ffi \
+		-lcuda -lcudart -ldl -Xcompiler=-pthread $(ORIGIN_RPATH) -o $@
+
+$(PREFILL_MLP_SHARED): cuda/q27_prefill_mlp.cu \
+		include/q27_prefill_mlp.h $(PREFILL_NVFP4_SHARED) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-L$(BUILD_DIR) -lq27-prefill-nvfp4 -lcudart \
+		$(ORIGIN_RPATH) -o $@
+
+$(PREFILL_ATTENTION_SHARED): cuda/q27_prefill_attention.cu \
+		include/q27_prefill_attention.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASHINFER_FLAGS) $(INCLUDES) \
+		$(CCCL_INCLUDES) $(FLASHINFER_INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< -lcudart -o $@
+
+$(PREFILL_ATTENTION_LAYER_SHARED): cuda/q27_prefill_attention_layer.cu \
+		include/q27_prefill_attention_layer.h $(PREFILL_CORE_SHARED) \
+		$(PREFILL_FP8_SHARED) $(PREFILL_ATTENTION_SHARED) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-L$(BUILD_DIR) -lq27-prefill-core -lq27-prefill-fp8 \
+		-lq27-prefill-attention -lcublasLt -lcublas -lcudart \
+		$(ORIGIN_RPATH) -o $@
+
+$(GDN_PREFILL_SHARED): cuda/q27_gdn_prefill.cu \
+		include/q27_gdn_prefill.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-lcublas -lcudart $(ORIGIN_RPATH) -o $@
+
+$(GDN_PREFILL_AB_SHARED): cuda/q27_gdn_prefill_ab.cu \
+		include/q27_gdn_prefill_ab.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-lcublas -lcudart $(ORIGIN_RPATH) -o $@
+
+$(GDN_PREFILL_WY_SHARED): cuda/q27_gdn_prefill_wy.cu \
+		include/q27_gdn_prefill_wy.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-lcublas -lcudart $(ORIGIN_RPATH) -o $@
+
+$(GDN_PREFILL_SUBLAYER_SHARED): cuda/q27_gdn_prefill_sublayer.cu \
+		include/q27_gdn_prefill_sublayer.h $(GDN_PREFILL_SHARED) \
+		$(GDN_PREFILL_AB_SHARED) $(GDN_PREFILL_WY_SHARED) \
+		$(PREFILL_FP8_SHARED) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-L$(BUILD_DIR) -lq27-gdn-prefill -lq27-gdn-prefill-ab \
+		-lq27-gdn-prefill-wy -lq27-prefill-fp8 -lcublas -lcudart \
+		$(ORIGIN_RPATH) -o $@
+
+$(GDN_PREFILL_LAYER_SHARED): cuda/q27_gdn_prefill_layer.cu \
+		include/q27_gdn_prefill_layer.h $(GDN_PREFILL_SUBLAYER_SHARED) \
+		$(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-L$(BUILD_DIR) -lq27-gdn-prefill-sublayer -lq27-prefill-core \
+		-lq27-prefill-fp8 -lcublasLt -lcublas -lcudart \
+		$(ORIGIN_RPATH) -o $@
+
+$(PREFILL_MODEL_SHARED): cuda/q27_prefill_model.cu \
+		include/q27_prefill_model.h $(GDN_PREFILL_LAYER_SHARED) \
+		$(PREFILL_ATTENTION_LAYER_SHARED) $(PREFILL_MLP_SHARED) \
+		$(PREFILL_CORE_SHARED) $(PREFILL_FP8_SHARED) \
+		$(LM_HEAD_BF16_SHARED) $(KERNEL_SHARED) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SHARED_FLAGS) \
+		-Xlinker=-soname -Xlinker=$(notdir $@) $< \
+		-L$(BUILD_DIR) -lq27-gdn-prefill-layer \
+		-lq27-prefill-attention-layer -lq27-prefill-mlp \
+		-lq27-prefill-core -lq27-prefill-fp8 -lq27-lm-head-bf16 \
+		-lq27-kernels -lcublas -lcudart $(ORIGIN_RPATH) -o $@
 
 $(LM_HEAD_BENCH): fixtures/q27_lm_head_bench.cu \
 		include/q27_lm_head_bf16.h include/q27_mapping.h include/q27_kernels.h \

@@ -54,6 +54,12 @@ unsafe extern "C" {
         token: u32,
         output_token: *mut u32,
     ) -> ModelStatus;
+    fn q27_model_prefill_greedy(
+        model: *mut NativeModel,
+        host_tokens: *const u32,
+        count: u32,
+        output_token: *mut u32,
+    ) -> ModelStatus;
     fn q27_model_get_stats(model: *const NativeModel, output: *mut ModelStats) -> ModelStatus;
     fn q27_model_copy_logits(
         model: *const NativeModel,
@@ -88,7 +94,7 @@ impl Drop for ModelGuard {
 
 fn usage(program: &Path) -> ! {
     eprintln!(
-        "usage: {} CHECKPOINT SCALE_SIDECAR TOKEN [CONTEXT_CAPACITY] [STEPS]",
+        "usage: {} CHECKPOINT SCALE_SIDECAR TOKEN[,TOKEN...] [CONTEXT_CAPACITY] [STEPS]",
         program.display()
     );
     std::process::exit(2);
@@ -100,13 +106,30 @@ fn main() {
     let Some(checkpoint) = arguments.next() else { usage(Path::new(&program)) };
     let Some(sidecar) = arguments.next() else { usage(Path::new(&program)) };
     let Some(token) = arguments.next() else { usage(Path::new(&program)) };
-    let capacity = arguments.next().unwrap_or_else(|| "1".into());
+    let capacity_argument = arguments.next();
     let steps = arguments.next().unwrap_or_else(|| "1".into());
     if arguments.next().is_some() { usage(Path::new(&program)); }
-    let token: u32 = token.to_string_lossy().parse().unwrap_or_else(|_| usage(Path::new(&program)));
-    let capacity: u32 = capacity.to_string_lossy().parse().unwrap_or_else(|_| usage(Path::new(&program)));
+    let token_text = token.to_string_lossy();
+    let batched_prefill = token_text.contains(',');
+    let token_ids = token_text
+        .split(',')
+        .map(|value| value.parse::<u32>().unwrap_or_else(|_| usage(Path::new(&program))))
+        .collect::<Vec<_>>();
+    if token_ids.is_empty() { usage(Path::new(&program)); }
+    let default_capacity = if batched_prefill {
+        u32::try_from(token_ids.len()).unwrap_or_else(|_| usage(Path::new(&program)))
+    } else {
+        1
+    };
+    let capacity: u32 = capacity_argument
+        .map(|value| value.to_string_lossy().parse().unwrap_or_else(|_| usage(Path::new(&program))))
+        .unwrap_or(default_capacity);
     let steps: u32 = steps.to_string_lossy().parse().unwrap_or_else(|_| usage(Path::new(&program)));
-    if steps == 0 || steps > capacity { usage(Path::new(&program)); }
+    if steps == 0 || steps > capacity ||
+        (batched_prefill && (steps != 1 || token_ids.len() > capacity as usize)) {
+        usage(Path::new(&program));
+    }
+    let token = token_ids[0];
 
     let load_begin = Instant::now();
     let plan = EagerWeightPlan::open(Path::new(&checkpoint), Path::new(&sidecar)).unwrap_or_else(|error| {
@@ -128,6 +151,37 @@ fn main() {
     });
     let model = ModelGuard(NonNull::new(raw).expect("q27 model returned null"));
     let load_seconds = load_begin.elapsed().as_secs_f64();
+
+    if batched_prefill {
+        let mut output_token = 0_u32;
+        let count = u32::try_from(token_ids.len()).unwrap_or_else(|_| usage(Path::new(&program)));
+        let prefill_begin = Instant::now();
+        // SAFETY: the token vector remains live through this synchronous
+        // native call and the model has exactly one Rust owner.
+        status(unsafe {
+            q27_model_prefill_greedy(
+                model.0.as_ptr(),
+                token_ids.as_ptr(),
+                count,
+                &mut output_token,
+            )
+        })
+        .unwrap_or_else(|error| {
+            eprintln!("q27 eager batched prefill failed: {error}");
+            std::process::exit(1);
+        });
+        let prefill_seconds = prefill_begin.elapsed().as_secs_f64();
+        println!("q27_eager=native");
+        println!("prompt_tokens={count}");
+        println!("output_token={output_token}");
+        println!("load_seconds={load_seconds:.3}");
+        println!("prefill_seconds={prefill_seconds:.6}");
+        println!(
+            "effective_prefill_tok_s={:.3}",
+            f64::from(count) / prefill_seconds
+        );
+        return;
+    }
 
     let mut output_token = 0;
     status(unsafe { q27_model_decode_greedy(model.0.as_ptr(), token, &mut output_token) })

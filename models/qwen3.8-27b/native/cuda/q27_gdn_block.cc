@@ -30,6 +30,8 @@ constexpr uint64_t kNormalizedOutputOffset =
     Align(kRecurrentOutputOffset + Q27_GDN_VALUE_WIDTH * 2);
 constexpr uint64_t kScratchBytes =
     Align(kNormalizedOutputOffset + Q27_GDN_VALUE_WIDTH * 2);
+constexpr uint64_t kQkvWeightBytes =
+    static_cast<uint64_t>(Q27_GDN_CONV_WIDTH) * Q27_GDN_HIDDEN_SIZE;
 
 static_assert(kScratchBytes == 83456);
 
@@ -108,7 +110,17 @@ extern "C" q27_gdn_block_status q27_gdn_block_decode(
   fp8.quantized_input_fp8_e4m3 = input_fp8;
   fp8.cuda_stream = args->cuda_stream;
 
-  fp8.n = Q27_GDN_CONV_WIDTH;
+  const bool fused_qkvz =
+      static_cast<const uint8_t*>(args->z_weight_fp8_e4m3) ==
+          static_cast<const uint8_t*>(args->qkv_weight_fp8_e4m3) +
+              kQkvWeightBytes &&
+      args->qkv_input_scale == args->z_input_scale &&
+      args->qkv_weight_scale == args->z_weight_scale &&
+      static_cast<uint8_t*>(projected_z) ==
+          static_cast<uint8_t*>(projected_qkv) + Q27_GDN_CONV_WIDTH * 2;
+
+  fp8.n = fused_qkvz ? Q27_GDN_CONV_WIDTH + Q27_GDN_VALUE_WIDTH
+                     : Q27_GDN_CONV_WIDTH;
   fp8.weight_fp8_e4m3 = args->qkv_weight_fp8_e4m3;
   fp8.input_scale = args->qkv_input_scale;
   fp8.weight_scale = args->qkv_weight_scale;
@@ -116,13 +128,15 @@ extern "C" q27_gdn_block_status q27_gdn_block_decode(
   q27_kernel_status kernel = q27_fp8_project(&fp8);
   if (kernel.code != Q27_KERNEL_OK) return Projection(kernel);
 
-  fp8.n = Q27_GDN_VALUE_WIDTH;
-  fp8.weight_fp8_e4m3 = args->z_weight_fp8_e4m3;
-  fp8.input_scale = args->z_input_scale;
-  fp8.weight_scale = args->z_weight_scale;
-  fp8.output_bf16 = projected_z;
-  kernel = q27_fp8_project(&fp8);
-  if (kernel.code != Q27_KERNEL_OK) return Projection(kernel);
+  if (!fused_qkvz) {
+    fp8.n = Q27_GDN_VALUE_WIDTH;
+    fp8.weight_fp8_e4m3 = args->z_weight_fp8_e4m3;
+    fp8.input_scale = args->z_input_scale;
+    fp8.weight_scale = args->z_weight_scale;
+    fp8.output_bf16 = projected_z;
+    kernel = q27_fp8_project(&fp8);
+    if (kernel.code != Q27_KERNEL_OK) return Projection(kernel);
+  }
 
   q27_bf16_ab_project_args ab = {};
   ab.struct_size = sizeof(ab);

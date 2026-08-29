@@ -23,18 +23,10 @@ mirror_env="HF_ENDPOINT=${HF_ENDPOINT} HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET}"
 export DOCKER_ENV="${DOCKER_ENV:+${DOCKER_ENV} }${mirror_env}"
 
 cd "${CHECKOUT}"
-profile="${QWEN27_PROFILE:-resident-mtp}"
-case "${profile}" in
-  resident|resident-mtp|mtp)
-    export IMAGE="${SPARK_ENGINE_IMAGE:-${IMAGE:-docker.1ms.run/lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6}}"
-    exec ./start.sh
-    ;;
-  dflash2)
-    export IMAGE="${SPARK_ENGINE_IMAGE:-${IMAGE:-lmsysorg/sglang:qwen38-27b-dflash2}}"
-    exec ./start-dflash.sh
-    ;;
-  *)
-    echo "QWEN27_PROFILE must be resident-mtp or dflash2" >&2
-    exit 64
-    ;;
-esac
+if [[ -n "${QWEN27_PROFILE:-}" && "${QWEN27_PROFILE}" != "dflash2" ]]; then
+  echo "QWEN27_PROFILE only accepts dflash2; MTP/EAGLE/DFlash1 are unsupported" >&2
+  exit 64
+fi
+
+export IMAGE="${SPARK_ENGINE_IMAGE:-${IMAGE:-lmsysorg/sglang:qwen38-27b-dflash2}}"
+exec ./start-dflash.sh

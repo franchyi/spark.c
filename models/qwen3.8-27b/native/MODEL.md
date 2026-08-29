@@ -16,7 +16,14 @@ oracle and pipeline reference; it is never linked into the native server.
   convolution, BF16 recurrent state.
 - Attention: 24 query heads, 4 KV heads, head dimension 256, gated Q output,
   QK norm, 1/4 partial RoPE, theta 10,000,000, FP8 E4M3 KV.
-- One in-checkpoint BF16 MTP layer. No second draft checkpoint is required.
+- The target checkpoint physically contains one BF16 `mtp.*` layer. It is
+  validated as checkpoint payload but never executed by the native server.
+- DFlash2 is the sole selected speculative engine. Native integration is in
+  progress; the current service uses batched target prefill and M=1 target
+  decode. The completed path
+  will use the separately pinned `z-lab/Qwen3.8-27B-DFlash2` draft and fixed
+  eight-token target verification. DFlash1, MTP, and EAGLE execution are
+  unsupported.
 - Vision is not part of the first server and its 333 tensors are never mapped.
 
 ## Quantization and physical bytes
@@ -25,15 +32,16 @@ oracle and pipeline reference; it is never linked into the native server.
 | --- | --- | ---: | ---: |
 | 64-layer body | FP8 projections + NVFP4 MLP + BF16 state weights | 1,840 | 16,892,600,448 |
 | Embedding, final norm, LM head | BF16 | 3 | 5,085,603,840 |
-| MTP | BF16 | 15 | 849,398,784 |
+| Ignored target `mtp.*` payload | BF16 | 15 | 849,398,784 |
 | Ignored vision tower | BF16 | 333 | 921,460,192 |
 | Whole checkpoint | mixed | 2,191 | 23,749,063,264 |
 
 All 208 attention/GDN projection targets are static FP8 E4M3. All 192 MLP
-projection targets are static ModelOpt NVFP4 W4A4 with group size 16. The MTP
-block is intentionally excluded from quantization. The native runtime maps
-22,827,603,072 text/MTP bytes and does not materialize a framework tensor
-registry.
+projection targets are static ModelOpt NVFP4 W4A4 with group size 16. The
+physical `mtp.*` block is excluded from quantization and speculation. The
+current strict mapper still accounts for 22,827,603,072 text/MTP bytes without
+materializing a framework tensor registry; avoiding registration of that
+ignored payload is a later load-time memory optimization, not a second engine.
 
 On GB10 the q27-only mapping capsule registers the three original shard files
 directly with CUDA. The complete 22.118 GiB checkpoint address space maps in
@@ -115,8 +123,69 @@ for about 43.50 ms before activation quantization and SiLU overhead. The
 highest-leverage next optimization is therefore a borrowed or independently
 verified SM121 NVFP4 streaming specialization that improves the current
 180--215 GB/s toward the FP8 capsule's 247--263 GB/s. The 32 available
-FlashInfer tactics are already swept, so an unverified kernel rewrite is not
-part of this MVP.
+FlashInfer tactics have not yet been successfully swept: the isolated all-in-
+one translation unit repeats a CUDA 13 front-end ICE and must be split into
+smaller candidate groups. Production selection remains unchanged; an
+unverified kernel rewrite is not part of this MVP.
+
+The same-prompt Spark benchmark rejects serial prefill as an execution model:
+12,617 prompt tokens took 1,565.4702 seconds (8.06 tok/s), versus 14.8017
+seconds (852.40 tok/s) for the pinned MiaAI/SGLang DFlash2 oracle. Native
+prefill therefore uses fixed-shape batched kernels. After its short gate passed,
+the production native HTTP service processed the same 12,617-token workload in
+26.0218 seconds (484.86 tok/s); no M=1 long run was repeated.
+
+The first replacement gate is a persistent CUTLASS NVFP4 capsule at M=128 and
+M=512. On Spark, its gate/up/down projections delivered 53.62--83.48x better
+per-token time than the M=1 loop, clearing the required 20x gate. These are
+synthetic timing fixtures. A real-checkpoint M=128 layer-0 gate fixture is now
+byte-exact across 4,456,448 BF16 output bytes. The distinct K=17408 down path
+is also byte-exact across 1,310,720 output bytes when fed real layer-0
+gate/up-to-SiLU activations.
+
+The matching cuBLASLt FP8 capsule also clears the gate: GDN QKV+Z/out are
+75.25--106.52x faster per token at M=128/M=512, with at most 0.007812 absolute
+error in its synthetic FP32-reference samples. It has the same real-checkpoint
+promotion rule. The fused layer-0 QKV+Z path is exact against the pinned
+ModelOpt/`torch._scaled_mm` oracle: zero packed-input or BF16-output mismatches
+across 2,097,152 values. The distinct K=6144 GDN output path is exact across
+655,360 BF16 values, with zero packed-input mismatches and cosine similarity
+one.
+
+The fixed M=128 target-attention capsule now passes its causal CPU reference,
+tail scheduling, invalid-page detection, and rejected-KV immutability gates.
+Its full hot call (metadata, Q/K normalization and RoPE, FP8 KV append,
+FlashInfer paged causal attention, and sigmoid gate) measured 0.119014,
+0.830566, and 2.27473 milliseconds at committed contexts 64, 4,096, and
+12,288. The 3x context increase from 4,096 to 12,288 costs 2.74x, so this path
+shows no long-context performance cliff.
+
+The fixed prefill core is bit-exact to M=1 for embedding and Gemma
+norm/residual at logical lengths 1, 63, 64, 127, and 128, including invalid
+token and padded-row guards. The complete real layer-0 MLP capsule (merged
+gate/up, SiLU, and down) is byte-exact across 1,310,720 BF16 output bytes and
+measured 1.26678 milliseconds per M=128 tile.
+
+The remaining c427 GDN WY stages are also implemented and Spark-gated: BF16
+L2Norm, the lower-triangular solve, W/U reconstruction, recurrent chunk output,
+and `valid_tokens=65` masking all pass their analytic reference. Intra-chunk
+construction measured 348.874 microseconds and recurrent output 140.371
+microseconds per M=128 layer tile. The next promotion gate is their joined
+full GDN layer, not another isolated kernel.
+
+That full GDN transformer layer now passes too. At `valid_tokens=65`, joined
+versus manual-capsule parity, tail masking, and CUDA graph replay are green.
+The complete input-norm through post-norm/residual path measured 2.005259
+milliseconds per M=128 layer tile and reuses 98,402,304 scratch bytes.
+
+The joined 64-layer coordinator is now Spark-gated as well. It owns the exact
+48-GDN/16-attention schedule, every dense MLP, final norm, streaming LM head,
+argmax, state/KV isolation, tail masking, and graph-capturable allocation-free
+hot call. The hardened full M=128 tile measured 203.809 ms, or **628 prefill
+tok/s**. The old M=1 path measured 8.06 tok/s; the pinned SGLang oracle remains
+faster at 852.40 tok/s. Production model/Rust wiring, the real c427 M=128
+layer capture, exact ChatML parity, and the guarded HTTP benchmark now pass on
+Spark.
 
 `q27-pack-scales` converts all 192 checkpoint E4M3 scale matrices into the
 CUTLASS 128x4 order once. Its revision-bound sidecar also stores each

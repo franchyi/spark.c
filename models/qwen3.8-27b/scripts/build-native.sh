@@ -4,9 +4,12 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../.." && pwd)
 cuda_image=${SPARK_CUDA_IMAGE:-docker.1ms.run/lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1}
+rust_image=${SPARK_RUST_IMAGE:-docker.1ms.run/rust:1.89.0}
 jobs=${JOBS:-4}
 user_id=$(id -u)
 group_id=$(id -g)
+target_host=${SPARK_Q27_CARGO_TARGET:-${HOME}/.cache/spark-c-q27-target}
+cargo_home=${SPARK_CARGO_HOME:-${HOME}/.cache/spark-c-cargo-home}
 
 "$repo_root/vendor/tools/fetch-flashinfer.sh" "$repo_root/vendor/_deps/flashinfer"
 
@@ -64,3 +67,21 @@ docker run --rm --gpus all --network host --user "$user_id:$group_id" \
   '
 
 echo "Q27 native capsule ready in $repo_root/build/q27"
+
+mkdir -p "$repo_root/build/bin" "$target_host" "$cargo_home"
+docker run --rm --network host --user "$user_id:$group_id" \
+  -v "$repo_root:/work" -w /work \
+  -v /usr/local/cuda:/usr/local/cuda:ro \
+  -v "$target_host:/cargo-target" \
+  -v "$cargo_home:/cargo-home" \
+  -e CARGO_HOME=/cargo-home \
+  -e CARGO_TARGET_DIR=/cargo-target \
+  -e 'RUSTFLAGS=-L native=/work/build/q27 -C link-arg=-Wl,-rpath,$ORIGIN/../q27 -C link-arg=-Wl,-rpath-link,/work/build/q27 -C link-arg=-Wl,-rpath-link,/usr/local/cuda/lib64' \
+  "$rust_image" \
+  cargo build --locked --release \
+    --manifest-path models/qwen3.8-27b/native/Cargo.toml \
+    --bin q27-eager --bin q27-serve
+cp "$target_host/release/q27-eager" "$repo_root/build/bin/q27-eager"
+cp "$target_host/release/q27-serve" "$repo_root/build/bin/q27-serve"
+
+echo "Q27 native tools ready in $repo_root/build/bin"

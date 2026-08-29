@@ -47,6 +47,7 @@ INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(__nv_bfloat16, 128, 32, 128,
 namespace {
 
 constexpr uint32_t kGateUpN = 17408;
+constexpr uint32_t kFusedGateUpN = kGateUpN * 2;
 constexpr uint32_t kGateUpK = 5120;
 constexpr uint32_t kDownN = 5120;
 constexpr uint32_t kDownK = 17408;
@@ -84,6 +85,10 @@ bool ResolveShape(uint32_t projection, uint32_t* n, uint32_t* k) {
       *n = kGateUpN;
       *k = kGateUpK;
       return true;
+    case Q27_NVFP4_GATE_UP:
+      *n = kFusedGateUpN;
+      *k = kGateUpK;
+      return true;
     case Q27_NVFP4_DOWN:
       *n = kDownN;
       *k = kDownK;
@@ -106,7 +111,8 @@ size_t RunGemm(void* output, const void* input, const void* weight,
                const void* input_scales, const void* weight_scales,
                const float* alpha, int n, int k, char* workspace,
                size_t workspace_bytes, cudaStream_t stream) {
-  const bool stream_k = n == static_cast<int>(kGateUpN);
+  const bool stream_k = n == static_cast<int>(kGateUpN) ||
+                        n == static_cast<int>(kFusedGateUpN);
   if (stream_k) {
     return flashinfer::gemm::genericFp4GemmKernelLauncherStreamK<
         __nv_bfloat16, cute::Int<128>, cute::Int<32>, cute::Int<128>,

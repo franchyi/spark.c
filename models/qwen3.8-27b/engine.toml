@@ -39,6 +39,7 @@ license = "MIT"
 [[sources]]
 role = "oracle-container"
 name = "lmsysorg/sglang:qwen38-27b"
-revision = "sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6"
+revision = "sha256:febfb971c7352570fc445c466ebd6ffc9d896024958e544a60f2137fd85856b1"
+image_id = "sha256:0076dffa60b76b7bf033c04d05e0cc69d46f2b8cd60aa2468827782afe9bc38f"
 platform = "linux/arm64"
 license = "mixed; see image SBOM"

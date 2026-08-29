@@ -27,6 +27,7 @@ typedef enum q27_nvfp4_projection {
   Q27_NVFP4_GATE = 0,
   Q27_NVFP4_UP = 1,
   Q27_NVFP4_DOWN = 2,
+  Q27_NVFP4_GATE_UP = 3,
 } q27_nvfp4_projection;
 
 typedef struct q27_nvfp4_shape {

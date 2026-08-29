@@ -93,6 +93,8 @@ The retained suite is
 the machine-readable passing report is the sibling `parity-report.json`. The
 oracle is `lmsysorg/sglang:qwen38-27b` image
 `sha256:0076dffa60b76b7bf033c04d05e0cc69d46f2b8cd60aa2468827782afe9bc38f`,
+pulled from the Linux/arm64 registry manifest
+`sha256:febfb971c7352570fc445c466ebd6ffc9d896024958e544a60f2137fd85856b1`,
 SGLang `c4271c3fe1262fc2adbd162c33b25de5255251c5`, FlashInfer
 `906181e3f4cf4bcc81835fb480db4011bbd80b62`, and checkpoint
 `RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead` revision

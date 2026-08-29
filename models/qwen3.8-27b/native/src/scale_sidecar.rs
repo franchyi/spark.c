@@ -114,6 +114,16 @@ impl ScaleSidecar {
                 "q27 scale sidecar must contain {expected_offset} bytes, found {file_bytes}"
             )));
         }
+        for layer in 0..64_usize {
+            let gate = entries[layer * 3];
+            let up = entries[layer * 3 + 1];
+            if gate.input_scale_inv.to_bits() != up.input_scale_inv.to_bits() ||
+                gate.alpha.to_bits() != up.alpha.to_bits() {
+                return Err(invalid(format!(
+                    "layer {layer} gate/up scales cannot use the fused projection"
+                )));
+            }
+        }
         drop(file);
         let mapping = MappedFile::open(path)?;
         Ok(Self { entries, mapping })

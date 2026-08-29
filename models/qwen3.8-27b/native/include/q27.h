@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define Q27_ABI_VERSION 1u
+#define Q27_ABI_VERSION 2u
 
 typedef struct q27_engine q27_engine;
 
@@ -28,7 +28,9 @@ typedef struct q27_status {
 
 enum {
   Q27_DISABLE_CUDA_GRAPHS = 1u << 0,
-  Q27_DISABLE_MTP = 1u << 1,
+  /* Target-only diagnostics may disable speculation; DFlash2 is the sole
+   * supported speculative engine. */
+  Q27_DISABLE_DFLASH2 = 1u << 1,
 };
 
 typedef struct q27_config {
@@ -53,7 +55,7 @@ typedef struct q27_stats {
   uint64_t verified_tokens;
   uint64_t last_step_us;
   uint32_t graph_replay_enabled;
-  uint32_t mtp_enabled;
+  uint32_t dflash2_enabled;
 } q27_stats;
 
 /*
@@ -67,6 +69,7 @@ q27_status q27_prefill(q27_engine* engine, uint32_t slot,
                        float* last_logits);
 q27_status q27_decode(q27_engine* engine, uint32_t slot, uint32_t token,
                       float* logits);
+/* DFlash2 target verification is fixed to one eight-token candidate block. */
 q27_status q27_verify(q27_engine* engine, uint32_t slot,
                       const uint32_t* draft_tokens, uint32_t token_count,
                       float* logits);

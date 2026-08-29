@@ -8,6 +8,8 @@
 #include "q27_kernels.h"
 #include "q27_lm_head_bf16.h"
 #include "q27_mlp.h"
+#include "q27_prefill_model.h"
+#include "q27_prefill_nvfp4.h"
 
 #include <cublas_v2.h>
 #include <cuda_fp8.h>
@@ -39,6 +41,9 @@ constexpr uint64_t kMlpArenaBytes =
 constexpr uint64_t kFp8ArenaBytes = 7214202880ULL;
 constexpr uint64_t kLmHeadBytes =
     static_cast<uint64_t>(kVocabulary) * kHidden * 2;
+constexpr uint64_t kGdnMergedAbStride = 96ULL * kHidden * 2;
+constexpr uint64_t kGdnMergedAbBytes =
+    Q27_MODEL_GDN_LAYERS * kGdnMergedAbStride;
 constexpr uint64_t kKvBytesPerToken =
     static_cast<uint64_t>(Q27_ATTENTION_KV_HEADS) *
     Q27_ATTENTION_HEAD_DIM;
@@ -86,6 +91,20 @@ q27_model_status Kernel(const char* prefix, const char* detail) {
 bool IsAttention(uint32_t layer) { return (layer + 1) % 4 == 0; }
 uint32_t AttentionIndex(uint32_t layer) { return layer / 4; }
 uint32_t GdnIndex(uint32_t layer) { return layer - layer / 4; }
+
+bool SelectedProfilePosition(uint32_t position) {
+  const char* selected = std::getenv("Q27_PROFILE_POSITION");
+  if (selected == nullptr || selected[0] == '\0') return false;
+  char* end = nullptr;
+  const unsigned long value = std::strtoul(selected, &end, 10);
+  return end != selected && end != nullptr && end[0] == '\0' &&
+         value <= UINT32_MAX && position == static_cast<uint32_t>(value);
+}
+
+bool ProfileDecode(uint32_t position) {
+  return SelectedProfilePosition(position) ||
+         (position == 1 && std::getenv("Q27_PROFILE_STAGES") != nullptr);
+}
 
 bool CommonWeightsValid(const q27_model_layer_weights& layer) {
   return layer.input_norm_bf16 != nullptr &&
@@ -168,7 +187,9 @@ __global__ void SetSequenceLength(uint32_t* destination, uint32_t value) {
 struct q27_model {
   q27_model_weights weights = {};
   q27_model_layer_weights layers[Q27_MODEL_LAYERS] = {};
+  q27_prefill_model_layer prefill_layers[Q27_MODEL_LAYERS] = {};
   uint32_t capacity = 0;
+  uint32_t state_capacity = 0;
   uint32_t position = 0;
   uint64_t state_bytes = 0;
   uint64_t scratch_bytes = 0;
@@ -201,8 +222,16 @@ struct q27_model {
   uint8_t* mlp_weight_arena = nullptr;
   uint8_t* fp8_weight_arena = nullptr;
   uint8_t* lm_head_arena = nullptr;
+  uint8_t* prefill_gate_up_scale_arena = nullptr;
+  uint8_t* prefill_gdn_ab_arena = nullptr;
   uint64_t mlp_scratch_bytes = 0;
   uint64_t mlp_workspace_bytes = 0;
+  uint64_t prefill_gate_up_scale_stride = 0;
+
+  q27_prefill_model_plan* prefill_plan = nullptr;
+  q27_prefill_model_layout prefill_layout = {};
+  uint8_t* prefill_scratch = nullptr;
+  uint32_t* prefill_token_tile = nullptr;
 
   uint8_t* attention_q_gate = nullptr;
   uint8_t* attention_key = nullptr;
@@ -270,7 +299,7 @@ class StageProfiler {
       enabled_ = false;
   }
 
-  void Report(double wall_ms, uint32_t position) {
+  void Report(double wall_ms, uint32_t position, const char* kind) {
     if (!enabled_) return;
     struct Total {
       const char* name;
@@ -296,11 +325,11 @@ class StageProfiler {
     }
     std::fprintf(
         stderr,
-        "q27_profile position=%u embedding_ms=%.6f norm_ms=%.6f "
+        "q27_profile kind=%s position=%u embedding_ms=%.6f norm_ms=%.6f "
         "gdn_ms=%.6f attention_ms=%.6f mlp_ms=%.6f lm_head_ms=%.6f "
         "argmax_ms=%.6f stage_sum_ms=%.6f wall_ms=%.6f gap_ms=%.6f "
         "spans=%zu\n",
-        position, totals[0].milliseconds, totals[1].milliseconds,
+        kind, position, totals[0].milliseconds, totals[1].milliseconds,
         totals[2].milliseconds, totals[3].milliseconds,
         totals[4].milliseconds, totals[5].milliseconds,
         totals[6].milliseconds, sum, wall_ms, wall_ms - sum,
@@ -358,6 +387,11 @@ q27_model_status DumpBoundary(q27_model* model, uint32_t layer,
 q27_model_status FreeModel(q27_model* model) {
   if (model == nullptr) return Ok();
   if (model->stream != nullptr) cudaStreamSynchronize(model->stream);
+  q27_prefill_model_plan_destroy(model->prefill_plan);
+  cudaFree(model->prefill_token_tile);
+  cudaFree(model->prefill_scratch);
+  cudaFree(model->prefill_gdn_ab_arena);
+  cudaFree(model->prefill_gate_up_scale_arena);
   cudaFree(model->output_token);
   cudaFree(model->argmax_indices);
   cudaFree(model->argmax_values);
@@ -443,8 +477,20 @@ q27_model_status AllocateModel(q27_model* model) {
   Q27_ALLOC(model->mlp_weight_arena, kMlpArenaBytes);
   Q27_ALLOC(model->fp8_weight_arena, kFp8ArenaBytes);
   Q27_ALLOC(model->lm_head_arena, kLmHeadBytes);
+  q27_prefill_nvfp4_shape gate_up = {
+      sizeof(gate_up), Q27_PREFILL_NVFP4_ABI_VERSION};
+  q27_prefill_nvfp4_status prefill_nvfp4 = q27_prefill_nvfp4_query(
+      128, Q27_PREFILL_NVFP4_GATE_UP, &gate_up);
+  if (prefill_nvfp4.code != Q27_PREFILL_NVFP4_OK)
+    return Kernel("q27 prefill gate/up layout: ", prefill_nvfp4.message);
+  model->prefill_gate_up_scale_stride = gate_up.weight_scale_bytes;
+  Q27_ALLOC(model->prefill_gate_up_scale_arena,
+            Q27_MODEL_LAYERS * model->prefill_gate_up_scale_stride);
+  Q27_ALLOC(model->prefill_gdn_ab_arena, kGdnMergedAbBytes);
   model->resident_weight_bytes =
-      kMlpArenaBytes + kFp8ArenaBytes + kLmHeadBytes;
+      kMlpArenaBytes + kFp8ArenaBytes + kLmHeadBytes +
+      Q27_MODEL_LAYERS * model->prefill_gate_up_scale_stride +
+      kGdnMergedAbBytes;
 
   Q27_ALLOC(model->attention_q_gate, 12288ULL * 2);
   Q27_ALLOC(model->attention_key, 1024ULL * 2);
@@ -453,14 +499,40 @@ q27_model_status AllocateModel(q27_model* model) {
   Q27_ALLOC(model->attention_gate, 6144ULL * 2);
   Q27_ALLOC(model->attention_output, 6144ULL * 2);
   const uint64_t cache_bytes = static_cast<uint64_t>(Q27_MODEL_ATTENTION_LAYERS) *
-                               model->capacity * kKvBytesPerToken;
+                               model->state_capacity * kKvBytesPerToken;
   Q27_ALLOC(model->attention_key_cache, cache_bytes);
   Q27_ALLOC(model->attention_value_cache, cache_bytes);
-  Q27_ALLOC(model->attention_block_table, model->capacity);
+  Q27_ALLOC(model->attention_block_table, model->state_capacity);
   Q27_ALLOC(model->attention_sequence_length, 1);
-  Q27_ALLOC(model->rope_cache, static_cast<uint64_t>(model->capacity) *
+  Q27_ALLOC(model->rope_cache, static_cast<uint64_t>(model->state_capacity) *
                                     Q27_ATTENTION_ROTARY_DIM);
   Q27_ALLOC(model->attention_workspace, Q27_ATTENTION_WORKSPACE_BYTES);
+
+  q27_prefill_model_config prefill_config = {};
+  prefill_config.struct_size = sizeof(prefill_config);
+  prefill_config.abi_version = Q27_PREFILL_MODEL_ABI_VERSION;
+  prefill_config.cache_capacity = model->state_capacity;
+  prefill_config.fast_accum = 0;
+  prefill_config.fp8_workspace_bytes =
+      Q27_PREFILL_ATTENTION_LAYER_FP8_WORKSPACE_BYTES;
+  model->prefill_layout = {sizeof(model->prefill_layout),
+                           Q27_PREFILL_MODEL_ABI_VERSION};
+  q27_prefill_model_status prefill =
+      q27_prefill_model_query(&prefill_config, &model->prefill_layout);
+  if (prefill.code != Q27_PREFILL_MODEL_OK)
+    return Kernel("q27 prefill model layout: ", prefill.message);
+  if (model->prefill_layout.gdn_conv_bytes_per_layer !=
+          model->gdn_conv_stride ||
+      model->prefill_layout.gdn_state_bytes_per_layer !=
+          model->gdn_recurrent_stride)
+    return Kernel("q27 prefill state layout: ",
+                  "decode and prefill GDN state strides differ");
+  Q27_ALLOC(model->prefill_scratch, model->prefill_layout.scratch_bytes);
+  Q27_ALLOC(model->prefill_token_tile, Q27_PREFILL_MODEL_TOKENS);
+  prefill = q27_prefill_model_plan_create(&prefill_config,
+                                           &model->prefill_plan);
+  if (prefill.code != Q27_PREFILL_MODEL_OK)
+    return Kernel("q27 prefill model plan: ", prefill.message);
 
   Q27_ALLOC(model->logits, kVocabulary);
   Q27_ALLOC(model->argmax_values, kArgmaxScratch);
@@ -474,7 +546,9 @@ q27_model_status AllocateModel(q27_model* model) {
   model->scratch_bytes = kHiddenBytes * 3 + 6144 + gdn.scratch_bytes +
                          mlp.scratch_bytes + mlp.workspace_bytes +
                          Q27_ATTENTION_WORKSPACE_BYTES +
-                         static_cast<uint64_t>(kVocabulary) * sizeof(float);
+                         static_cast<uint64_t>(kVocabulary) * sizeof(float) +
+                         model->prefill_layout.scratch_bytes +
+                         Q27_PREFILL_MODEL_TOKENS * sizeof(uint32_t);
 #undef Q27_ALLOC
   return Ok();
 }
@@ -515,6 +589,28 @@ q27_model_status PrepareModel(q27_model* model) {
         return Cuda("q27 resident MLP weight copy: ", error);
       *destinations[projection] = destination;
     }
+    /* The locked sidecar requires gate/up activation scales to match. Its
+     * revision also has identical gate/up global alpha values, so sharing the
+     * pointer makes that invariant explicit to the conditional fused GEMM. */
+    model->layers[layer].mlp_up_alpha =
+        model->layers[layer].mlp_gate_alpha;
+    const uint64_t one_scale_bytes =
+        model->prefill_gate_up_scale_stride / 2;
+    uint8_t* merged_scales = model->prefill_gate_up_scale_arena +
+                             static_cast<uint64_t>(layer) *
+                                 model->prefill_gate_up_scale_stride;
+    error = cudaMemcpyAsync(merged_scales,
+                            model->layers[layer].mlp_gate_scales_fp8_128x4,
+                            one_scale_bytes, cudaMemcpyDefault,
+                            model->stream);
+    if (error != cudaSuccess)
+      return Cuda("q27 merged gate scale copy: ", error);
+    error = cudaMemcpyAsync(merged_scales + one_scale_bytes,
+                            model->layers[layer].mlp_up_scales_fp8_128x4,
+                            one_scale_bytes, cudaMemcpyDefault,
+                            model->stream);
+    if (error != cudaSuccess)
+      return Cuda("q27 merged up scale copy: ", error);
   }
 
   /* The custom FP8 GEMV issues float4 global loads. 127 checkpoint matrix
@@ -632,18 +728,18 @@ q27_model_status PrepareModel(q27_model* model) {
     return Cuda("q27 resident LM-head copy: ", error);
   model->weights.lm_head_bf16 = model->lm_head_arena;
 
-  std::vector<int32_t> pages(model->capacity);
-  for (uint32_t page = 0; page < model->capacity; ++page)
+  std::vector<int32_t> pages(model->state_capacity);
+  for (uint32_t page = 0; page < model->state_capacity; ++page)
     pages[page] = static_cast<int32_t>(page);
   error = cudaMemcpy(model->attention_block_table, pages.data(),
                      pages.size() * sizeof(int32_t),
                      cudaMemcpyHostToDevice);
   if (error != cudaSuccess) return Cuda("q27 page table copy: ", error);
 
-  std::vector<float> rope(static_cast<uint64_t>(model->capacity) *
+  std::vector<float> rope(static_cast<uint64_t>(model->state_capacity) *
                           Q27_ATTENTION_ROTARY_DIM);
   constexpr uint32_t kHalf = Q27_ATTENTION_ROTARY_DIM / 2;
-  for (uint32_t position = 0; position < model->capacity; ++position) {
+  for (uint32_t position = 0; position < model->state_capacity; ++position) {
     for (uint32_t frequency = 0; frequency < kHalf; ++frequency) {
       const double exponent = static_cast<double>(2 * frequency) /
                               static_cast<double>(Q27_ATTENTION_ROTARY_DIM);
@@ -662,6 +758,19 @@ q27_model_status PrepareModel(q27_model* model) {
   for (uint32_t layer = 0; layer < Q27_MODEL_LAYERS; ++layer) {
     if (IsAttention(layer)) continue;
     const uint32_t index = GdnIndex(layer);
+    uint8_t* merged_ab = model->prefill_gdn_ab_arena +
+                         static_cast<uint64_t>(index) * kGdnMergedAbStride;
+    constexpr uint64_t kOneAbBytes = 48ULL * kHidden * 2;
+    error = cudaMemcpyAsync(merged_ab,
+                            model->layers[layer].gdn_a_weight_bf16,
+                            kOneAbBytes, cudaMemcpyDefault, model->stream);
+    if (error != cudaSuccess)
+      return Cuda("q27 merged GDN A copy: ", error);
+    error = cudaMemcpyAsync(merged_ab + kOneAbBytes,
+                            model->layers[layer].gdn_b_weight_bf16,
+                            kOneAbBytes, cudaMemcpyDefault, model->stream);
+    if (error != cudaSuccess)
+      return Cuda("q27 merged GDN B copy: ", error);
     q27_gdn_convert_parameters_args convert = {};
     convert.struct_size = sizeof(convert);
     convert.abi_version = Q27_GDN_ABI_VERSION;
@@ -675,6 +784,92 @@ q27_model_status PrepareModel(q27_model* model) {
     const q27_gdn_status status = q27_gdn_convert_parameters(&convert);
     if (status.code != Q27_GDN_OK)
       return Kernel("q27 GDN parameter conversion: ", status.message);
+  }
+
+  const uint64_t one_gate_up_scale_bytes =
+      model->prefill_gate_up_scale_stride / 2;
+  const uint64_t attention_cache_stride =
+      static_cast<uint64_t>(model->state_capacity) * kKvBytesPerToken;
+  for (uint32_t layer = 0; layer < Q27_MODEL_LAYERS; ++layer) {
+    const q27_model_layer_weights& source = model->layers[layer];
+    q27_prefill_model_layer& target = model->prefill_layers[layer];
+    target.kind = IsAttention(layer) ? Q27_PREFILL_MODEL_ATTENTION
+                                     : Q27_PREFILL_MODEL_GDN;
+    target.input_norm_bf16 = source.input_norm_bf16;
+    target.post_attention_norm_bf16 = source.post_attention_norm_bf16;
+    target.mlp.gate_up_weight_fp4_e2m1 = source.mlp_gate_weight_fp4;
+    target.mlp.gate_up_weight_bytes = 2 * kMlpWeightBytes;
+    target.mlp.gate_up_scales_e4m3_128x4 =
+        model->prefill_gate_up_scale_arena +
+        static_cast<uint64_t>(layer) * model->prefill_gate_up_scale_stride;
+    target.mlp.gate_up_scale_bytes = model->prefill_gate_up_scale_stride;
+    target.mlp.hidden_global_scale_inv = source.mlp_hidden_scale_inv;
+    target.mlp.gate_up_alpha = source.mlp_gate_alpha;
+    target.mlp.down_weight_fp4_e2m1 = source.mlp_down_weight_fp4;
+    target.mlp.down_weight_bytes = kMlpWeightBytes;
+    target.mlp.down_scales_e4m3_128x4 =
+        source.mlp_down_scales_fp8_128x4;
+    target.mlp.down_scale_bytes = one_gate_up_scale_bytes;
+    target.mlp.activated_global_scale_inv = source.mlp_activated_scale_inv;
+    target.mlp.down_alpha = source.mlp_down_alpha;
+    if (!IsAttention(layer)) {
+      const uint32_t index = GdnIndex(layer);
+      const auto* qkv = static_cast<const uint8_t*>(
+          source.gdn_qkv_weight_fp8);
+      if (source.gdn_z_weight_fp8 != qkv + 10240ULL * kHidden)
+        return Kernel("q27 prefill fused QKVZ: ",
+                      "resident QKV and Z ranges are not contiguous");
+      target.gdn.qkvz_weight_fp8_e4m3 = qkv;
+      target.gdn.qkvz_weight_bytes = 16384ULL * kHidden;
+      target.gdn.qkvz_input_scale = source.gdn_qkv_input_scale;
+      target.gdn.qkvz_weight_scale = source.gdn_qkv_weight_scale;
+      target.gdn.conv_weight_bf16 = source.gdn_conv_weight_bf16;
+      target.gdn.merged_ab_weight_bf16 =
+          model->prefill_gdn_ab_arena +
+          static_cast<uint64_t>(index) * kGdnMergedAbStride;
+      target.gdn.a_log_f32 =
+          model->gdn_a_log + static_cast<uint64_t>(index) *
+                                 Q27_GDN_VALUE_HEADS;
+      target.gdn.dt_bias_f32 =
+          model->gdn_dt_bias + static_cast<uint64_t>(index) *
+                                   Q27_GDN_VALUE_HEADS;
+      target.gdn.gdn_norm_weight_bf16 = source.gdn_norm_weight_bf16;
+      target.gdn.out_weight_fp8_e4m3 = source.gdn_out_weight_fp8;
+      target.gdn.out_weight_bytes = 5120ULL * 6144;
+      target.gdn.out_input_scale = source.gdn_out_input_scale;
+      target.gdn.out_weight_scale = source.gdn_out_weight_scale;
+      target.gdn.convolution_state_bf16 =
+          model->gdn_convolution_state + index * model->gdn_conv_stride;
+      target.gdn.convolution_state_bytes = model->gdn_conv_stride;
+      target.gdn.recurrent_state_bf16 =
+          model->gdn_recurrent_state + index * model->gdn_recurrent_stride;
+      target.gdn.recurrent_state_bytes = model->gdn_recurrent_stride;
+    } else {
+      const uint32_t index = AttentionIndex(layer);
+      auto& weights = target.attention.weights;
+      weights.q_weight_fp8_e4m3 = source.attention_q_weight_fp8;
+      weights.q_input_scale = source.attention_q_input_scale;
+      weights.q_weight_scale = source.attention_q_weight_scale;
+      weights.k_weight_fp8_e4m3 = source.attention_k_weight_fp8;
+      weights.k_input_scale = source.attention_k_input_scale;
+      weights.k_weight_scale = source.attention_k_weight_scale;
+      weights.v_weight_fp8_e4m3 = source.attention_v_weight_fp8;
+      weights.v_input_scale = source.attention_v_input_scale;
+      weights.v_weight_scale = source.attention_v_weight_scale;
+      weights.o_weight_fp8_e4m3 = source.attention_o_weight_fp8;
+      weights.o_input_scale = source.attention_o_input_scale;
+      weights.o_weight_scale = source.attention_o_weight_scale;
+      weights.q_norm_bf16 = source.attention_q_norm_bf16;
+      weights.k_norm_bf16 = source.attention_k_norm_bf16;
+      target.attention.block_table_i32 = model->attention_block_table;
+      target.attention.block_table_entries = model->state_capacity;
+      target.attention.key_cache_fp8_e4m3 =
+          model->attention_key_cache + index * attention_cache_stride;
+      target.attention.value_cache_fp8_e4m3 =
+          model->attention_value_cache + index * attention_cache_stride;
+      target.attention.key_cache_scale = 1.0F;
+      target.attention.value_cache_scale = 1.0F;
+    }
   }
   q27_model_status reset = q27_model_reset(model);
   if (reset.code != Q27_MODEL_OK) return reset;
@@ -838,7 +1033,7 @@ q27_model_status AttentionLayer(q27_model* model, uint32_t layer) {
 
   const uint32_t attention_index = AttentionIndex(layer);
   const uint64_t cache_layer_stride =
-      static_cast<uint64_t>(model->capacity) * kKvBytesPerToken;
+      static_cast<uint64_t>(model->state_capacity) * kKvBytesPerToken;
   uint8_t* key_cache = model->attention_key_cache +
                        attention_index * cache_layer_stride;
   uint8_t* value_cache = model->attention_value_cache +
@@ -877,7 +1072,7 @@ q27_model_status AttentionLayer(q27_model* model, uint32_t layer) {
   decode.value_cache_fp8_e4m3 = value_cache;
   decode.block_table_i32 = model->attention_block_table;
   decode.sequence_length_u32 = model->attention_sequence_length;
-  decode.max_sequence_length = model->capacity;
+  decode.max_sequence_length = model->state_capacity;
   decode.kv_scale = 1.0F;
   decode.output_bf16 = model->attention_output;
   decode.workspace = model->attention_workspace;
@@ -1039,6 +1234,9 @@ extern "C" q27_model_status q27_model_create(
   std::memcpy(model->layers, weights->layers, sizeof(model->layers));
   model->weights.layers = model->layers;
   model->capacity = options->context_capacity;
+  model->state_capacity =
+      std::max<uint32_t>(options->context_capacity,
+                         static_cast<uint32_t>(Q27_PREFILL_MODEL_TOKENS));
   error = cudaStreamCreateWithFlags(&model->stream, cudaStreamNonBlocking);
   if (error != cudaSuccess) {
     FreeModel(model);
@@ -1076,7 +1274,7 @@ extern "C" q27_model_status q27_model_reset(q27_model* model) {
       model->gdn_recurrent_stride * Q27_MODEL_GDN_LAYERS, model->stream);
   if (error != cudaSuccess) return Cuda("q27 recurrence reset: ", error);
   const uint64_t cache_bytes = static_cast<uint64_t>(Q27_MODEL_ATTENTION_LAYERS) *
-                               model->capacity * kKvBytesPerToken;
+                               model->state_capacity * kKvBytesPerToken;
   error = cudaMemsetAsync(model->attention_key_cache, 0, cache_bytes,
                           model->stream);
   if (error != cudaSuccess) return Cuda("q27 key cache reset: ", error);
@@ -1091,11 +1289,112 @@ extern "C" q27_model_status q27_model_consume_token(q27_model* model,
     return Invalid("invalid q27 consume token arguments");
   if (model->position >= model->capacity)
     return Invalid("q27 context capacity exhausted");
-  StageProfiler profiler(model->stream, false);
+  const bool profile = SelectedProfilePosition(model->position);
+  const auto begin = std::chrono::steady_clock::now();
+  StageProfiler profiler(model->stream, profile);
   model->logits_valid = false;
   q27_model_status status = RunLayers(model, token, profiler);
   if (status.code != Q27_MODEL_OK) return status;
+  if (profile) {
+    const cudaError_t error = cudaStreamSynchronize(model->stream);
+    if (error != cudaSuccess) return Cuda("q27 profiled consume sync: ", error);
+    const uint64_t elapsed_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - begin)
+            .count());
+    profiler.Report(static_cast<double>(elapsed_us) / 1000.0,
+                    model->position, "consume");
+  }
   ++model->position;
+  return Ok();
+}
+
+extern "C" q27_model_status q27_model_prefill_greedy(
+    q27_model* model, const uint32_t* host_tokens, uint32_t count,
+    uint32_t* output_token) {
+  if (model == nullptr || host_tokens == nullptr || output_token == nullptr ||
+      count == 0 || count > model->capacity)
+    return Invalid("invalid q27 batched prefill arguments");
+  for (uint32_t index = 0; index < count; ++index)
+    if (host_tokens[index] >= kVocabulary)
+      return Invalid("q27 batched prefill token is out of range");
+
+  q27_model_status reset = q27_model_reset(model);
+  if (reset.code != Q27_MODEL_OK) return reset;
+  model->logits_valid = false;
+  const auto begin = std::chrono::steady_clock::now();
+  uint32_t consumed = 0;
+  while (consumed < count) {
+    const uint32_t valid = std::min<uint32_t>(
+        Q27_PREFILL_MODEL_TOKENS, count - consumed);
+    cudaError_t error = cudaMemcpyAsync(
+        model->prefill_token_tile, host_tokens + consumed,
+        static_cast<uint64_t>(valid) * sizeof(uint32_t),
+        cudaMemcpyHostToDevice, model->stream);
+    if (error != cudaSuccess)
+      return Cuda("q27 prefill token tile copy: ", error);
+
+    q27_prefill_model_args args = {};
+    args.struct_size = sizeof(args);
+    args.abi_version = Q27_PREFILL_MODEL_ABI_VERSION;
+    args.valid_tokens = valid;
+    args.committed_tokens = model->position;
+    args.token_ids_u32 = model->prefill_token_tile;
+    args.embedding_bf16 = model->weights.embedding_bf16;
+    args.final_norm_bf16 = model->weights.final_norm_bf16;
+    args.lm_head_bf16 = model->weights.lm_head_bf16;
+    args.layers = model->prefill_layers;
+    args.layer_count = Q27_MODEL_LAYERS;
+    args.produce_output = consumed + valid == count ? 1U : 0U;
+    args.rope_cos_sin_f32 = model->rope_cache;
+    args.rope_row_stride_elements = Q27_ATTENTION_ROTARY_DIM;
+    args.rope_position_capacity = model->state_capacity;
+    args.output_token_i32 = model->output_token;
+    args.scratch = model->prefill_scratch;
+    args.scratch_bytes = model->prefill_layout.scratch_bytes;
+    args.cuda_stream = model->stream;
+    const q27_prefill_model_status prefill =
+        q27_prefill_model_forward(model->prefill_plan, &args);
+    if (prefill.code != Q27_PREFILL_MODEL_OK)
+      return Kernel("q27 batched prefill: ", prefill.message);
+    model->position += valid;
+    consumed += valid;
+  }
+
+  const float* prefill_logits = q27_prefill_model_logits(
+      &model->prefill_layout, model->prefill_scratch);
+  cudaError_t error = cudaMemcpyAsync(
+      model->logits, prefill_logits,
+      static_cast<uint64_t>(kVocabulary) * sizeof(float),
+      cudaMemcpyDeviceToDevice, model->stream);
+  if (error != cudaSuccess)
+    return Cuda("q27 prefill logits publication: ", error);
+  int32_t result = -1;
+  uint32_t invalid = 0;
+  error = cudaMemcpyAsync(&result, model->output_token, sizeof(result),
+                          cudaMemcpyDeviceToHost, model->stream);
+  if (error != cudaSuccess)
+    return Cuda("q27 prefill token result copy: ", error);
+  error = cudaMemcpyAsync(
+      &invalid,
+      q27_prefill_model_invalid_count(&model->prefill_layout,
+                                      model->prefill_scratch),
+      sizeof(invalid), cudaMemcpyDeviceToHost, model->stream);
+  if (error != cudaSuccess)
+    return Cuda("q27 prefill validation copy: ", error);
+  error = cudaStreamSynchronize(model->stream);
+  if (error != cudaSuccess) return Cuda("q27 prefill sync: ", error);
+  if (invalid != 0)
+    return Kernel("q27 batched prefill: ",
+                  "device token/page validation failed");
+  if (result < 0 || static_cast<uint32_t>(result) >= kVocabulary)
+    return Kernel("q27 batched prefill: ", "argmax result is out of range");
+  *output_token = static_cast<uint32_t>(result);
+  model->last_decode_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - begin)
+          .count());
+  model->logits_valid = true;
   return Ok();
 }
 
@@ -1107,9 +1406,7 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
   if (model->position >= model->capacity)
     return Invalid("q27 context capacity exhausted");
   const auto begin = std::chrono::steady_clock::now();
-  StageProfiler profiler(
-      model->stream,
-      model->position == 1 && std::getenv("Q27_PROFILE_STAGES") != nullptr);
+  StageProfiler profiler(model->stream, ProfileDecode(model->position));
   model->logits_valid = false;
   q27_model_status status = RunLayers(model, token, profiler);
   if (status.code != Q27_MODEL_OK) return status;
@@ -1169,7 +1466,8 @@ extern "C" q27_model_status q27_model_decode_greedy(q27_model* model,
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - begin)
           .count());
-  profiler.Report(static_cast<double>(elapsed_us) / 1000.0, model->position);
+  profiler.Report(static_cast<double>(elapsed_us) / 1000.0, model->position,
+                  "decode");
   *output_token = static_cast<uint32_t>(result);
   ++model->position;
   model->last_decode_us = elapsed_us;

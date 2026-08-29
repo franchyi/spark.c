@@ -10,13 +10,21 @@
 The repository is a Spark-specific SGLang recipe, not a standalone kernel
 library. We reuse its exact checkpoint selection and measured operating policy:
 FlashInfer attention for SM121, FP8 KV, BF16 Mamba/GDN state, fixed state-pool
-sizing, chunked prefill, CPU pinning, and speculative-decoding profiles.
+sizing, chunked prefill, CPU pinning, and its DFlash2 speculative profile.
 
-The resident `lmsysorg/sglang:qwen38-27b` Linux/arm64 image is pinned to
-`sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6`
-and pulled through `docker.1ms.run`. Its image configuration/SBOM is captured on
-Spark before acceptance. The optional locally built DFlash2 derivative remains
-a separate, non-default profile.
+Only its pinned DFlash2 profile is a supported speculative oracle. Historical
+MTP/EAGLE recipes and a selector-free DFlash1 fallback are explicitly outside
+the Spark.C product boundary. Target-only launches remain useful for numerical
+parity, but they are not an alternative speculative serving configuration.
+
+The `lmsysorg/sglang:qwen38-27b` Linux/arm64 registry manifest is pinned to
+`sha256:febfb971c7352570fc445c466ebd6ffc9d896024958e544a60f2137fd85856b1`
+and pulled through `docker.1ms.run`. The accepted Spark image ID is separately
+recorded as
+`sha256:0076dffa60b76b7bf033c04d05e0cc69d46f2b8cd60aa2468827782afe9bc38f`;
+the registry manifest and local image ID must not be substituted for one
+another. Its image configuration/SBOM is captured on Spark before acceptance.
+The locally built DFlash2 derivative remains revision-locked separately.
 
 ## Potential kernel donors
 
@@ -26,8 +34,9 @@ kernel provenance lock with a full revision, license, file hashes, tensor
 contract, and oracle parity result. Until then, they remain transitive components
 of the pinned oracle container.
 
-The DFlash2 overlay in the pinned repository is an optional oracle profile. Its
-Python patches are not copied into Q27's native runtime.
+The DFlash2 overlay in the pinned repository is the serving oracle profile. Its
+Python patches are not copied into Q27's native runtime; only audited,
+fixed-shape kernels and semantics cross the native boundary.
 
 ## Dense NVFP4 donor audit
 

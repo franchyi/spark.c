@@ -24,7 +24,9 @@ Qwen tokenizer/chat rendering. It cannot own GPU state or model scheduling.
 For the two Qwen programs:
 
 - Rust owns request admission, tokenization, streaming, model-specific state,
-  fixed buffers, storage I/O, cancellation, and launch order.
+  fixed buffers, storage I/O, cancellation, and launch order. Qwen prefill is
+  tiled at fixed M=128/512 shapes; a scheduler must never implement prompt
+  ingestion as a loop over the M=1 decode body.
 - C/CUDA owns hot arithmetic behind narrow raw-pointer ABIs. Kernel calls do not
   allocate, discover models, page weights, or choose scheduling policy.
 - Python/Torch may appear in offline export or oracle scripts, never in the
@@ -81,5 +83,16 @@ builders, or unused platform support into the native server.
 6. Same-prompt prefill/decode benchmark against the oracle on Spark.
 
 Performance numbers are never compared across different checkpoints, prompt
-lengths, generation lengths, concurrency, MTP modes, or thermal states. Current
-evidence is summarized in [benchmarks.md](benchmarks.md).
+lengths, generation lengths, concurrency, DFlash2 draft revisions/settings, or
+thermal states. DFlash2 is Qwen3.8-27B's sole speculative path; target-only
+batched prefill plus M=1 decode remains the current native service while
+DFlash2 integration is in progress. M=1 execution is retained only for decode,
+parity, and baseline measurement.
+Current evidence is summarized in [benchmarks.md](benchmarks.md).
+
+The native Qwen3.8-27B serial-prefill baseline is now a rejected correctness
+oracle: it measured 8.06 tok/s on the same 12,617-token prompt where the pinned
+SGLang profile reached 852.40 tok/s. New prefill code enters the model only
+after short M=128/M=512 arithmetic, state, and attention fixtures pass on
+Spark. The promoted path now measures 484.86 tok/s over the same 12,617-token
+HTTP workload; no further long M=1 prompt benchmark is permitted.

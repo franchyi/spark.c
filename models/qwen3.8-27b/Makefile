@@ -25,7 +25,7 @@ smoke:
 	@./scripts/smoke-native.sh
 
 bench:
-	@./scripts/bench.sh
+	@./scripts/bench-native.py
 
 stop:
 	@./scripts/stop-native.sh

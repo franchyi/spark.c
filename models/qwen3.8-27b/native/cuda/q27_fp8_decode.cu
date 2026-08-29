@@ -4,7 +4,8 @@
  * The streaming GEMV arithmetic is adapted from SGLang's Apache-2.0
  * sm120_fp8_gemv.cuh at sha256 b30efef9bc1a000b46e0710357f4531a...
  * Framework TensorView/JIT wrappers are removed. Q27 instantiates only
- * the five shapes present in the q27 checkpoint and calls raw CUDA pointers.
+ * the six shapes used by the q27 graph and calls raw CUDA pointers. The
+ * 16384x5120 shape is the load-time-concatenated GDN QKV+Z projection.
  */
 
 #include "q27_kernels.h"
@@ -140,7 +141,8 @@ void Launch(const q27_fp8_project_args& args, cudaStream_t stream) {
 }
 
 bool Supported(uint32_t n, uint32_t k) {
-  return (n == 10240 && k == 5120) || (n == 6144 && k == 5120) ||
+  return (n == 16384 && k == 5120) || (n == 10240 && k == 5120) ||
+         (n == 6144 && k == 5120) ||
          (n == 5120 && k == 6144) || (n == 12288 && k == 5120) ||
          (n == 1024 && k == 5120);
 }
@@ -162,7 +164,9 @@ extern "C" q27_kernel_status q27_fp8_project(
             "shape is not a Qwen3.8-27B FP8 projection"};
   }
   cudaStream_t stream = static_cast<cudaStream_t>(args->cuda_stream);
-  if (args->n == 10240 && args->k == 5120) {
+  if (args->n == 16384 && args->k == 5120) {
+    Launch<16384, 5120>(*args, stream);
+  } else if (args->n == 10240 && args->k == 5120) {
     Launch<10240, 5120>(*args, stream);
   } else if (args->n == 6144 && args->k == 5120) {
     Launch<6144, 5120>(*args, stream);

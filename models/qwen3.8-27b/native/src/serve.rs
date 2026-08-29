@@ -1,9 +1,9 @@
 //! Model-specific OpenAI service for the native Qwen3.8-27B capsule.
 //!
 //! This process owns exactly one long-lived native model and one serialized
-//! generation queue. Prompt prefill advances recurrent/KV state without an LM
-//! head for every non-final prompt token; the final prompt step produces the
-//! first completion token. There is no Python or framework runtime.
+//! generation queue. One model-level native call schedules the complete prompt
+//! in fixed 128-token CUDA tiles and returns the first completion token. There
+//! is no Python or framework runtime.
 
 mod checkpoint;
 mod mapping;
@@ -68,8 +68,12 @@ unsafe extern "C" {
         options: *const ModelOptions,
         output: *mut *mut NativeModel,
     ) -> ModelStatus;
-    fn q27_model_reset(model: *mut NativeModel) -> ModelStatus;
-    fn q27_model_consume_token(model: *mut NativeModel, token: u32) -> ModelStatus;
+    fn q27_model_prefill_greedy(
+        model: *mut NativeModel,
+        host_tokens: *const u32,
+        count: u32,
+        output_token: *mut u32,
+    ) -> ModelStatus;
     fn q27_model_decode_greedy(
         model: *mut NativeModel,
         token: u32,
@@ -406,13 +410,20 @@ fn run_generation(
     let result = drive_greedy(
         request,
         context_capacity,
-        || {
+        |tokens| {
+            let count = u32::try_from(tokens.len())
+                .map_err(|_| "q27 prompt token count exceeds u32".to_owned())?;
+            let mut output = 0_u32;
             // SAFETY: all calls are serialized on the model's owner thread.
-            native_status(unsafe { q27_model_reset(model.0.as_ptr()) })
-        },
-        |token| {
-            // SAFETY: all calls are serialized on the model's owner thread.
-            native_status(unsafe { q27_model_consume_token(model.0.as_ptr(), token) })
+            native_status(unsafe {
+                q27_model_prefill_greedy(
+                    model.0.as_ptr(),
+                    tokens.as_ptr(),
+                    count,
+                    &mut output,
+                )
+            })?;
+            Ok(output)
         },
         |token| {
             let mut output = 0_u32;
@@ -466,8 +477,7 @@ fn run_generation(
 fn drive_greedy(
     request: GenerationRequest,
     context_capacity: u32,
-    mut reset: impl FnMut() -> Result<(), String>,
-    mut consume: impl FnMut(u32) -> Result<(), String>,
+    mut prefill: impl FnMut(&[u32]) -> Result<u32, String>,
     mut decode: impl FnMut(u32) -> Result<u32, String>,
     mut emit: impl FnMut(u32) -> Result<(), String>,
 ) -> Result<GreedyOutcome, String> {
@@ -488,15 +498,7 @@ fn drive_greedy(
         ));
     }
 
-    reset()?;
-    let (final_prompt, prompt_prefix) = request
-        .prompt_token_ids
-        .split_last()
-        .expect("empty prompt was rejected above");
-    for &token in prompt_prefix {
-        consume(token)?;
-    }
-    let mut candidate = decode(*final_prompt)?;
+    let mut candidate = prefill(&request.prompt_token_ids)?;
     for generated in 0..request.max_new_tokens {
         if request.stop_token_ids.contains(&candidate) {
             return Ok(GreedyOutcome {
@@ -608,21 +610,16 @@ mod tests {
     }
 
     #[test]
-    fn sequential_prefill_returns_final_prompt_prediction_first() {
-        let mut consumed_inputs = Vec::new();
+    fn batched_prefill_returns_final_prompt_prediction_first() {
+        let mut prefill_inputs = Vec::new();
         let mut decoded_inputs = Vec::new();
         let mut emitted = Vec::new();
-        let mut resets = 0;
         let finish = drive_greedy(
             request(&[10, 20], 3, &[]),
             8,
-            || {
-                resets += 1;
-                Ok(())
-            },
-            |token| {
-                consumed_inputs.push(token);
-                Ok(())
+            |tokens| {
+                prefill_inputs.push(tokens.to_vec());
+                Ok(21)
             },
             |token| {
                 decoded_inputs.push(token);
@@ -634,9 +631,8 @@ mod tests {
             },
         )
         .expect("greedy sequence");
-        assert_eq!(resets, 1);
-        assert_eq!(consumed_inputs, [10]);
-        assert_eq!(decoded_inputs, [20, 21, 22]);
+        assert_eq!(prefill_inputs, [vec![10, 20]]);
+        assert_eq!(decoded_inputs, [21, 22]);
         assert_eq!(emitted, [21, 22, 23]);
         assert_eq!(finish.finish_reason, FinishReason::Length);
         assert_eq!(finish.terminal_stop_token_id, None);
@@ -648,8 +644,7 @@ mod tests {
         let finish = drive_greedy(
             request(&[10, 20], 3, &[21]),
             8,
-            || Ok(()),
-            |_| Ok(()),
+            |_| Ok(21),
             |token| Ok(token + 1),
             |token| {
                 emitted.push(token);
@@ -668,14 +663,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sampling_and_slot_overflow_before_reset() {
+    fn rejects_sampling_and_slot_overflow_before_prefill() {
         let mut sampling = request(&[1], 1, &[]);
         sampling.temperature = 0.5;
         let error = drive_greedy(
             sampling,
             2,
-            || panic!("must not reset"),
-            |_| panic!("must not consume"),
+            |_| panic!("must not prefill"),
             |_| Ok(2),
             |_| Ok(()),
         )
@@ -685,8 +679,7 @@ mod tests {
         let error = drive_greedy(
             request(&[1, 2], 2, &[]),
             3,
-            || panic!("must not reset"),
-            |_| panic!("must not consume"),
+            |_| panic!("must not prefill"),
             |_| Ok(2),
             |_| Ok(()),
         )
@@ -724,20 +717,13 @@ mod tests {
     }
 
     #[test]
-    fn consume_failure_stops_before_final_prompt_decode() {
+    fn prefill_failure_stops_before_decode() {
         let mut decoded = false;
         let mut emitted = false;
         let error = drive_greedy(
             request(&[10, 20, 30], 1, &[]),
             8,
-            || Ok(()),
-            |token| {
-                if token == 20 {
-                    Err("consume failed".to_owned())
-                } else {
-                    Ok(())
-                }
-            },
+            |_| Err("prefill failed".to_owned()),
             |_| {
                 decoded = true;
                 Ok(31)
@@ -747,8 +733,8 @@ mod tests {
                 Ok(())
             },
         )
-        .expect_err("consume failure");
-        assert_eq!(error, "consume failed");
+        .expect_err("prefill failure");
+        assert_eq!(error, "prefill failed");
         assert!(!decoded);
         assert!(!emitted);
     }

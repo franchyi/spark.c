@@ -13,6 +13,10 @@ namespace {
 constexpr uint64_t kAlignment = 256;
 constexpr uint32_t kHidden = 5120;
 constexpr uint32_t kIntermediate = 17408;
+constexpr uint64_t kGateWeightBytes =
+    static_cast<uint64_t>(kIntermediate) * kHidden / 2;
+constexpr uint64_t kGateScaleBytes =
+    static_cast<uint64_t>(kIntermediate) * (kHidden / 16);
 
 q27_mlp_status Ok() { return {Q27_MLP_OK, "ok"}; }
 
@@ -28,30 +32,30 @@ uint64_t Align(uint64_t value) {
   return (value + kAlignment - 1) & ~(kAlignment - 1);
 }
 
-bool BuildLayout(q27_mlp_layout* output, const q27_nvfp4_shape& gate,
+bool BuildLayout(q27_mlp_layout* output, const q27_nvfp4_shape& gate_up,
                  const q27_nvfp4_shape& down) {
-  if (gate.n != kIntermediate || gate.k != kHidden ||
+  if (gate_up.n != kIntermediate * 2 || gate_up.k != kHidden ||
       down.n != kHidden || down.k != kIntermediate) {
     return false;
   }
   uint64_t cursor = 0;
   output->packed_hidden_offset = cursor;
-  cursor = Align(cursor + gate.packed_input_bytes);
+  cursor = Align(cursor + gate_up.packed_input_bytes);
   output->hidden_scales_offset = cursor;
-  cursor = Align(cursor + gate.input_scale_bytes);
+  cursor = Align(cursor + gate_up.input_scale_bytes);
   output->gate_output_offset = cursor;
-  cursor = Align(cursor + gate.output_bytes);
+  cursor = Align(cursor + gate_up.output_bytes / 2);
   output->up_output_offset = cursor;
-  cursor = Align(cursor + gate.output_bytes);
+  cursor = Align(cursor + gate_up.output_bytes / 2);
   output->activated_offset = cursor;
-  cursor = Align(cursor + gate.output_bytes);
+  cursor = Align(cursor + gate_up.output_bytes / 2);
   output->packed_activated_offset = cursor;
   cursor = Align(cursor + down.packed_input_bytes);
   output->activated_scales_offset = cursor;
   cursor = Align(cursor + down.input_scale_bytes);
   output->scratch_bytes = cursor;
   output->workspace_bytes =
-      std::max(gate.workspace_bytes, down.workspace_bytes);
+      std::max(gate_up.workspace_bytes, down.workspace_bytes);
   return true;
 }
 
@@ -66,13 +70,14 @@ extern "C" q27_mlp_status q27_mlp_query(q27_mlp_layout* output) {
       output->abi_version != Q27_MLP_ABI_VERSION) {
     return Invalid("invalid q27 MLP layout output");
   }
-  q27_nvfp4_shape gate = {sizeof(gate), Q27_NVFP4_ABI_VERSION};
+  q27_nvfp4_shape gate_up = {sizeof(gate_up), Q27_NVFP4_ABI_VERSION};
   q27_nvfp4_shape down = {sizeof(down), Q27_NVFP4_ABI_VERSION};
-  q27_nvfp4_status status = q27_nvfp4_query(Q27_NVFP4_GATE, &gate);
+  q27_nvfp4_status status =
+      q27_nvfp4_query(Q27_NVFP4_GATE_UP, &gate_up);
   if (status.code != Q27_NVFP4_OK) return Nvfp4(status);
   status = q27_nvfp4_query(Q27_NVFP4_DOWN, &down);
   if (status.code != Q27_NVFP4_OK) return Nvfp4(status);
-  if (!BuildLayout(output, gate, down)) {
+  if (!BuildLayout(output, gate_up, down)) {
     return Kernel("pinned q27 NVFP4 physical shape changed");
   }
   return Ok();
@@ -129,7 +134,17 @@ extern "C" q27_mlp_status q27_mlp_decode(
   q27_nvfp4_gemm_args gemm = {};
   gemm.struct_size = sizeof(gemm);
   gemm.abi_version = Q27_NVFP4_ABI_VERSION;
-  gemm.projection = Q27_NVFP4_GATE;
+  const bool fused_gate_up =
+      static_cast<const unsigned char*>(args->up_weight_fp4_e2m1) ==
+          static_cast<const unsigned char*>(args->gate_weight_fp4_e2m1) +
+              kGateWeightBytes &&
+      static_cast<const unsigned char*>(
+          args->up_weight_scales_e4m3_128x4) ==
+          static_cast<const unsigned char*>(
+              args->gate_weight_scales_e4m3_128x4) + kGateScaleBytes &&
+      args->gate_alpha == args->up_alpha;
+  gemm.projection =
+      fused_gate_up ? Q27_NVFP4_GATE_UP : Q27_NVFP4_GATE;
   gemm.packed_input_fp4_e2m1 = packed_hidden;
   gemm.input_scales_e4m3_128x4 = hidden_scales;
   gemm.weight_fp4_e2m1 = args->gate_weight_fp4_e2m1;
@@ -143,13 +158,15 @@ extern "C" q27_mlp_status q27_mlp_decode(
   status = q27_nvfp4_gemm(&gemm);
   if (status.code != Q27_NVFP4_OK) return Nvfp4(status);
 
-  gemm.projection = Q27_NVFP4_UP;
-  gemm.weight_fp4_e2m1 = args->up_weight_fp4_e2m1;
-  gemm.weight_scales_e4m3_128x4 = args->up_weight_scales_e4m3_128x4;
-  gemm.alpha = args->up_alpha;
-  gemm.output_bf16 = up_output;
-  status = q27_nvfp4_gemm(&gemm);
-  if (status.code != Q27_NVFP4_OK) return Nvfp4(status);
+  if (!fused_gate_up) {
+    gemm.projection = Q27_NVFP4_UP;
+    gemm.weight_fp4_e2m1 = args->up_weight_fp4_e2m1;
+    gemm.weight_scales_e4m3_128x4 = args->up_weight_scales_e4m3_128x4;
+    gemm.alpha = args->up_alpha;
+    gemm.output_bf16 = up_output;
+    status = q27_nvfp4_gemm(&gemm);
+    if (status.code != Q27_NVFP4_OK) return Nvfp4(status);
+  }
 
   q27_silu_mul_args silu = {};
   silu.struct_size = sizeof(silu);
