@@ -44,7 +44,6 @@ CUDA_QWEN_QSA_BLOCK_SHARED := $(BUILD_DIR)/libsparkserve-qwen-qsa-block.so
 CUDA_QWEN_PLE_BLOCK_SHARED := $(BUILD_DIR)/libsparkserve-qwen-ple-block.so
 CUDA_QWEN_DECODE_GLUE_SHARED := $(BUILD_DIR)/libsparkserve-qwen-decode-glue.so
 CUDA_QWEN_RUNTIME_SHARED := $(BUILD_DIR)/libsparkserve-qwen-runtime.so
-CUDA_QWEN_DISPATCH_SHARED := $(BUILD_DIR)/libsparkserve-qwen-dispatch.so
 CUDA_FABRIC_SHARED := $(BUILD_DIR)/libsparkserve-fabric.so
 CUDA_QWEN_EXPERT_PACK_SHARED := $(BUILD_DIR)/libsparkserve-qwen-expert-pack.so
 CUDA_QWEN_EXPERT_PACK_FIXTURE_TEST := $(BUILD_DIR)/qwen-expert-pack-fixture-test
@@ -101,7 +100,7 @@ GDN_PREFILL_AOT_OBJECTS ?=
 TVM_FFI_ROOT ?=
 CUTE_DSL_ROOT ?=
 
-.PHONY: test test-cpp test-cuda fetch-ds4-glm53 glm53-ds4-static fabric-shared qwen-expert-pack-shared qwen-moe-shared qwen-gdn-shared qwen-qsa-block-shared qwen-ple-block-shared qwen-decode-glue-shared qwen-runtime-shared qwen-dispatch-shared ggml-quant-shared glm-kda-shared glm-kpool-shared glm-paged-mqa-shared glm-sparse-mla-shared qsa-shared moe-gate-shared shared-expert-shared moe-join-shared mhc-shared test-cuda-fabric test-cuda-qwen-expert-pack-fixture test-cuda-ggml-quant-fixture test-cuda-glm-kda-fixture test-cuda-glm-kpool-fixture test-cuda-glm-paged-mqa-fixture test-cuda-glm-sparse-mla-fixture test-cuda-gdn test-cuda-gdn-fixture test-cuda-gdn-prefill-fixture test-cuda-qwen-gdn-block-fixture test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-moe-gate-fixture test-cuda-shared-expert-fixture test-cuda-moe-join-fixture test-cuda-mhc-fixture test-cuda-ple-gather-fixture test-cuda-qsa-topk-fixture test-cuda-qsa-expand-fixture test-cuda-qsa-score-fixture test-cuda-qsa-index-prep-fixture test-cuda-qsa-kv-pack-fixture test-cuda-qsa-decode-xqa-fixture test-cuda-qwen-moe-fixture test-cuda-qwen-full-layer-fixture docker-flash-next-sm121 clean
+.PHONY: test test-cpp test-cuda fetch-ds4-glm53 glm53-ds4-static fabric-shared qwen-expert-pack-shared qwen-moe-shared qwen-gdn-shared qwen-qsa-block-shared qwen-ple-block-shared qwen-decode-glue-shared qwen-runtime-shared ggml-quant-shared glm-kda-shared glm-kpool-shared glm-paged-mqa-shared glm-sparse-mla-shared qsa-shared moe-gate-shared shared-expert-shared moe-join-shared mhc-shared test-cuda-fabric test-cuda-qwen-expert-pack-fixture test-cuda-ggml-quant-fixture test-cuda-glm-kda-fixture test-cuda-glm-kpool-fixture test-cuda-glm-paged-mqa-fixture test-cuda-glm-sparse-mla-fixture test-cuda-gdn test-cuda-gdn-fixture test-cuda-gdn-prefill-fixture test-cuda-qwen-gdn-block-fixture test-cuda-nvfp4 test-cuda-nvfp4-fixture test-cuda-grouped-nvfp4 test-cuda-grouped-nvfp4-fixture test-cuda-silu-nvfp4 test-cuda-silu-nvfp4-fixture test-cuda-moe-route test-cuda-moe-gate-fixture test-cuda-shared-expert-fixture test-cuda-moe-join-fixture test-cuda-mhc-fixture test-cuda-ple-gather-fixture test-cuda-qsa-topk-fixture test-cuda-qsa-expand-fixture test-cuda-qsa-score-fixture test-cuda-qsa-index-prep-fixture test-cuda-qsa-kv-pack-fixture test-cuda-qsa-decode-xqa-fixture test-cuda-qwen-moe-fixture test-cuda-qwen-full-layer-fixture docker-flash-next-sm121 clean
 
 test: test-cpp
 
@@ -161,8 +160,6 @@ qwen-ple-block-shared: $(CUDA_QWEN_PLE_BLOCK_SHARED)
 qwen-decode-glue-shared: $(CUDA_QWEN_DECODE_GLUE_SHARED)
 
 qwen-runtime-shared: $(CUDA_QWEN_RUNTIME_SHARED)
-
-qwen-dispatch-shared: $(CUDA_QWEN_DISPATCH_SHARED)
 
 ggml-quant-shared: $(CUDA_GGML_QUANT_SHARED)
 
@@ -695,12 +692,7 @@ $(CUDA_QWEN_DECODE_GLUE_SHARED): csrc/cuda/qwen_decode_glue.cu csrc/include/spar
 		csrc/cuda/qwen_decode_glue.cu -lcublas -lcudart \
 		-o $(CUDA_QWEN_DECODE_GLUE_SHARED)
 
-$(CUDA_QWEN_DISPATCH_SHARED): csrc/qwen_runtime_dispatch.cc csrc/include/sparkserve/qwen_runtime_dispatch_api.h csrc/include/sparkserve/kernel_api.h csrc/include/sparkserve/qwen_gdn_aux_api.h
-	mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -shared -fPIC -Icsrc/include \
-		csrc/qwen_runtime_dispatch.cc -ldl -o $(CUDA_QWEN_DISPATCH_SHARED)
-
-$(CUDA_QWEN_RUNTIME_SHARED): csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu csrc/cuda/gdn_decode_flashinfer_cute.cc csrc/cuda/gdn_block_sglang.cu csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/cuda/moe_gate_sglang.cu csrc/cuda/shared_expert_sglang.cu csrc/cuda/moe_join_sglang.cu csrc/cuda/mhc_sglang.cu csrc/cuda/ple_gather.cu csrc/cuda/qwen_expert_pack.cu csrc/cuda/qwen_gdn_aux.cu csrc/cuda/qwen_qsa_block.cu csrc/cuda/qwen_ple_block.cu csrc/cuda/qwen_decode_glue.cu csrc/include/sparkserve/kernel_api.h
+$(CUDA_QWEN_RUNTIME_SHARED): csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc csrc/cuda/gdn_decode.cu csrc/cuda/gdn_decode_flashinfer_cute.cc csrc/cuda/gdn_block_sglang.cu csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu csrc/cuda/moe_gate_sglang.cu csrc/cuda/shared_expert_sglang.cu csrc/cuda/moe_join_sglang.cu csrc/cuda/mhc_sglang.cu csrc/cuda/ple_gather.cu csrc/cuda/qwen_expert_pack.cu csrc/cuda/qwen_gdn_aux.cu csrc/cuda/qwen_qsa_block.cu csrc/cuda/qwen_ple_block.cu csrc/cuda/qwen_decode_glue.cu csrc/include/sparkserve/kernel_api.h csrc/include/sparkserve/qwen_runtime_api.h
 	test -n "$(GDN_AOT_OBJECT)"
 	test -n "$(GDN_PREFILL_AOT_OBJECTS)"
 	test -n "$(CUTE_NVFP4_OBJECT)"
@@ -727,7 +719,8 @@ $(CUDA_QWEN_RUNTIME_SHARED): csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu csr
 		-DSPARKSERVE_WITH_SGLANG_CUBLAS_MHC \
 		-DSPARKSERVE_WITH_SGLANG_PLE_GATHER \
 		-Icsrc/include -Icsrc $(FLASHINFER_INCLUDES) -I$(TVM_FFI_ROOT)/include \
-		csrc/kernel_contract.cc csrc/cuda/gdn_decode.cu \
+		csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc \
+		csrc/cuda/gdn_decode.cu \
 		csrc/cuda/gdn_decode_flashinfer_cute.cc csrc/cuda/gdn_block_sglang.cu \
 		csrc/cuda/nvfp4_grouped_flashinfer.cu csrc/cuda/nvfp4_silu_cute.cc \
 		csrc/cuda/nvfp4_quantize_cute.cc csrc/cuda/moe_route_flashinfer.cu \

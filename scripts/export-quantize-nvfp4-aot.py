@@ -28,11 +28,17 @@ def main() -> None:
 
     values = torch.zeros((1, 2560), dtype=torch.bfloat16, device="cuda")
     global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+    # Call FlashInfer's CuTe-DSL backend explicitly.  SGLang's fp4_quantize is
+    # a precompiled torch op and therefore does not populate the AOT cache.
+    # A device scale selects the ABI consumed by nvfp4_quantize_cute.cc.
+    from flashinfer.quantization import nvfp4_quantize
 
-    if fp4_quantize is None:
-        raise RuntimeError("SGLang did not register FlashInfer fp4_quantize")
-    fp4_quantize(values, global_scale)
+    nvfp4_quantize(
+        values,
+        global_scale,
+        backend="cute-dsl",
+        enable_pdl=False,
+    )
     torch.cuda.synchronize()
 
     matches = list(Path(jit_env.FLASHINFER_JIT_DIR).rglob(SPECIALIZATION))

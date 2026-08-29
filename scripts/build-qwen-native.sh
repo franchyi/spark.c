@@ -7,6 +7,12 @@ cuda_image=${SPARKSERVE_CUDA_IMAGE:-sparkserve/sglang:qwen38flashnext-sm121}
 rust_image=${SPARKSERVE_RUST_IMAGE:-docker.1ms.run/rust:1.89.0}
 jobs=${JOBS:-4}
 target_host=${SPARKSERVE_RUST_TARGET:-${HOME}/.cache/sparkserve-rust-target}
+expected_cuda_image_id=$(tr -d '[:space:]' < "$repo_root/third_party/qwen-native-build-image.id")
+actual_cuda_image_id=$(docker image inspect "$cuda_image" --format '{{.Id}}')
+if [[ "$actual_cuda_image_id" != "$expected_cuda_image_id" ]]; then
+  echo "Qwen build image mismatch: expected $expected_cuda_image_id, got $actual_cuda_image_id" >&2
+  exit 1
+fi
 
 "$script_dir/fetch-kernel-sources.sh" "$repo_root/third_party/_deps/flashinfer"
 
@@ -18,14 +24,7 @@ docker run --rm --gpus all --network host \
     python3 scripts/export-gdn-aot.py build/aot-qwen/gdn --tokens 1 2 4 8 16
     python3 scripts/export-silu-nvfp4-aot.py build/aot-qwen/silu
     python3 scripts/export-quantize-nvfp4-aot.py build/aot-qwen/quantize
-    printf "%s  %s\n" \
-      4779bfc774d485240ef2b0ae4be8bd3a6b45619cad2c02b4f236e5a58c972163 \
-      build/aot-qwen/gdn/gdn_bf16_t1_h16_hv48_k128_v128_sm121.o \
-      | sha256sum -c -
-    printf "%s  %s\n" \
-      8cbc3a588037ba109978c019da0f774c87f3968193376a341a8fc35624376916 \
-      build/aot-qwen/quantize/swizzled_bfloat16_k2560_sf0_pdl0.o \
-      | sha256sum -c -
+    sha256sum -c third_party/qwen-aot-sm121.sha256
 
     tvm_lib=$(find /usr/local/lib /usr/lib -type f -name "libtvm_ffi.so*" -print -quit 2>/dev/null)
     dialect_archive=$(find /usr/local/lib /usr/lib -type f -name libcuda_dialect_runtime_static.a -print -quit 2>/dev/null)
@@ -52,7 +51,7 @@ docker run --rm --network host \
   -v "$target_host:/cargo-target" \
   -e CARGO_HOME=/work/.cache/cargo-home \
   -e CARGO_TARGET_DIR=/cargo-target \
-  -e RUSTFLAGS='-L native=/work/build -l dylib=sparkserve-fabric -l dylib=sparkserve-qwen-runtime -l dylib=sparkserve-qsa -C link-arg=-Wl,--allow-shlib-undefined' \
+  -e RUSTFLAGS='-L native=/work/build -l dylib=sparkserve-fabric -l dylib=sparkserve-qwen-runtime -l dylib=sparkserve-qsa' \
   "$rust_image" \
   cargo build --release -p sparkserve-runtime --features native-fabric-smoke \
     --example qwen_first_token --example qwen_decode --example qwen_serve

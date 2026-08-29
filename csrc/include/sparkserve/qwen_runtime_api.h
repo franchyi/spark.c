@@ -1,5 +1,5 @@
-#ifndef SPARKSERVE_QWEN_RUNTIME_DISPATCH_API_H_
-#define SPARKSERVE_QWEN_RUNTIME_DISPATCH_API_H_
+#ifndef SPARKSERVE_QWEN_RUNTIME_API_H_
+#define SPARKSERVE_QWEN_RUNTIME_API_H_
 
 #include "sparkserve/kernel_api.h"
 #include "sparkserve/qwen_gdn_aux_api.h"
@@ -43,4 +43,4 @@ SparkServeStatus sparkserve_qwen_runtime_ple_gather(
 }  // extern "C"
 #endif
 
-#endif  // SPARKSERVE_QWEN_RUNTIME_DISPATCH_API_H_
+#endif  // SPARKSERVE_QWEN_RUNTIME_API_H_

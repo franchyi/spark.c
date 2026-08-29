@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=docker.1ms.run/lmsysorg/sglang:qwen38flashnext
+ARG BASE_IMAGE=docker.1ms.run/lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1
 FROM ${BASE_IMAGE}
 
 COPY src/sparkserve /opt/sparkserve/sparkserve
