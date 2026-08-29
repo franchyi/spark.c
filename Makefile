@@ -706,6 +706,7 @@ $(CUDA_QWEN_RUNTIME_SHARED): csrc/kernel_contract.cc csrc/qwen_runtime_direct.cc
 	mkdir -p $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) --use_fast_math $(FLASHINFER_ARCH_FLAGS) -diag-suppress 177 \
 		-diag-suppress 549 -shared -Xcompiler=-fPIC \
+		-DSPARKSERVE_WITH_CUDA \
 		-DSPARKSERVE_WITH_FLASHINFER_GDN_AOT \
 		-DSPARKSERVE_WITH_FLASHINFER_GDN_PREFILL_AOT \
 		-DSPARKSERVE_WITH_SGLANG_CUBLAS_GDN_BLOCK \
