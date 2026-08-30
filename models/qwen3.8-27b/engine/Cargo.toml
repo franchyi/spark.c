@@ -1,0 +1,20 @@
+[package]
+name = "spark-qwen27"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Model-specific Qwen3.8-27B DFlash2 engine for DGX Spark"
+
+[[bin]]
+name = "q27-serve-dflash2"
+path = "src/serve_dflash2.rs"
+
+[[bin]]
+name = "q27-pack-scales"
+path = "src/scale_pack.rs"
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"] }
+tiny_http = "=0.12.0"

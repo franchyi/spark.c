@@ -1,2 +1,0 @@
-f1b56af7476695688d11bb004dc6cee144cd8922a56683a12c504c53aec26c47  python/sglang/kernels/jit/csrc/elementwise/activation.cuh
-7c357dfb96efb31a52e1895477a97f96d17c11e618d35cc0cb04ba4d051a6d89  python/sglang/kernels/ops/moe/triton_sigmoid_gate_mul.py

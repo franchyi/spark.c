@@ -1,12 +1,13 @@
 [workspace]
 members = [
-    "models/qwen3.8-27b/native",
-    "models/qwen3.8-flash-next/native",
+    "models/qwen3.8-27b/engine",
+    "models/qwen3.8-flash-next/engine",
 ]
 resolver = "2"
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 8
+incremental = true
 panic = "abort"
 strip = "symbols"

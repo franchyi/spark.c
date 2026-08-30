@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: build download serve smoke bench stop provenance
+.PHONY: build download serve smoke bench stop
 
 build:
 	@./scripts/build.sh
@@ -19,6 +19,3 @@ bench:
 
 stop:
 	@./scripts/stop.sh
-
-provenance:
-	@sed -n '1,240p' VENDOR.md

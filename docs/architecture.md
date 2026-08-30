@@ -1,98 +1,55 @@
 # Architecture
 
-## Product boundary
+## Boundary
 
-Spark.C supports exactly three model products on one DGX Spark:
+Spark.C supports exactly three products on one DGX Spark:
 
-| Model | Graph owner | Native language | Weight format |
+| Model | Control | Hot path | Weights |
 | --- | --- | --- | --- |
-| Qwen3.8-27B | `models/qwen3.8-27b` | Rust + CUDA | ModelOpt NVFP4 safetensors |
-| Qwen3.8-Flash-Next | `models/qwen3.8-flash-next` | Rust + CUDA | ModelOpt NVFP4 safetensors + FP8 PLE |
-| GLM-5.3-Flash Q2 | embedded ds4 under `models/glm-5.3-flash-q2/native` | C + CUDA | GGUF Q2 |
+| Qwen3.8-27B | Rust, one request slot | CUDA + fixed DFlash2 T=8 | NVFP4 safetensors |
+| Qwen3.8-Flash-Next | Rust, one request slot | CUDA GDN/QSA/MoE/PLE | NVFP4 + FP8 PLE |
+| GLM-5.3-Flash | embedded C | ds4-derived CUDA graph/MMQ | Q2 GGUF |
 
-The model directories share an operational contract, not an inference
-framework. Each owns its tensor layout, state, CUDA launch sequence, memory
-budget, and performance decisions. A small amount of duplicated model glue is
-preferred to a dynamic graph, plugin registry, generalized allocator, or model
-class hierarchy.
+Each `models/<name>/engine/` owns its graph, tensor layouts, state, launch
+sequence, and memory budget. A little duplicated model glue is preferred to a
+dynamic graph, framework scheduler, model registry, or generalized allocator.
+`common/` is limited to HTTP/SSE and exact Qwen tokenization.
 
-`common/` is intentionally limited to the OpenAI HTTP/SSE surface and exact
-Qwen tokenizer/chat rendering. It cannot own GPU state or model scheduling.
+Rust owns admission, tokenization, streaming, cancellation, storage, and fixed
+buffers for Qwen. C/CUDA owns allocation-free arithmetic through narrow ABIs.
+Python/Torch is allowed only for offline AOT export. GLM keeps its complete
+model-specific C/CUDA control path because rewriting that graph in Rust offers
+no demonstrated performance benefit.
 
-## Runtime split
+## Spark policy
 
-For the two Qwen programs:
+GB10 CPU and GPU share 128 GB of physical memory. Moving a model between
+"CPU" and "GPU" does not create capacity, so Spark.C avoids duplicate copies:
 
-- Rust owns request admission, tokenization, streaming, model-specific state,
-  fixed buffers, storage I/O, cancellation, and launch order. Qwen prefill is
-  tiled at fixed M=128/512 shapes; a scheduler must never implement prompt
-  ingestion as a loop over the M=1 decode body.
-- C/CUDA owns hot arithmetic behind narrow raw-pointer ABIs. Kernel calls do not
-  allocate, discover models, page weights, or choose scheduling policy.
-- Python/Torch may appear in offline export or oracle scripts, never in the
-  native serving process.
+- Qwen3.8-27B should load an aligned packed sidecar directly, then unregister
+  and discard the original mapped source pages.
+- Flash-Next maps and CUDA-registers one expert sidecar. PLE remains FP8 in its
+  original files and only selected rows enter a bounded cache.
+- GLM maps/registers the GGUF directly, uses ATS/HMM prefetch and source-page
+  discard, and retains its selective expert cache. Its resident Q2 service needs
+  about 110 GiB available memory.
 
-GLM is intentionally different. The pinned ds4 source closure is embedded in
-the model capsule and already owns the loader,
-tokenizer, KDA, DSA/MLA, mHC, MoE, MTP, sampling, APIs, and CUDA graphs. The
-first release builds and runs that source directly, without fetching or linking
-an external ds4 checkout. A later Rust admission front is useful
-only if a benchmark demonstrates an operational advantage; it must not rewrite
-the GLM graph or quantized kernels.
+The single-user specialization is deliberate: batch one, static arenas,
+persistent KV/recurrent state, fixed CUDA graphs, prefix/session reuse, no
+multi-tenant fairness machinery, and NVMe only as startup/cold backing.
 
-## Spark memory policy
+## Build policy
 
-GB10 CPU and GPU share 128 GB of physical memory. “CPU offload” therefore does
-not create capacity, and model loading must avoid accidental host/device copies.
+CuTe/FlashInfer kernels that require Python generation are exported once as
+fixed SM121 objects because the serving process has no Python or JIT runtime.
+`make build` verifies checksums and reuses those objects. Donor source is kept
+outside the repository at `~/.cache/spark-c/sources`; generated/JIT state is
+kept at `~/.cache/spark-c/aot`. Ordinary CUDA and Rust build directories are
+incremental and are no longer deleted by build scripts.
 
-- Qwen3.8-27B keeps the compact text graph resident. Safetensors are mapped and
-  registered for inspection; aligned hot matrices are promoted only where the
-  measured kernel requires it.
-- Flash-Next keeps its roughly 47.7-GiB FP8 PLE in the original safetensors on
-  NVMe. Only selected rows enter a bounded, registered cache; the full table is
-  never expanded to BF16.
-- GLM Q2 is a resident 96,505,816,384-byte GGUF and requires about 110 GiB
-  `MemAvailable` before startup. IQ3 expert paging is future work, not a hidden
-  dependency of the Q2 service.
+## Gates
 
-File-backed bytes still consume DRAM after they are touched. Every model must
-charge mapped/resident pages, KV or recurrent state, scratch, and request
-transients before admission. Fixed addresses are favored so decode CUDA graphs
-can be captured without allocator activity.
-
-## Kernel reuse
-
-Frameworks are references; selected kernels are dependencies. A borrowed kernel
-is accepted only with an immutable source revision, license, tensor contract,
-SM121 build, real-checkpoint fixture, numerical policy, and GB10 measurement.
-The current sources are recorded in [kernels.md](kernels.md) and
-`vendor/kernel-sources.toml`.
-
-The preferred order is FlashInfer/FlashAttention, CUTLASS/CuTe, cuBLASLt, a
-small donor kernel from SGLang/ds4, then a local specialization. We do not carry
-SGLang or vLLM scheduling, distributed execution, Python model registries, JIT
-builders, or unused platform support into the native server.
-
-## Delivery gates
-
-1. Strict checkpoint identity and tensor-layout validation.
-2. Operator fixtures from real checkpoint tensors.
-3. Complete layer and persistent-state parity.
-4. Teacher-forced logits and greedy continuation parity with the pinned oracle.
-5. OpenAI non-streaming and SSE service smoke.
-6. Same-prompt prefill/decode benchmark against the oracle on Spark.
-
-Performance numbers are never compared across different checkpoints, prompt
-lengths, generation lengths, concurrency, DFlash2 draft revisions/settings, or
-thermal states. DFlash2 is Qwen3.8-27B's sole speculative path; target-only
-batched prefill plus M=1 decode remains the current native service while
-DFlash2 integration is in progress. M=1 execution is retained only for decode,
-parity, and baseline measurement.
-Current evidence is summarized in [benchmarks.md](benchmarks.md).
-
-The native Qwen3.8-27B serial-prefill baseline is now a rejected correctness
-oracle: it measured 8.06 tok/s on the same 12,617-token prompt where the pinned
-SGLang profile reached 852.40 tok/s. New prefill code enters the model only
-after short M=128/M=512 arithmetic, state, and attention fixtures pass on
-Spark. The promoted path now measures 484.86 tok/s over the same 12,617-token
-HTTP workload; no further long M=1 prompt benchmark is permitted.
+The minimum promotion sequence is strict checkpoint/layout validation, one
+real-tensor operator canary, complete layer/state parity, greedy token parity,
+one OpenAI/SSE smoke, and one matched Spark prefill/decode benchmark. Repeated
+benchmark matrices and long rejected baselines are intentionally avoided.

@@ -17,8 +17,8 @@ if ! kill -0 "${pid}" 2>/dev/null; then
 fi
 
 command_line="$(ps -p "${pid}" -o command=)"
-if [[ "${command_line}" != *"ds4-server"* ]]; then
-  echo "refusing to stop pid ${pid}; command is not ds4-server: ${command_line}" >&2
+if [[ "${command_line}" != *"glm-server"* ]]; then
+  echo "refusing to stop pid ${pid}; command is not glm-server: ${command_line}" >&2
   exit 1
 fi
 

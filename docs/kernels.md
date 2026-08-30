@@ -1,8 +1,8 @@
 # Kernel sources
 
 Spark.C borrows proven arithmetic, not a general serving framework. The
-machine-readable pins, source paths, licenses, and hashes live in
-`vendor/kernel-sources.toml` and each `vendor/*/VENDOR.md`.
+donor commits and licenses live in the root README; generated code lives under
+the one model that compiles it.
 
 | Model path | Operation | Donor | Local boundary |
 | --- | --- | --- | --- |
@@ -24,7 +24,7 @@ Every copied or generated kernel must record:
 1. upstream repository, full commit, original path, license, and file hash;
 2. supported dtype, shape, packing, strides, alignment, scales, and output;
 3. compiler/CUDA/SM121 flags and any offline AOT step;
-4. independent real-tensor fixture and explicit tolerance;
+4. one independent real-tensor canary and explicit tolerance;
 5. GB10 timing plus the fallback or kill switch.
 
 A correct GEMM does not establish model correctness. Scale inversion, padded
@@ -36,7 +36,6 @@ order, and reduction precision are all part of the contract.
 The serving binary may link CUDA, cuBLAS/cuBLASLt, and the small C runtime needed
 by pinned AOT objects. It must not require Python, Torch, SGLang, vLLM,
 serving-time JIT, dynamic model discovery, or a framework allocator. Oracle
-containers remain isolated under model-local `oracle-*` commands.
-
-The historical design review and exact donor investigation remain under
-`handoff/ARCHITECTURE_REVIEW.md`; they are evidence, not the current tree map.
+containers and historical review clones are not part of the shipping tree.
+Donor commits are recorded in the root README; build-time source manifests and
+inline source notices stay beside the engines that consume them.

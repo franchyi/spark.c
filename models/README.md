@@ -1,30 +1,21 @@
-# Three model implementations
+# Model engines
 
-Each directory below is a complete model capsule. A capsule owns its model
-graph, weights, native code, scripts, service lifecycle, and measured baseline.
-There is no shared model superclass or framework scheduler.
+All three model directories use the same small operational layout:
 
 ```text
-models/
-├── qwen3.8-27b/
-│   ├── native/{src,cuda,include,fixtures,tools}
-│   └── scripts/                 # native service + SGLang oracle
-├── qwen3.8-flash-next/
-│   ├── native/{src,kernels,examples,tests,tools}
-│   └── scripts/                 # native service + vLLM oracle
-└── glm-5.3-flash-q2/
-    ├── native/{ds4.c,ds4_cuda.cu,cuda/mmq,...}
-    └── scripts/                 # standalone build/service
+<model>/
+├── engine/       # complete model-specific inference implementation
+├── scripts/      # build, serve, smoke, benchmark, stop
+├── engine.toml   # checkpoint/runtime pins
+├── Makefile
+└── README.md
 ```
 
 | Model | Implementation | Status | Port |
-| --- | --- | --- | --- |
-| Qwen3.8-27B | native Rust/CUDA NVFP4 | functional MVP | `30000` |
-| Qwen3.8-Flash-Next | native Rust/CUDA NVFP4 + sparse PLE | first-token/greedy | `8020` |
-| GLM-5.3-Flash Q2 | embedded ds4 C/CUDA GGUF | accepted | `8010` |
+| --- | --- | --- | ---: |
+| Qwen3.8-27B | Rust/CUDA NVFP4, fixed DFlash2 T=8 | serving and optimized | 30000 |
+| Qwen3.8-Flash-Next | Rust/CUDA NVFP4, GDN/QSA/MoE/PLE | serving, performance work continues | 8020 |
+| GLM-5.3-Flash Q2 | standalone C/CUDA GGUF | accepted | 8010 |
 
-Each model exposes `build`, `serve`, `smoke`, `bench`, `stop`, and
-`provenance` through its Makefile. From the root, use `make qwen27-*`,
-`make flash-*`, or `make glm-*`. The operational contract is documented in
-[CONTRACT.md](CONTRACT.md), and the target-host run order is in
-[SPARK_ACCEPTANCE.md](SPARK_ACCEPTANCE.md).
+The directories share only an HTTP/tokenizer utility layer. They do not share
+a model abstraction, scheduler, allocator, or graph runtime.

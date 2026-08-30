@@ -1,50 +1,26 @@
 # GLM-5.3-Flash Q2
 
-This capsule embeds the complete pinned ds4 GLM-5.3 source closure under
-`native/`. That is the shortest route to a correct standalone C/CUDA service:
-the embedded engine owns the GGUF loader, KDA,
-DSA/MLA, mHC, top-8 MoE graph, MTP, tokenizer, sampling, OpenAI endpoints, and
-SSE. It has no source-checkout or external ds4 runtime dependency. Spark.C does
-not rebuild those pieces in Rust for the first release.
-
-The Q2 checkpoint is the mainline. Unsloth `UD-IQ3_XXS` expert paging remains an
-independent later engine/format optimization and cannot block this service.
-
-## Operations
+A standalone C/CUDA engine for the 96,505,816,384-byte Q2 GGUF. The embedded
+ds4-derived implementation owns GGUF loading, KDA, DSA/MLA, mHC, top-8 MoE,
+MTP, tokenization, sampling, OpenAI endpoints, and SSE. It has no runtime source
+checkout or Python dependency. IQ3 paging is later work and does not block Q2.
 
 ```bash
-make build
 make download
-GLM53_Q2_VERIFY_SHA=1 make serve
+make build
+make serve
 make smoke
 make bench
 make stop
-make provenance
 ```
 
-Defaults:
+Defaults are port `8010`, 2048 context, 128 output tokens, and model path
+`/home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`.
+Startup requires about 110 GiB available memory.
 
-- Model: `/home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`
-- Endpoint: `127.0.0.1:8010`
-- Context/output: `2048/128`
-- Preflight: at least 110 GiB `MemAvailable`
-
-Set `SPARK_ENGINE_MODEL`, `SPARK_ENGINE_BIND`, and `SPARK_ENGINE_PORT` to
-override those values. `make download` uses `https://hf-mirror.com` and resumes
-the exact locked revision.
-
-## Accepted Spark baseline
-
-The pinned embedded source and exact 96,505,816,384-byte model passed models,
-Chat Completions, Responses, and Chat SSE. Its exact ds4 2048/128 benchmark on
-the measured Spark produced 523.02 prefill and 14.52 generation tok/s. Those are
-the release baseline; later Rust scheduling must preserve correctness and show a
-measured operational benefit before replacing ds4's control path.
-
-## Rust boundary
-
-A future Rust front-end may own admission, batching, cancellation, metrics, and
-multi-client fairness while calling a long-lived ds4 model context through a
-narrow ABI. It must not fork one ds4 process per request or rewrite GLM kernels.
-Until that boundary is benchmarked, the embedded native server remains the
-shipping engine.
+The accepted Spark baseline is 523.02 prefill and 14.52 decode tok/s. A later
+Nsight Systems sample measured a 68.57-ms steady decode boundary (14.58 tok/s):
+Q8 dense 35.7%, Q4 pair 14.9%, BF16 matvec 11.4%, and indexed attention 9.7%.
+The engine now pairs the KDA `f_a/g_a` low-rank projections, removing eleven
+launches per token while retaining `DS4_CUDA_GLM_DISABLE_KDA_FG_PAIR=1` as an
+exact fallback.

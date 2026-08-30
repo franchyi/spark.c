@@ -1548,7 +1548,7 @@ mod tests {
 
     impl TokenGenerator for GreedyDefaultBackend {
         fn model_id(&self) -> &str {
-            "qwen3.8-27b-native"
+            "qwen3.8-27b"
         }
 
         fn default_temperature(&self) -> f32 {
@@ -1628,7 +1628,7 @@ mod tests {
     fn backend_temperature_default_applies_only_when_wire_value_is_absent() {
         let service = OpenAiServer::new(tokenizer(), Arc::new(GreedyDefaultBackend));
         let omitted: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "qwen3.8-27b-native",
+            "model": "qwen3.8-27b",
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 1,
             "chat_template_kwargs": {"enable_thinking": false}
@@ -1640,7 +1640,7 @@ mod tests {
         );
 
         let explicit: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "qwen3.8-27b-native",
+            "model": "qwen3.8-27b",
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 1,
             "temperature": 0.25,
@@ -1689,7 +1689,7 @@ mod tests {
             ("tools", json!([{"type": "function", "function": {"name": "lookup"}}])),
         ] {
             let mut value = json!({
-                "model": "qwen3.8-27b-native",
+                "model": "qwen3.8-27b",
                 "messages": [{"role": "user", "content": "hello"}],
                 "max_tokens": 1
             });

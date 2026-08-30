@@ -1,32 +1,73 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENGINE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-REPO_ROOT="$(CDPATH= cd -- "${ENGINE_DIR}/../.." && pwd)"
-CHECKOUT="${Q27_DEPS_DIR:-${REPO_ROOT}/vendor/_deps}/qwen38-27b-miaai"
+# Foreground, single-slot launcher for the model-specific DFlash2 engine.
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd "$script_dir/../../.." && pwd)
+model_dir=$(cd "$script_dir/.." && pwd)
+server="$repo_root/build/bin/q27-serve-dflash2"
+pid_file="$model_dir/.server.pid"
 
-"${ENGINE_DIR}/scripts/fetch-oracle.sh"
+target=${SPARK_ENGINE_MODEL:?set SPARK_ENGINE_MODEL to the target Qwen3.8-27B snapshot}
+sidecar=${SPARK_ENGINE_SIDECAR:?set SPARK_ENGINE_SIDECAR to q27-scales-v1.bin}
+draft=${SPARK_DFLASH2_MODEL:?set SPARK_DFLASH2_MODEL to the pinned draft snapshot}
+bind=${SPARK_ENGINE_BIND:-0.0.0.0:${SPARK_ENGINE_PORT:-30000}}
+model_id=${SPARK_ENGINE_MODEL_ID:-spark/Qwen3.8-27B-DFlash2}
+capacity=${SPARK_ENGINE_CONTEXT_CAPACITY:-16384}
 
-port="${SPARK_ENGINE_PORT:-8888}"
-if [[ "${port}" != "8888" ]]; then
-  echo "the pinned first-version launcher requires SPARK_ENGINE_PORT=8888" >&2
-  exit 64
+for path in "$target" "$sidecar" "$draft"; do
+  if [[ ! -e "$path" ]]; then
+    echo "required model path does not exist: $path" >&2
+    exit 1
+  fi
+done
+if [[ ! -x "$server" ]]; then
+  echo "Q27 DFlash2 server is not built: $server" >&2
+  exit 1
 fi
 
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
-export QUANT="${QWEN27_QUANT:-${QUANT:-nvfp4}}"
-export CPUSET="${QWEN27_CPUSET:-${CPUSET:-5-9,15-19}}"
-export CONTEXT_LENGTH="${QWEN27_CONTEXT_LENGTH:-${CONTEXT_LENGTH:-262144}}"
-export MAX_CONCURRENT_REQUESTS="${QWEN27_MAX_CONCURRENCY:-${MAX_CONCURRENT_REQUESTS:-10}}"
-mirror_env="HF_ENDPOINT=${HF_ENDPOINT} HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET}"
-export DOCKER_ENV="${DOCKER_ENV:+${DOCKER_ENV} }${mirror_env}"
+export LD_LIBRARY_PATH="$repo_root/build/q27:/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+export Q27_GDN_C427_AOT=${Q27_GDN_C427_AOT:-1}
+export Q27_GDN_C427_AOT_DIR=${Q27_GDN_C427_AOT_DIR:-${HOME}/.cache/spark-c/aot/q27/c427}
+export Q27_PREFILL_M8192=${Q27_PREFILL_M8192:-1}
+export Q27_DFLASH2_T8_GDN=${Q27_DFLASH2_T8_GDN:-1}
 
-cd "${CHECKOUT}"
-if [[ -n "${QWEN27_PROFILE:-}" && "${QWEN27_PROFILE}" != "dflash2" ]]; then
-  echo "QWEN27_PROFILE only accepts dflash2; MTP/EAGLE/DFlash1 are unsupported" >&2
-  exit 64
+server_pid() {
+  local pid=$1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -e "/proc/$pid/exe" ]] || return 1
+  [[ "$(readlink -f "/proc/$pid/exe")" == "$(readlink -f "$server")" ]]
+}
+
+if [[ -f "$pid_file" ]]; then
+  old_pid=$(<"$pid_file")
+  if kill -0 "$old_pid" 2>/dev/null; then
+    if server_pid "$old_pid"; then
+      echo "Q27 DFlash2 server already running as pid $old_pid" >&2
+    else
+      echo "refusing to reuse active pid $old_pid from $pid_file" >&2
+    fi
+    exit 1
+  fi
+  rm -f "$pid_file"
 fi
 
-export IMAGE="${SPARK_ENGINE_IMAGE:-${IMAGE:-lmsysorg/sglang:qwen38-27b-dflash2}}"
-exec ./start-dflash.sh
+child_pid=""
+cleanup() {
+  if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+    if server_pid "$child_pid"; then
+      kill "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+    else
+      echo "refusing to stop reused pid $child_pid" >&2
+    fi
+  fi
+  rm -f "$pid_file"
+}
+trap cleanup EXIT INT TERM
+
+"$server" "$target" "$sidecar" "$draft" \
+  "$bind" "$model_id" "$capacity" &
+child_pid=$!
+printf '%s\n' "$child_pid" >"$pid_file"
+wait "$child_pid"

@@ -1,0 +1,38 @@
+[package]
+name = "spark-flash-next"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Model-specific Qwen3.8 Flash-Next engine for DGX Spark"
+
+[[bin]]
+name = "qwen_serve"
+path = "src/bin/server.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "qwen_first_token"
+path = "src/bin/first_token.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "qwen_decode"
+path = "src/bin/decode.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "qwen_expert_sidecar_v2"
+path = "src/bin/expert_sidecar.rs"
+
+[features]
+cuda = []
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"] }
+tiny_http = "=0.12.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "=0.7.14"
+libc = "=0.2.189"

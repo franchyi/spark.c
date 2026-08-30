@@ -4,9 +4,9 @@
 
 help:
 	@echo "Spark.C model commands"
-	@echo "  make qwen27-{build|serve|smoke|bench|stop|provenance}"
-	@echo "  make flash-{build|serve|smoke|bench|stop|provenance}"
-	@echo "  make glm-{build|download|serve|smoke|bench|stop|provenance}"
+	@echo "  make qwen27-{build|serve|smoke|bench|stop}"
+	@echo "  make flash-{build|build-fused|index-ple|serve|smoke|bench|stop}"
+	@echo "  make glm-{build|download|serve|smoke|bench|stop}"
 
 list:
 	@echo qwen3.8-27b

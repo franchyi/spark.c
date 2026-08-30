@@ -9,7 +9,7 @@
       "architecture": "Qwen3_5ForConditionalGeneration",
       "format": "modelopt_nvfp4_safetensors",
       "quantization": "NVFP4_MLP_FP8_ATTENTION_BF16_LM_HEAD",
-      "inventory": "strict_native_scanner",
+      "inventory": "strict_engine_scanner",
       "checkpoint_bytes": 23749063264,
       "storage": {
         "mapped_text_mtp_bytes": 22827603072,

@@ -1,14 +1,11 @@
 .venv/
 .uv-cache/
 .pytest_cache/
-vendor/_deps/
-models/*/native/tests/fixtures/private/
+models/*/engine/tests/fixtures/private/
 __pycache__/
 *.py[cod]
 build/
 dist/
 target/
 compile_commands.json
-models/*/.native.pid
 models/*/.server.pid
-handoff/repos/

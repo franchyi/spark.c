@@ -2,17 +2,17 @@
 set -euo pipefail
 
 ENGINE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-PID_FILE="${ENGINE_DIR}/.native.pid"
+PID_FILE="${ENGINE_DIR}/.server.pid"
 
 if [[ ! -f "${PID_FILE}" ]]; then
-  echo "native Qwen pid file absent; nothing to stop"
+  echo "Qwen Flash-Next pid file absent; nothing to stop"
   exit 0
 fi
 
 pid="$(cat "${PID_FILE}")"
 if ! kill -0 "${pid}" 2>/dev/null; then
   rm -f "${PID_FILE}"
-  echo "removed stale native Qwen pid file"
+  echo "removed stale Qwen Flash-Next pid file"
   exit 0
 fi
 
@@ -24,4 +24,4 @@ fi
 
 kill "${pid}"
 rm -f "${PID_FILE}"
-echo "stopped native Qwen server pid ${pid}"
+echo "stopped Qwen Flash-Next server pid ${pid}"

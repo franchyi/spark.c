@@ -3,7 +3,7 @@ id = "qwen3.8-flash-next"
 display_name = "Qwen3.8-Flash-Next NVFP4"
 model_family = "qwen3.8-flash-next"
 checkpoint_format = "modelopt-nvfp4-safetensors"
-stage = "native-first-token"
+stage = "serving"
 default_port = 8020
 
 [checkpoint]
@@ -11,7 +11,7 @@ default = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
 ple_storage = "fp8-safetensors-on-nvme"
 
 [runtime]
-shipping_backend = "spark.c-rust-cuda"
+shipping_backend = "spark-rust-cuda"
 oracle_backend = "vllm-pinned-mmap"
 attention = "qsa-selected-kv-flashinfer-xqa"
 recurrent = "gdn"

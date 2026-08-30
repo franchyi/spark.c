@@ -7,7 +7,7 @@ engine_dir=$(cd "$script_dir/.." && pwd)
 pid_file="$engine_dir/.server.pid"
 model=${1:-${SPARK_ENGINE_MODEL:-${GLM53_Q2_MODEL:-/home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf}}}
 
-server="$repo_root/build/glm-5.3-flash-q2/ds4-server"
+server="$repo_root/build/glm-5.3-flash-q2/glm-server"
 if [[ ! -x "$server" ]]; then
   echo "missing $server; run 'make build' in the GLM model directory" >&2
   exit 1

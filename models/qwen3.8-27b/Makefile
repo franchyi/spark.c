@@ -1,46 +1,20 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: build inspect eager test-fp8 serve smoke bench stop provenance fetch-oracle \
-	oracle-serve oracle-smoke oracle-bench oracle-stop
+.PHONY: build serve smoke bench stop
 
 build:
-	@./scripts/build-native.sh
-
-inspect:
-	@./scripts/inspect-native.sh
-
-eager:
-	@./scripts/run-eager.sh
-
-test-fp8:
-	@$(MAKE) -C native test-fp8
-
-fetch-oracle:
-	@./scripts/fetch-oracle.sh
+	@./scripts/build.sh
 
 serve:
-	@./scripts/serve-native.sh
-
-smoke:
-	@./scripts/smoke-native.sh
-
-bench:
-	@./scripts/bench-native.py
-
-stop:
-	@./scripts/stop-native.sh
-
-oracle-serve: fetch-oracle
 	@./scripts/serve.sh
 
-oracle-smoke:
+smoke:
 	@./scripts/smoke.sh
 
-oracle-bench:
-	@./scripts/bench.sh
+bench:
+	@python3 ./scripts/bench.py --engine spark-q27 \
+		--case "$${Q27_BENCH_CASE:-decode}" --sample 1 \
+		--base-url "$${SPARK_ENGINE_BASE_URL:-http://127.0.0.1:30000/v1}"
 
-oracle-stop:
+stop:
 	@./scripts/stop.sh
-
-provenance:
-	@sed -n '1,240p' VENDOR.md

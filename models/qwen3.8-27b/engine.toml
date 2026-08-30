@@ -3,7 +3,7 @@ id = "qwen3.8-27b"
 display_name = "Qwen3.8-27B NVFP4"
 model_family = "qwen3.8"
 checkpoint_format = "modelopt-nvfp4-safetensors"
-stage = "native-p0"
+stage = "serving"
 default_port = 30000
 
 [checkpoint]
@@ -11,7 +11,7 @@ default = "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
 alternative = "RadixArk/Qwen3.8-27B-NVFP4"
 
 [runtime]
-shipping_backend = "native-q27"
+shipping_backend = "spark-q27"
 oracle_backend = "sglang-pinned-recipe"
 attention = "pinned-flashinfer-or-flashattention-specialization"
 kv_cache_dtype = "fp8_e4m3"
