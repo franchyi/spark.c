@@ -836,6 +836,7 @@ typedef struct FlashGdnBlockPlan {
   uint32_t dtype;
   uint32_t requested_backend;
   float rms_norm_eps;
+  // 1 selects SGLang's merged QKVZBA projection for fixed T=1 decode.
   uint32_t reserved;
 } FlashGdnBlockPlan;
 

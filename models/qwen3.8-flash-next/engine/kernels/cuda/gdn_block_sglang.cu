@@ -23,6 +23,7 @@ constexpr int kHeadDim = 128;
 constexpr int kQkWidth = kQkHeads * kHeadDim;
 constexpr int kValueWidth = kValueHeads * kHeadDim;
 constexpr int kConvWidth = 2 * kQkWidth + kValueWidth;
+constexpr int kFusedProjectionWidth = kConvWidth + kValueWidth + 2 * kValueHeads;
 constexpr int kConvKernel = 4;
 constexpr int kConvState = kConvKernel - 1;
 constexpr int kConvThreads = 64;
@@ -243,28 +244,39 @@ FlashStatus flash_sglang_cublas_gdn_prepare_cuda_launch(
   FlashStatus bound = Bind(handle, stream);
   if (bound.code != FLASH_STATUS_OK) return bound;
 
-  struct Projection {
-    int width;
-    const void* weight;
-    void* output;
-    const char* error;
-  };
-  const Projection projections[] = {
-      {kConvWidth, args->in_proj_qkv_weight, args->projected_qkv,
-       "cuBLAS GDN QKV projection failed: "},
-      {kValueWidth, args->in_proj_z_weight, args->projected_z,
-       "cuBLAS GDN Z projection failed: "},
-      {kValueHeads, args->in_proj_b_weight, args->projected_b,
-       "cuBLAS GDN B projection failed: "},
-      {kValueHeads, args->in_proj_a_weight, args->projected_a,
-       "cuBLAS GDN A projection failed: "},
-  };
-  for (const Projection& projection : projections) {
+  // SGLang stacks qkv, z, b, and a weights at load time and uses one wide
+  // projection for small-M decode. The four output pointers are row views of
+  // that fused T=1 result. Large-M prefill retains the component GEMMs.
+  if (args->plan.reserved == 1) {
     const cublasStatus_t status = RowMajorBf16Linear(
-        handle, tokens, projection.width, kHidden, args->hidden_states,
-        projection.weight, projection.output);
+        handle, tokens, kFusedProjectionWidth, kHidden, args->hidden_states,
+        args->in_proj_qkv_weight, args->projected_qkv);
     if (status != CUBLAS_STATUS_SUCCESS)
-      return CublasError(projection.error, status);
+      return CublasError("cuBLAS fused GDN QKVZBA projection failed: ", status);
+  } else {
+    struct Projection {
+      int width;
+      const void* weight;
+      void* output;
+      const char* error;
+    };
+    const Projection projections[] = {
+        {kConvWidth, args->in_proj_qkv_weight, args->projected_qkv,
+         "cuBLAS GDN QKV projection failed: "},
+        {kValueWidth, args->in_proj_z_weight, args->projected_z,
+         "cuBLAS GDN Z projection failed: "},
+        {kValueHeads, args->in_proj_b_weight, args->projected_b,
+         "cuBLAS GDN B projection failed: "},
+        {kValueHeads, args->in_proj_a_weight, args->projected_a,
+         "cuBLAS GDN A projection failed: "},
+    };
+    for (const Projection& projection : projections) {
+      const cublasStatus_t status = RowMajorBf16Linear(
+          handle, tokens, projection.width, kHidden, args->hidden_states,
+          projection.weight, projection.output);
+      if (status != CUBLAS_STATUS_SUCCESS)
+        return CublasError(projection.error, status);
+    }
   }
 
   if (tokens == 1) {

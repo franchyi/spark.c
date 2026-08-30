@@ -21,6 +21,13 @@ the token path reads unified DRAM without a second expert copy. NVMe is startup
 backing and the future cold tier, not the steady decode path. The default fused
 service listens on port `8020` and requires the SoA-v2 sidecar.
 
-Current warm target-only measurements are 43.3-44.5 prefill tok/s for a
-66-token prompt and 9.7-10.9 decode tok/s. The fused-MoE integration is present;
-its performance promotion remains the next Spark gate.
+The current one-shot warm measurement is 74.8 prefill tok/s for a 57-token
+prompt and 10.9 target-only decode tok/s. The earlier pre-batching prefill range
+was 43.3-44.5 tok/s. The gain comes from SGLang-style merged GDN decode
+projections and batched QSA input/output projections; sparse selection remains
+causal and model-owned.
+
+The checkpoint contains its native `mtp.*` tensors but no DFlash/DFlash2 draft
+weights. SGLang's Flash-Next path therefore uses NEXTN/MTP rather than DFlash2.
+Native NEXTN verification is the next decode milestone; DFlash2 should only be
+added if a matching Flash-Next draft checkpoint and SGLang recipe appear.

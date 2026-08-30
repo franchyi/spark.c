@@ -9,7 +9,8 @@ cache policy match.
 | Mia/SGLang Qwen3.8-27B DFlash2 | 12,617 prompt; 47 → 256 decode | 826.78 tok/s | 35.30 tok/s |
 | Spark.C Qwen3.8-27B, final prefill | c427 prep/recurrence, mixed tail | **926.48 tok/s** | — |
 | Spark.C Qwen3.8-27B, true-M8 DFlash2 | matched 47 → 256 decode | — | **37.76 tok/s** |
-| Spark.C Flash-Next target-only | warm 66-token prompt | 43.3-44.5 tok/s | 9.7-10.9 tok/s |
+| Spark.C Flash-Next, before batched QSA | warm 66-token prompt | 43.3-44.5 tok/s | 9.7-10.9 tok/s |
+| Spark.C Flash-Next, batched QSA | warm 57-token prompt / 2 output | **74.80 tok/s** | **10.87 tok/s** |
 | Spark.C GLM-5.3 Q2 | 2048 prompt / 128 output | 523.02 tok/s | 14.52 tok/s |
 
 Qwen3.8-27B first measured 537.42 prefill and 17.07 DFlash2 decode tok/s. The
@@ -28,5 +29,8 @@ benchmark was repeated solely to amplify that small launch-level change.
 
 Flash-Next keeps the 63.282-GiB expert sidecar resident with zero expert
 loads/copies during requests. Its measured cold sidecar prefault was 129.06 s
-and cold first-request BF16 staging was 21.90 s. The next performance gate is
-one fused-MoE warm canary, not a broad test matrix.
+and cold first-request BF16 staging was 21.90 s. SGLang-style load-time GDN
+QKVZBA merging removes three GEMM launches from each T=1 GDN layer. Batching
+QSA input/output projections across the existing T=16 prompt bucket then cut
+the retained warm 57-token canary from 1.182 s to 0.762 s while producing the
+same two token IDs. These are single canaries, not repeated statistical claims.

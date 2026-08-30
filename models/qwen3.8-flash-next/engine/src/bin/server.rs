@@ -87,6 +87,10 @@ impl TokenGenerator for QwenThreadBackend {
 fn run_generation(engine: &mut QwenNativeEngine, command: EngineCommand) {
     let EngineCommand { request, events } = command;
     let trace_layers = std::env::var_os("FLASH_QWEN_TRACE_LAYERS").is_some();
+    // Profile one steady-state decode token without synchronizing every stage
+    // of prompt prefill. This keeps the diagnostic canary short and prevents
+    // tracing itself from turning a multi-token prompt into minutes of work.
+    let profile_decode = std::env::var_os("FLASH_QWEN_PROFILE_DECODE").is_some();
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         if request.prompt_token_ids.is_empty() {
             return Err("Qwen prompt cannot be empty".into());
@@ -159,7 +163,8 @@ fn run_generation(engine: &mut QwenNativeEngine, command: EngineCommand) {
                 let _ = events.send(EngineEvent::Finished(FinishReason::Length));
                 return Ok(());
             }
-            let step = engine.forward_token(token, trace_layers)?;
+            let step = engine
+                .forward_token(token, trace_layers || (profile_decode && generated == 0))?;
             eprintln!(
                 "Qwen decode {}: input {token}, next {}, {:.3} s, experts {}/{} hit/pack, {} evictions",
                 generated + 1,

@@ -2207,6 +2207,9 @@ extern "C" FlashStatus flash_gdn_block_validate(
       !std::isfinite(plan->rms_norm_eps)) {
     return Invalid("GDN gated RMSNorm epsilon must be finite and positive");
   }
+  if (plan->reserved > 1 || (plan->reserved == 1 && plan->num_tokens != 1)) {
+    return Invalid("fused GDN QKVZBA projection requires exactly one token");
+  }
   if (!CanMultiply(plan->num_tokens, 10240) ||
       !CanMultiply(plan->num_tokens, 6144)) {
     return Invalid("GDN block buffer size overflow");

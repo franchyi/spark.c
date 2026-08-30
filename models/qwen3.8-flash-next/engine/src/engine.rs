@@ -4,6 +4,7 @@
 //! `QwenNativeEngine` exposes persistent sequence state for the standalone
 //! decoder and OpenAI service integration.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_void};
 use std::os::unix::fs::FileExt;
@@ -131,6 +132,14 @@ const QSA_FINAL_TOPK: u64 = 2051;
 const QSA_PACKED_TOKENS: u64 = 2112;
 const QSA_XQA_PAGES: u64 = 33;
 
+thread_local! {
+    /// Debug-only host clock. `trace_stage` first fences the model stream, so
+    /// each delta is the GPU work submitted since the preceding stage marker.
+    /// Keeping this outside the production path avoids CUDA-event or timer
+    /// overhead when tracing is disabled.
+    static TRACE_STAGE_STARTED: RefCell<Option<Instant>> = const { RefCell::new(None) };
+}
+
 /// Fixed-address, batch-one decode scratch. Production execution allocates
 /// these regions once and reuses them for every layer and token; no donor
 /// kernel owns an allocation.
@@ -253,13 +262,13 @@ impl QwenDecodeArena {
             gdn_core: slab(PREFILL_CHUNK_TOKENS * VALUE_WIDTH * 2)?,
             gdn_gated: slab(PREFILL_CHUNK_TOKENS * VALUE_WIDTH * 2)?,
             state_index: slab(4)?,
-            qsa_projected_q: slab(2 * QUERY_WIDTH * 2)?,
-            qsa_projected_k: slab(KV_WIDTH * 2)?,
-            qsa_query: slab(QUERY_WIDTH * 2)?,
-            qsa_key: slab(KV_WIDTH * 2)?,
-            qsa_value: slab(KV_WIDTH * 2)?,
-            qsa_gate: slab(QUERY_WIDTH * 2)?,
-            qsa_index_qk: slab(INDEX_WIDTH * 2)?,
+            qsa_projected_q: slab(PREFILL_CHUNK_TOKENS * 2 * QUERY_WIDTH * 2)?,
+            qsa_projected_k: slab(PREFILL_CHUNK_TOKENS * KV_WIDTH * 2)?,
+            qsa_query: slab(PREFILL_CHUNK_TOKENS * QUERY_WIDTH * 2)?,
+            qsa_key: slab(PREFILL_CHUNK_TOKENS * KV_WIDTH * 2)?,
+            qsa_value: slab(PREFILL_CHUNK_TOKENS * KV_WIDTH * 2)?,
+            qsa_gate: slab(PREFILL_CHUNK_TOKENS * QUERY_WIDTH * 2)?,
+            qsa_index_qk: slab(PREFILL_CHUNK_TOKENS * INDEX_WIDTH * 2)?,
             qsa_cos_sin,
             // CPU-owned QSA metadata is slotted across the whole AOT prefill
             // bucket. The values stay immutable while all 12 QSA layers
@@ -267,15 +276,15 @@ impl QwenDecodeArena {
             qsa_positions: slab(PREFILL_CHUNK_TOKENS * 8)?,
             qsa_cache_locs: slab(PREFILL_CHUNK_TOKENS * 8)?,
             qsa_axis_map: slab(u64::from(ROTARY_DIM / 2) * 4)?,
-            qsa_index_query: slab(8 * INDEX_HEAD_DIM * 2)?,
+            qsa_index_query: slab(PREFILL_CHUNK_TOKENS * 8 * INDEX_HEAD_DIM * 2)?,
             qsa_compressed_page_table,
             qsa_compressed_lengths: slab(PREFILL_CHUNK_TOKENS * 4)?,
-            qsa_logits: slab(QSA_COMPRESSED_SLOTS * 4)?,
+            qsa_logits: slab(PREFILL_CHUNK_TOKENS * QSA_COMPRESSED_SLOTS * 4)?,
             qsa_row_start: slab(PREFILL_CHUNK_TOKENS * 4)?,
-            qsa_block_indices: slab(QSA_BLOCK_TOPK * 4)?,
+            qsa_block_indices: slab(PREFILL_CHUNK_TOKENS * QSA_BLOCK_TOPK * 4)?,
             qsa_query_positions: slab(PREFILL_CHUNK_TOKENS * 8)?,
             qsa_sequence_lengths: slab(PREFILL_CHUNK_TOKENS * 4)?,
-            qsa_logical_indices: slab(QSA_FINAL_TOPK * 4)?,
+            qsa_logical_indices: slab(PREFILL_CHUNK_TOKENS * QSA_FINAL_TOPK * 4)?,
             qsa_request_to_token,
             qsa_request_indices: slab(PREFILL_CHUNK_TOKENS * 4)?,
             qsa_group_locs: slab(PREFILL_CHUNK_TOKENS * QSA_COMPRESS_RATIO * 4)?,
@@ -285,8 +294,8 @@ impl QwenDecodeArena {
             qsa_valid_counts: slab(4)?,
             qsa_xqa_block_table,
             qsa_attention_workspace: slab(QSA_WORKSPACE)?,
-            qsa_raw_attention: slab(QUERY_WIDTH * 2)?,
-            qsa_gated: slab(QUERY_WIDTH * 2)?,
+            qsa_raw_attention: slab(PREFILL_CHUNK_TOKENS * QUERY_WIDTH * 2)?,
+            qsa_gated: slab(PREFILL_CHUNK_TOKENS * QUERY_WIDTH * 2)?,
             router_logits: slab(PREFILL_CHUNK_TOKENS * 512 * 2)?,
             route_weights: slab(PREFILL_CHUNK_TOKENS * u64::from(TOP_K) * 4)?,
             route_ids: slab(PREFILL_CHUNK_TOKENS * u64::from(TOP_K) * 4)?,
@@ -801,6 +810,47 @@ impl QwenResidentWeights {
             .device_address())
     }
 
+    /// Stage differently-shaped checkpoint shards in one output-major BF16
+    /// matrix. SGLang uses the same load-time merge for Flash-Next GDN: decode
+    /// can issue one wide projection, while prefill may address the component
+    /// row ranges and retain its faster large-M GEMM shapes.
+    fn merged_bf16_segments(
+        &mut self,
+        maps: &mut FlashNextWeightMaps,
+        stream: &mut CudaStreamOwner,
+        key: &str,
+        segments: &[(&str, &[u64], u64)],
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        if !self.tensors.contains_key(key) {
+            let output_bytes = segments.iter().try_fold(0_u64, |total, (_, _, bytes)| {
+                total.checked_add(*bytes).ok_or("merged weight size overflow")
+            })?;
+            let output = slab(output_bytes)?;
+            let mut output_offset = 0_u64;
+            for (name, shape, bytes) in segments {
+                let source = checked_tensor(maps, name, "BF16", shape, *bytes)?;
+                unsafe {
+                    stream.memcpy_async(
+                        output.device_address() + output_offset,
+                        source.device_address,
+                        usize::try_from(*bytes)?,
+                    )?;
+                }
+                output_offset += *bytes;
+            }
+            self.tensors.insert(key.to_owned(), output);
+            self.bytes = self
+                .bytes
+                .checked_add(output_bytes)
+                .ok_or("resident weight bytes overflow")?;
+        }
+        Ok(self
+            .tensors
+            .get(key)
+            .expect("merged resident tensor inserted")
+            .device_address())
+    }
+
     /// Stage a checkpoint BF16 vector and convert it once for kernels whose
     /// ABI consumes FP32 constants. GDN A_log and dt_bias are invariant across
     /// the sequence; converting them in every 16-token prefill bucket adds two
@@ -1215,6 +1265,10 @@ impl QwenNativeEngine {
         let expert_packs_before = self.expert_packs;
         let direct_expert_pack = self.direct_expert_pack;
         let started = Instant::now();
+        if verbose {
+            self.stream.synchronize()?;
+            reset_trace_clock();
+        }
         for layer in 0..LAYERS {
             let (current, next) = if layer.is_multiple_of(2) {
                 (&self.hyper_a, &self.hyper_b)
@@ -1237,6 +1291,7 @@ impl QwenNativeEngine {
                     &self.caps,
                     fast_decode,
                 )?;
+                trace_stage(&mut self.stream, verbose, layer, "PLE")?;
             }
             let layer_index = usize::try_from(layer)?;
             let resident_expert_bank = self.resident_experts.is_some() || self.fused_moe.is_some();
@@ -1442,27 +1497,25 @@ fn run_layer(
     })?;
     trace_stage(stream, trace, layer, "attention mHC mix")?;
     if (layer + 1).is_multiple_of(4) {
-        for token_offset in 0..num_tokens {
-            run_qsa(
-                maps,
-                resident,
-                layer,
-                start_position + token_offset,
-                token_offset,
-                arena.mixed.device_address() + u64::from(token_offset) * HIDDEN * 2,
-                arena.attention.device_address() + u64::from(token_offset) * HIDDEN * 2,
-                qsa_index_key_states,
-                qsa_rope_positions,
-                qsa_compressed_keys,
-                qsa_full_key_states,
-                qsa_full_value_states,
-                arena,
-                stream,
-                blas,
-                caps,
-                fast_decode,
-            )?;
-        }
+        run_qsa(
+            maps,
+            resident,
+            layer,
+            start_position,
+            num_tokens,
+            arena.mixed.device_address(),
+            arena.attention.device_address(),
+            qsa_index_key_states,
+            qsa_rope_positions,
+            qsa_compressed_keys,
+            qsa_full_key_states,
+            qsa_full_value_states,
+            arena,
+            stream,
+            blas,
+            caps,
+            fast_decode,
+        )?;
     } else {
         run_gdn(
             maps,
@@ -1541,9 +1594,23 @@ fn trace_stage(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if trace {
         stream.synchronize()?;
-        eprintln!("Qwen trace layer {layer}: {stage} complete");
+        let elapsed_ms = TRACE_STAGE_STARTED.with(|started| {
+            let now = Instant::now();
+            let mut started = started.borrow_mut();
+            let elapsed = started.replace(now).map_or(0.0, |previous| {
+                now.duration_since(previous).as_secs_f64() * 1_000.0
+            });
+            elapsed
+        });
+        eprintln!("Qwen trace layer {layer}: {stage} {elapsed_ms:.3} ms");
     }
     Ok(())
+}
+
+fn reset_trace_clock() {
+    TRACE_STAGE_STARTED.with(|started| {
+        *started.borrow_mut() = Some(Instant::now());
+    });
 }
 
 struct MhcWeights {
@@ -1645,38 +1712,31 @@ fn run_gdn(
     caps: &DeviceCaps,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let prefix = format!("model.language_model.layers.{layer}.linear_attn");
-    let qkv = resident.get(
+    let qkv_name = format!("{prefix}.in_proj_qkv.weight");
+    let z_name = format!("{prefix}.in_proj_z.weight");
+    let b_name = format!("{prefix}.in_proj_b.weight");
+    let a_name = format!("{prefix}.in_proj_a.weight");
+    let merged_name = format!("{prefix}.spark_in_proj_qkvzba.weight");
+    let qkv_shape = [GDN_CONV_WIDTH, HIDDEN];
+    let z_shape = [VALUE_WIDTH, HIDDEN];
+    let ba_shape = [VALUE_HEADS, HIDDEN];
+    let qkv_bytes = GDN_CONV_WIDTH * HIDDEN * 2;
+    let z_bytes = VALUE_WIDTH * HIDDEN * 2;
+    let ba_bytes = VALUE_HEADS * HIDDEN * 2;
+    let qkv = resident.merged_bf16_segments(
         maps,
         stream,
-        &format!("{prefix}.in_proj_qkv.weight"),
-        "BF16",
-        &[GDN_CONV_WIDTH, HIDDEN],
-        GDN_CONV_WIDTH * HIDDEN * 2,
+        &merged_name,
+        &[
+            (&qkv_name, &qkv_shape, qkv_bytes),
+            (&z_name, &z_shape, z_bytes),
+            (&b_name, &ba_shape, ba_bytes),
+            (&a_name, &ba_shape, ba_bytes),
+        ],
     )?;
-    let z = resident.get(
-        maps,
-        stream,
-        &format!("{prefix}.in_proj_z.weight"),
-        "BF16",
-        &[VALUE_WIDTH, HIDDEN],
-        VALUE_WIDTH * HIDDEN * 2,
-    )?;
-    let b = resident.get(
-        maps,
-        stream,
-        &format!("{prefix}.in_proj_b.weight"),
-        "BF16",
-        &[VALUE_HEADS, HIDDEN],
-        VALUE_HEADS * HIDDEN * 2,
-    )?;
-    let a = resident.get(
-        maps,
-        stream,
-        &format!("{prefix}.in_proj_a.weight"),
-        "BF16",
-        &[VALUE_HEADS, HIDDEN],
-        VALUE_HEADS * HIDDEN * 2,
-    )?;
+    let z = qkv + qkv_bytes;
+    let b = z + z_bytes;
+    let a = b + ba_bytes;
     let conv = resident.get(
         maps,
         stream,
@@ -1709,10 +1769,33 @@ fn run_gdn(
     let conv_state = conv_states.device_address() + gdn_ordinal * GDN_CONV_WIDTH * 3 * 2;
     let temporal_state =
         temporal_states.device_address() + gdn_ordinal * VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2;
+    // SGLang merges qkvz+ba into one BF16 GEMM for decode, saving three tiny-M
+    // launches. At prefill widths it deliberately keeps the four row views,
+    // because the single very-wide GEMM is slower there. The T=1 fused output
+    // fits in the existing T=16 qkv scratch without another allocation.
+    let fused_decode_projection = num_tokens == 1;
+    let projected_qkv = arena.gdn_projected_qkv.device_address();
+    let projected_z = if fused_decode_projection {
+        projected_qkv + GDN_CONV_WIDTH * 2
+    } else {
+        arena.gdn_projected_z.device_address()
+    };
+    let projected_b = if fused_decode_projection {
+        projected_z + VALUE_WIDTH * 2
+    } else {
+        arena.gdn_projected_b.device_address()
+    };
+    let projected_a = if fused_decode_projection {
+        projected_b + VALUE_HEADS * 2
+    } else {
+        arena.gdn_projected_a.device_address()
+    };
+    let mut plan = GdnBlockPlan::qwen38_flash_decode(num_tokens);
+    plan.reserved = u32::from(fused_decode_projection);
     let block = GdnBlockArgs {
         struct_size: size::<GdnBlockArgs>(),
         abi_version: KERNEL_ABI_VERSION,
-        plan: GdnBlockPlan::qwen38_flash_decode(num_tokens),
+        plan,
         hidden_states: ptr(arena.mixed.device_address()),
         in_proj_qkv_weight: ptr(qkv),
         in_proj_z_weight: ptr(z),
@@ -1723,10 +1806,10 @@ fn run_gdn(
         out_proj_weight: ptr(out),
         conv_state_pool: ptr_mut(conv_state),
         state_indices: ptr(arena.state_index.device_address()).cast::<i32>(),
-        projected_qkv: ptr_mut(arena.gdn_projected_qkv.device_address()),
-        projected_z: ptr_mut(arena.gdn_projected_z.device_address()),
-        projected_b: ptr_mut(arena.gdn_projected_b.device_address()),
-        projected_a: ptr_mut(arena.gdn_projected_a.device_address()),
+        projected_qkv: ptr_mut(projected_qkv),
+        projected_z: ptr_mut(projected_z),
+        projected_b: ptr_mut(projected_b),
+        projected_a: ptr_mut(projected_a),
         convolved_qkv: ptr_mut(arena.gdn_convolved.device_address()),
         gdn_core_output: ptr(arena.gdn_core.device_address()),
         gated_norm_output: ptr_mut(arena.gdn_gated.device_address()),
@@ -1741,8 +1824,8 @@ fn run_gdn(
         q: ptr(arena.gdn_convolved.device_address()),
         k: ptr(arena.gdn_convolved.device_address() + u64::from(num_tokens) * QK_WIDTH * 2),
         v: ptr(arena.gdn_convolved.device_address() + 2 * u64::from(num_tokens) * QK_WIDTH * 2),
-        a: ptr(arena.gdn_projected_a.device_address()),
-        b: ptr(arena.gdn_projected_b.device_address()),
+        a: ptr(projected_a),
+        b: ptr(projected_b),
         a_log: ptr(a_log).cast::<f32>(),
         dt_bias: ptr(dt).cast::<f32>(),
         state_pool: ptr_mut(temporal_state),
@@ -1841,8 +1924,8 @@ fn run_qsa(
     maps: &mut FlashNextWeightMaps,
     resident: &mut QwenResidentWeights,
     layer: u32,
-    position: u32,
-    metadata_slot: u32,
+    start_position: u32,
+    num_tokens: u32,
     hidden_states: u64,
     attention_output: u64,
     index_key_states: &CoherentRegionOwner,
@@ -1857,12 +1940,9 @@ fn run_qsa(
     fast_decode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let prefix = format!("model.language_model.layers.{layer}.self_attn");
-    if u64::from(metadata_slot) >= PREFILL_CHUNK_TOKENS {
-        return Err("Qwen QSA metadata slot exceeds the AOT bucket".into());
+    if num_tokens == 0 || u64::from(num_tokens) > PREFILL_CHUNK_TOKENS {
+        return Err("Qwen QSA batch exceeds the AOT prefill bucket".into());
     }
-    let metadata_i32 = u64::from(metadata_slot) * 4;
-    let metadata_i64 = u64::from(metadata_slot) * 8;
-    let group_metadata = u64::from(metadata_slot) * QSA_COMPRESS_RATIO * 4;
     let q = resident.get(
         maps,
         stream,
@@ -1941,12 +2021,6 @@ fn run_qsa(
         return Err("Qwen QSA layer ordinal exceeds the persistent state".into());
     }
     let context_capacity = u64::try_from(QWEN_MODEL_MAX_LENGTH)?;
-    let position_u64 = u64::from(position);
-    let sequence_length = position
-        .checked_add(1)
-        .ok_or("Qwen QSA position overflow")?;
-    let compressed_length = sequence_length / u32::try_from(QSA_COMPRESS_RATIO)?;
-    let groups = u32::from(sequence_length.is_multiple_of(u32::try_from(QSA_COMPRESS_RATIO)?));
     let index_state_base =
         index_key_states.device_address() + qsa_ordinal * context_capacity * INDEX_HEAD_DIM * 2;
     let rope_positions_base =
@@ -1959,19 +2033,19 @@ fn run_qsa(
         full_value_states.device_address() + qsa_ordinal * context_capacity * KV_WIDTH * 2;
 
     let key_destination = if fast_decode {
-        full_key_base + position_u64 * KV_WIDTH * 2
+        full_key_base + u64::from(start_position) * KV_WIDTH * 2
     } else {
         arena.qsa_key.device_address()
     };
     let value_destination = if fast_decode {
-        full_value_base + position_u64 * KV_WIDTH * 2
+        full_value_base + u64::from(start_position) * KV_WIDTH * 2
     } else {
         arena.qsa_value.device_address()
     };
     let project = QwenQsaProjectArgs {
         struct_size: size::<QwenQsaProjectArgs>(),
         abi_version: QWEN_QSA_BLOCK_ABI_VERSION,
-        tokens: 1,
+        tokens: num_tokens,
         rotary_dim: ROTARY_DIM,
         cos_sin_stride: u64::from(ROTARY_DIM),
         hidden_states: ptr(hidden_states),
@@ -1982,7 +2056,7 @@ fn run_qsa(
         q_norm_weight: ptr(q_norm),
         k_norm_weight: ptr(k_norm),
         cos_sin_cache: ptr(arena.qsa_cos_sin.device_address()).cast::<f32>(),
-        positions: ptr(arena.qsa_positions.device_address() + metadata_i64).cast::<i64>(),
+        positions: ptr(arena.qsa_positions.device_address()).cast::<i64>(),
         projected_q: ptr_mut(arena.qsa_projected_q.device_address()),
         projected_k: ptr_mut(arena.qsa_projected_k.device_address()),
         query: ptr_mut(arena.qsa_query.device_address()),
@@ -1998,177 +2072,207 @@ fn run_qsa(
     })?;
 
     if !fast_decode {
+        let kv_bytes = u64::from(num_tokens) * KV_WIDTH * 2;
         unsafe {
             stream.memcpy_async(
-                full_key_base + position_u64 * KV_WIDTH * 2,
+                full_key_base + u64::from(start_position) * KV_WIDTH * 2,
                 arena.qsa_key.device_address(),
-                usize::try_from(KV_WIDTH * 2)?,
+                usize::try_from(kv_bytes)?,
             )?;
             stream.memcpy_async(
-                full_value_base + position_u64 * KV_WIDTH * 2,
+                full_value_base + u64::from(start_position) * KV_WIDTH * 2,
                 arena.qsa_value.device_address(),
-                usize::try_from(KV_WIDTH * 2)?,
+                usize::try_from(kv_bytes)?,
             )?;
         }
     }
 
-    let index_prep = QsaIndexPrepArgs {
-        struct_size: size::<QsaIndexPrepArgs>(),
-        abi_version: KERNEL_ABI_VERSION,
-        plan: QsaIndexPrepPlan::qwen38_flash_with_rotary(
-            1,
-            groups,
-            u32::try_from(QWEN_MODEL_MAX_LENGTH)?,
-            u32::try_from(QSA_COMPRESSED_SLOTS)?,
-            1,
-            ROTARY_DIM,
-        ),
-        qk: ptr(arena.qsa_index_qk.device_address()),
-        q_output: ptr_mut(arena.qsa_index_query.device_address()),
-        q_norm_weight: ptr(index_q_norm),
-        k_norm_weight: if groups == 0 {
-            std::ptr::null()
-        } else {
-            ptr(index_k_norm)
-        },
-        cos_sin_cache: ptr(arena.qsa_cos_sin.device_address()).cast::<f32>(),
-        cos_sin_rows: context_capacity,
-        axis_map: ptr(arena.qsa_axis_map.device_address()).cast::<i32>(),
-        positions: ptr(arena.qsa_positions.device_address() + metadata_i64).cast::<i64>(),
-        positions_stride: 1,
-        cache_locs: ptr(arena.qsa_cache_locs.device_address() + metadata_i64).cast::<i64>(),
-        key_state: ptr_mut(index_state_base),
-        rope_positions: ptr_mut(rope_positions_base).cast::<i64>(),
-        group_locs: if groups == 0 {
-            std::ptr::null()
-        } else {
-            ptr(arena.qsa_group_locs.device_address() + group_metadata).cast::<i32>()
-        },
-        write_locs: if groups == 0 {
-            std::ptr::null()
-        } else {
-            ptr(arena.qsa_write_locs.device_address() + metadata_i32).cast::<i32>()
-        },
-        compressed_keys: if groups == 0 {
-            std::ptr::null_mut()
-        } else {
-            ptr_mut(compressed_keys_base)
-        },
-        eps: 1.0e-6,
-        reserved: 0,
-        cuda_stream: stream.raw(),
-    };
-    native("Qwen QSA index prep", unsafe {
-        flash_qsa_index_prep_launch(caps, &index_prep)
-    })?;
+    for metadata_slot in 0..num_tokens {
+        let position = start_position
+            .checked_add(metadata_slot)
+            .ok_or("Qwen QSA position overflow")?;
+        let metadata_i32 = u64::from(metadata_slot) * 4;
+        let metadata_i64 = u64::from(metadata_slot) * 8;
+        let group_metadata = u64::from(metadata_slot) * QSA_COMPRESS_RATIO * 4;
+        let sequence_length = position
+            .checked_add(1)
+            .ok_or("Qwen QSA position overflow")?;
+        let compressed_length = sequence_length / u32::try_from(QSA_COMPRESS_RATIO)?;
+        let groups =
+            u32::from(sequence_length.is_multiple_of(u32::try_from(QSA_COMPRESS_RATIO)?));
+        let index_qk = arena.qsa_index_qk.device_address()
+            + u64::from(metadata_slot) * INDEX_WIDTH * 2;
+        let index_query = arena.qsa_index_query.device_address()
+            + u64::from(metadata_slot) * 8 * INDEX_HEAD_DIM * 2;
+        let logits = arena.qsa_logits.device_address()
+            + u64::from(metadata_slot) * QSA_COMPRESSED_SLOTS * 4;
+        let block_indices = arena.qsa_block_indices.device_address()
+            + u64::from(metadata_slot) * QSA_BLOCK_TOPK * 4;
+        let logical_indices = arena.qsa_logical_indices.device_address()
+            + u64::from(metadata_slot) * QSA_FINAL_TOPK * 4;
+        let query = arena.qsa_query.device_address()
+            + u64::from(metadata_slot) * QUERY_WIDTH * 2;
+        let raw_attention = arena.qsa_raw_attention.device_address()
+            + u64::from(metadata_slot) * QUERY_WIDTH * 2;
 
-    let max_pages = compressed_length
-        .div_ceil(u32::try_from(QSA_COMPRESSED_PAGE_SIZE)?)
-        .max(1);
-    let score_plan = QsaScorePlan::qwen38_flash(1, u32::try_from(QSA_COMPRESSED_PAGES)?, max_pages);
-    let score = QsaScoreArgs {
-        struct_size: size::<QsaScoreArgs>(),
-        abi_version: KERNEL_ABI_VERSION,
-        plan: score_plan,
-        query: ptr(arena.qsa_index_query.device_address()),
-        key_cache: ptr(compressed_keys_base),
-        page_table: ptr(arena.qsa_compressed_page_table.device_address()).cast::<i32>(),
-        context_lengths: ptr(arena.qsa_compressed_lengths.device_address() + metadata_i32)
-            .cast::<i32>(),
-        logits: ptr_mut(arena.qsa_logits.device_address()).cast::<f32>(),
-        score_scale: (INDEX_HEAD_DIM as f32).sqrt(),
-        reserved: 0,
-        cuda_stream: stream.raw(),
-    };
-    native("Qwen QSA index score", unsafe {
-        flash_qsa_score_launch(caps, &score)
-    })?;
+        let index_prep = QsaIndexPrepArgs {
+            struct_size: size::<QsaIndexPrepArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan: QsaIndexPrepPlan::qwen38_flash_with_rotary(
+                1,
+                groups,
+                u32::try_from(QWEN_MODEL_MAX_LENGTH)?,
+                u32::try_from(QSA_COMPRESSED_SLOTS)?,
+                1,
+                ROTARY_DIM,
+            ),
+            qk: ptr(index_qk),
+            q_output: ptr_mut(index_query),
+            q_norm_weight: ptr(index_q_norm),
+            k_norm_weight: if groups == 0 {
+                std::ptr::null()
+            } else {
+                ptr(index_k_norm)
+            },
+            cos_sin_cache: ptr(arena.qsa_cos_sin.device_address()).cast::<f32>(),
+            cos_sin_rows: context_capacity,
+            axis_map: ptr(arena.qsa_axis_map.device_address()).cast::<i32>(),
+            positions: ptr(arena.qsa_positions.device_address() + metadata_i64).cast::<i64>(),
+            positions_stride: 1,
+            cache_locs: ptr(arena.qsa_cache_locs.device_address() + metadata_i64).cast::<i64>(),
+            key_state: ptr_mut(index_state_base),
+            rope_positions: ptr_mut(rope_positions_base).cast::<i64>(),
+            group_locs: if groups == 0 {
+                std::ptr::null()
+            } else {
+                ptr(arena.qsa_group_locs.device_address() + group_metadata).cast::<i32>()
+            },
+            write_locs: if groups == 0 {
+                std::ptr::null()
+            } else {
+                ptr(arena.qsa_write_locs.device_address() + metadata_i32).cast::<i32>()
+            },
+            compressed_keys: if groups == 0 {
+                std::ptr::null_mut()
+            } else {
+                ptr_mut(compressed_keys_base)
+            },
+            eps: 1.0e-6,
+            reserved: 0,
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen QSA index prep", unsafe {
+            flash_qsa_index_prep_launch(caps, &index_prep)
+        })?;
 
-    let topk = QsaTopkArgs {
-        struct_size: size::<QsaTopkArgs>(),
-        abi_version: KERNEL_ABI_VERSION,
-        plan: QsaTopkPlan::qwen38_flash(
-            1,
-            score_plan.max_model_len,
-            u64::from(score_plan.max_model_len),
-        ),
-        scores: ptr(arena.qsa_logits.device_address()).cast::<f32>(),
-        row_starts: ptr(arena.qsa_row_start.device_address() + metadata_i32).cast::<i32>(),
-        lengths: ptr(arena.qsa_compressed_lengths.device_address() + metadata_i32)
-            .cast::<i32>(),
-        indices: ptr_mut(arena.qsa_block_indices.device_address()).cast::<i32>(),
-        cuda_stream: stream.raw(),
-    };
-    native("Qwen QSA block top-k", unsafe {
-        flash_qsa_topk_launch(caps, &topk)
-    })?;
+        let max_pages = compressed_length
+            .div_ceil(u32::try_from(QSA_COMPRESSED_PAGE_SIZE)?)
+            .max(1);
+        let score_plan = QsaScorePlan::qwen38_flash(1, u32::try_from(QSA_COMPRESSED_PAGES)?, max_pages);
+        let score = QsaScoreArgs {
+            struct_size: size::<QsaScoreArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan: score_plan,
+            query: ptr(index_query),
+            key_cache: ptr(compressed_keys_base),
+            page_table: ptr(arena.qsa_compressed_page_table.device_address()).cast::<i32>(),
+            context_lengths: ptr(arena.qsa_compressed_lengths.device_address() + metadata_i32)
+                .cast::<i32>(),
+            logits: ptr_mut(logits).cast::<f32>(),
+            score_scale: (INDEX_HEAD_DIM as f32).sqrt(),
+            reserved: 0,
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen QSA index score", unsafe {
+            flash_qsa_score_launch(caps, &score)
+        })?;
 
-    let expand = QsaExpandArgs {
-        struct_size: size::<QsaExpandArgs>(),
-        abi_version: KERNEL_ABI_VERSION,
-        plan: QsaExpandPlan::qwen38_flash(1),
-        block_indices: ptr(arena.qsa_block_indices.device_address()).cast::<i32>(),
-        query_positions: ptr(arena.qsa_query_positions.device_address() + metadata_i64)
-            .cast::<i64>(),
-        sequence_lengths: ptr(arena.qsa_sequence_lengths.device_address() + metadata_i32)
-            .cast::<i32>(),
-        logical_indices: ptr_mut(arena.qsa_logical_indices.device_address()).cast::<i32>(),
-        cuda_stream: stream.raw(),
-    };
-    native("Qwen QSA token expansion", unsafe {
-        flash_qsa_expand_launch(caps, &expand)
-    })?;
+        let topk = QsaTopkArgs {
+            struct_size: size::<QsaTopkArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan: QsaTopkPlan::qwen38_flash(
+                1,
+                score_plan.max_model_len,
+                u64::from(score_plan.max_model_len),
+            ),
+            scores: ptr(logits).cast::<f32>(),
+            row_starts: ptr(arena.qsa_row_start.device_address() + metadata_i32).cast::<i32>(),
+            lengths: ptr(arena.qsa_compressed_lengths.device_address() + metadata_i32)
+                .cast::<i32>(),
+            indices: ptr_mut(block_indices).cast::<i32>(),
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen QSA block top-k", unsafe {
+            flash_qsa_topk_launch(caps, &topk)
+        })?;
 
-    let pack = QsaKvPackArgs {
-        struct_size: size::<QsaKvPackArgs>(),
-        abi_version: KERNEL_ABI_VERSION,
-        plan: QsaKvPackPlan::qwen38_flash(
-            1,
-            u32::try_from(QWEN_MODEL_MAX_LENGTH)?,
-            1,
-            u32::try_from(QWEN_MODEL_MAX_LENGTH)?,
-        ),
-        key_state: ptr(full_key_base),
-        value_state: ptr(full_value_base),
-        req_to_token: ptr(arena.qsa_request_to_token.device_address()).cast::<i32>(),
-        request_indices: ptr(arena.qsa_request_indices.device_address() + metadata_i32)
-            .cast::<i32>(),
-        logical_indices: ptr(arena.qsa_logical_indices.device_address()).cast::<i32>(),
-        sequence_lengths: ptr(arena.qsa_sequence_lengths.device_address() + metadata_i32)
-            .cast::<i32>(),
-        valid_counts: ptr_mut(arena.qsa_valid_counts.device_address()).cast::<i32>(),
-        packed_key: ptr_mut(arena.qsa_packed_key.device_address()),
-        packed_value: ptr_mut(arena.qsa_packed_value.device_address()),
-        cuda_stream: stream.raw(),
-    };
-    native("Qwen QSA selected K/V pack", unsafe {
-        flash_qsa_kv_pack_launch(caps, &pack)
-    })?;
+        let expand = QsaExpandArgs {
+            struct_size: size::<QsaExpandArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan: QsaExpandPlan::qwen38_flash(1),
+            block_indices: ptr(block_indices).cast::<i32>(),
+            query_positions: ptr(arena.qsa_query_positions.device_address() + metadata_i64)
+                .cast::<i64>(),
+            sequence_lengths: ptr(arena.qsa_sequence_lengths.device_address() + metadata_i32)
+                .cast::<i32>(),
+            logical_indices: ptr_mut(logical_indices).cast::<i32>(),
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen QSA token expansion", unsafe {
+            flash_qsa_expand_launch(caps, &expand)
+        })?;
 
-    let decode = QsaDecodeArgs {
-        struct_size: size::<QsaDecodeArgs>(),
-        abi_version: KERNEL_ABI_VERSION,
-        plan: QsaDecodePlan::qwen38_flash(1, 48),
-        query: ptr(arena.qsa_query.device_address()),
-        packed_key: ptr(arena.qsa_packed_key.device_address()),
-        packed_value: ptr(arena.qsa_packed_value.device_address()),
-        block_tables: ptr(arena.qsa_xqa_block_table.device_address()).cast::<i32>(),
-        sequence_lengths: ptr(arena.qsa_valid_counts.device_address()).cast::<i32>(),
-        output: ptr_mut(arena.qsa_raw_attention.device_address()),
-        workspace: ptr_mut(arena.qsa_attention_workspace.device_address()),
-        workspace_bytes: QSA_WORKSPACE,
-        bmm1_scale: 1.0 / (QSA_HEAD_DIM as f32).sqrt(),
-        bmm2_scale: 1.0,
-        cuda_stream: stream.raw(),
-    };
-    native("Qwen QSA sparse decode", unsafe {
-        flash_qsa_decode_launch(caps, &decode)
-    })?;
+        let pack = QsaKvPackArgs {
+            struct_size: size::<QsaKvPackArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan: QsaKvPackPlan::qwen38_flash(
+                1,
+                u32::try_from(QWEN_MODEL_MAX_LENGTH)?,
+                1,
+                u32::try_from(QWEN_MODEL_MAX_LENGTH)?,
+            ),
+            key_state: ptr(full_key_base),
+            value_state: ptr(full_value_base),
+            req_to_token: ptr(arena.qsa_request_to_token.device_address()).cast::<i32>(),
+            request_indices: ptr(arena.qsa_request_indices.device_address() + metadata_i32)
+                .cast::<i32>(),
+            logical_indices: ptr(logical_indices).cast::<i32>(),
+            sequence_lengths: ptr(arena.qsa_sequence_lengths.device_address() + metadata_i32)
+                .cast::<i32>(),
+            valid_counts: ptr_mut(arena.qsa_valid_counts.device_address()).cast::<i32>(),
+            packed_key: ptr_mut(arena.qsa_packed_key.device_address()),
+            packed_value: ptr_mut(arena.qsa_packed_value.device_address()),
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen QSA selected K/V pack", unsafe {
+            flash_qsa_kv_pack_launch(caps, &pack)
+        })?;
+
+        let decode = QsaDecodeArgs {
+            struct_size: size::<QsaDecodeArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan: QsaDecodePlan::qwen38_flash(1, 48),
+            query: ptr(query),
+            packed_key: ptr(arena.qsa_packed_key.device_address()),
+            packed_value: ptr(arena.qsa_packed_value.device_address()),
+            block_tables: ptr(arena.qsa_xqa_block_table.device_address()).cast::<i32>(),
+            sequence_lengths: ptr(arena.qsa_valid_counts.device_address()).cast::<i32>(),
+            output: ptr_mut(raw_attention),
+            workspace: ptr_mut(arena.qsa_attention_workspace.device_address()),
+            workspace_bytes: QSA_WORKSPACE,
+            bmm1_scale: 1.0 / (QSA_HEAD_DIM as f32).sqrt(),
+            bmm2_scale: 1.0,
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen QSA sparse decode", unsafe {
+            flash_qsa_decode_launch(caps, &decode)
+        })?;
+    }
 
     let finish = QwenQsaFinishArgs {
         struct_size: size::<QwenQsaFinishArgs>(),
         abi_version: QWEN_QSA_BLOCK_ABI_VERSION,
-        tokens: 1,
+        tokens: num_tokens,
         reserved: 0,
         attention_output: ptr(arena.qsa_raw_attention.device_address()),
         gate: ptr(arena.qsa_gate.device_address()),

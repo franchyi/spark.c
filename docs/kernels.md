@@ -10,8 +10,8 @@ the one model that compiles it.
 | Qwen3.8-27B | GDN recurrence | FlashInfer CuTe export + SGLang arithmetic oracle | model-local fixed BF16 recurrent state |
 | Qwen3.8-27B | full attention | FlashInfer attention/XQA family | fixed FP8 KV layout and Q27 head geometry |
 | Qwen3.8-27B | BF16 LM head | ds4 streaming GEMV | fixed `[248320,5120]` allocation-free launch |
-| Flash-Next | GDN + causal convolution | SGLang + FlashInfer | fixed 36-layer recurrent graph |
-| Flash-Next | QSA sparse attention | SGLang, TileLang, FlashInfer XQA | index, top-k, selected-K/V pack, fixed pages |
+| Flash-Next | GDN + causal convolution | SGLang + FlashInfer | merged T=1 QKVZBA projection and fixed 36-layer recurrent graph |
+| Flash-Next | QSA sparse attention | SGLang, TileLang, FlashInfer XQA | batched T≤16 projections; causal index/top-k/selected-KV loop |
 | Flash-Next | NVFP4 routed MoE | FlashInfer/CUTLASS + SGLang routing/join | fixed cache-slot route owned by Rust |
 | Flash-Next | mHC | SGLang reductions + cuBLAS | fixed hidden/rank geometry |
 | Flash-Next | FP8 PLE gather | SGLang arithmetic contract | Rust-owned NVMe row cache and descriptors |
