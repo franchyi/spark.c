@@ -1,7 +1,4 @@
-<p align="center">
-  <h1 align="center">Spark.C</h1>
-  <p align="center"><strong>Small, model-specific inference engines for one DGX Spark.</strong></p>
-</p>
+# Spark.C
 
 Spark.C is a native inference project built for the NVIDIA DGX Spark and its
 128 GB unified memory. It serves three fixed models with Rust, C, and CUDA. It
