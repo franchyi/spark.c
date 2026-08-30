@@ -1,35 +1,47 @@
-# Qwen3.8-Flash-Next
+# Qwen3.8 Flash-Next
 
-A standalone Rust/CUDA engine for
-`RadixArk/Qwen3.8-Flash-Next-NVFP4`. It implements the model-specific GDN,
-QSA sparse attention, mHC, routed/shared NVFP4 MoE, PLE, KV/recurrent state,
-native NEXTN/MTP, greedy sampling, and OpenAI service.
+A standalone Rust/CUDA engine for `RadixArk/Qwen3.8-Flash-Next-NVFP4`, including
+GDN, QSA, mHC, routed/shared NVFP4 MoE, PLE, and the checkpoint's native
+NEXTN/MTP layer.
 
-```bash
-make build
-make index-ple
-make build-fused
-make serve
-make smoke
-make bench
-make stop
+## Deploy
+
+From the repository root:
+
+```sh
+./spark setup flash-next
+./spark serve flash-next
 ```
 
-The immutable FP8 PLE remains in its safetensors and is indexed without
-copying. The 63.282-GiB expert sidecar is memory-mapped and CUDA-registered so
-the token path reads unified DRAM without a second expert copy. NVMe is startup
-backing and the future cold tier, not the steady decode path. The default fused
-service listens on port `8020` and requires the SoA-v2 sidecar.
+`setup` performs the complete first-run pipeline:
 
-The retained target-only measurement is 74.8 prefill tok/s for a 57-token
-prompt and 10.9 decode tok/s. Native NEXTN extends the bundled one-layer MTP
-cache from target prompt hidden states, drafts one top-1 token, and verifies it
-with the current target candidate in one T=2 pass. A warm 56-prompt/24-output
-canary measured 66.8 prefill and 11.9 decode tok/s with about 77% proposal
-acceptance. Rejection restores the recurrent state captured after verifier row
-zero instead of replaying the target model.
+1. Download the pinned Hugging Face snapshot through `hf-mirror.com` with uv.
+2. Build and link the GB10 engine using the pinned Docker build image.
+3. Index the FP8 PLE in place without copying its large table.
+4. Create the resumable 63.282-GiB SoA-v2 expert sidecar.
 
-The checkpoint contains 31 native BF16 `mtp.*` tensors but no DFlash/DFlash2
-draft weights. The service therefore enables NEXTN by default. DFlash2 should
-only be added if a matching Flash-Next draft checkpoint and SGLang recipe
-appear; the Qwen3.8-27B DFlash2 weights are not compatible with this model.
+The generated files are kept with the checkpoint, not scattered across shell
+variables or unrelated caches:
+
+```text
+~/models/RadixArk/Qwen3.8-Flash-Next-NVFP4/
+└── .spark.c/
+    ├── ple.ssple
+    └── experts-nvfp4-soa-v2.ssx
+```
+
+Plan for about 126 GiB for the original checkpoint and 63.3 GiB for the expert
+sidecar, or approximately 190 GiB total NVMe storage. The service binds to
+`127.0.0.1:8020`. Fused MoE, the decode fast path, and native NEXTN are the
+shipping configuration and are selected automatically.
+
+For a different model disk or bind address:
+
+```sh
+./spark setup flash-next --models-dir /mnt/models
+./spark serve flash-next --models-dir /mnt/models --host 0.0.0.0 --port 8020
+```
+
+Stop it with `./spark stop flash-next`. The retained warm canary measured 66.75
+prefill and 11.91 decode tok/s with about 77% NEXTN acceptance. See
+[../../docs/benchmarks.md](../../docs/benchmarks.md).

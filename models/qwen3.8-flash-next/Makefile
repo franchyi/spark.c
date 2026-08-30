@@ -1,6 +1,9 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: build build-fused index-ple serve smoke bench stop
+.PHONY: download build build-fused prepare setup serve smoke bench stop
+
+download:
+	@../../spark download flash-next
 
 build:
 	@./scripts/build.sh
@@ -8,13 +11,14 @@ build:
 build-fused:
 	@./engine/tools/build-fused-server.sh
 
-index-ple:
-	@python3 engine/tools/ple_index.py \
-		"$${SPARK_ENGINE_MODEL:-$${HOME}/models/RadixArk/Qwen3.8-Flash-Next-NVFP4}" \
-		--revision 7b719225242aacd3dbd3f9407468c2ee9a9d2594
+prepare:
+	@../../spark prepare flash-next
+
+setup:
+	@../../spark setup flash-next
 
 serve:
-	@./scripts/serve.sh
+	@../../spark serve flash-next
 
 smoke:
 	@./scripts/smoke.sh

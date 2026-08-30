@@ -5,10 +5,12 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../.." && pwd)
 engine_dir=$(cd "$script_dir/.." && pwd)
 pid_file="$engine_dir/.server.pid"
-model_root=${FLASH_QWEN_MODEL:-${HOME}/models/RadixArk/Qwen3.8-Flash-Next-NVFP4}
-bind=${FLASH_QWEN_BIND:-127.0.0.1:8020}
-model_id=${FLASH_QWEN_MODEL_ID:-RadixArk/Qwen3.8-Flash-Next-NVFP4}
-sidecar=${FLASH_QWEN_FUSED_MOE_SIDECAR:-$model_root/.spark.c/experts-nvfp4-soa-v2.ssx}
+model_root=${1:-${HOME}/models/RadixArk/Qwen3.8-Flash-Next-NVFP4}
+host=${2:-127.0.0.1}
+port=${3:-8020}
+bind="$host:$port"
+model_id=RadixArk/Qwen3.8-Flash-Next-NVFP4
+sidecar="$model_root/.spark.c/experts-nvfp4-soa-v2.ssx"
 binary="$repo_root/build/bin/qwen_serve_fused"
 
 for required in \
@@ -23,7 +25,8 @@ for required in \
   "$model_root/.spark.c/ple.ssple" \
   "$sidecar"; do
   if [[ ! -e "$required" ]]; then
-    echo "missing fused Qwen serving artifact: $required" >&2
+    echo "missing Flash-Next artifact: $required" >&2
+    echo "run './spark setup flash-next'" >&2
     exit 1
   fi
 done
@@ -49,8 +52,8 @@ trap cleanup EXIT INT TERM
 
 export FLASH_QWEN_FUSED_MOE=1
 export FLASH_QWEN_FUSED_MOE_SIDECAR="$sidecar"
-export FLASH_QWEN_MTP=${FLASH_QWEN_MTP:-1}
-export FLASH_QWEN_DECODE_FAST_PATH=${FLASH_QWEN_DECODE_FAST_PATH:-1}
+export FLASH_QWEN_MTP=1
+export FLASH_QWEN_DECODE_FAST_PATH=1
 export LD_LIBRARY_PATH="$repo_root/build/flash-next:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$binary" "$model_root" "$bind" "$model_id" &
 child_pid=$!

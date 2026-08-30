@@ -8,12 +8,14 @@ model_dir=$(cd "$script_dir/.." && pwd)
 server="$repo_root/build/bin/q27-serve-dflash2"
 pid_file="$model_dir/.server.pid"
 
-target=${SPARK_ENGINE_MODEL:?set SPARK_ENGINE_MODEL to the target Qwen3.8-27B snapshot}
-sidecar=${SPARK_ENGINE_SIDECAR:?set SPARK_ENGINE_SIDECAR to q27-scales-v1.bin}
-draft=${SPARK_DFLASH2_MODEL:?set SPARK_DFLASH2_MODEL to the pinned draft snapshot}
-bind=${SPARK_ENGINE_BIND:-0.0.0.0:${SPARK_ENGINE_PORT:-30000}}
-model_id=${SPARK_ENGINE_MODEL_ID:-spark/Qwen3.8-27B-DFlash2}
-capacity=${SPARK_ENGINE_CONTEXT_CAPACITY:-16384}
+target=${1:-${HOME}/models/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead}
+draft=${2:-${HOME}/models/z-lab/Qwen3.8-27B-DFlash2}
+host=${3:-127.0.0.1}
+port=${4:-30000}
+sidecar="$target/.spark.c/q27-scales-v1.bin"
+bind="$host:$port"
+model_id=spark/Qwen3.8-27B-DFlash2
+capacity=16384
 
 for path in "$target" "$sidecar" "$draft"; do
   if [[ ! -e "$path" ]]; then
@@ -22,15 +24,15 @@ for path in "$target" "$sidecar" "$draft"; do
   fi
 done
 if [[ ! -x "$server" ]]; then
-  echo "Q27 DFlash2 server is not built: $server" >&2
+  echo "Q27 DFlash2 server is not built; run './spark setup qwen27'" >&2
   exit 1
 fi
 
 export LD_LIBRARY_PATH="$repo_root/build/q27:/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
-export Q27_GDN_C427_AOT=${Q27_GDN_C427_AOT:-1}
-export Q27_GDN_C427_AOT_DIR=${Q27_GDN_C427_AOT_DIR:-${HOME}/.cache/spark-c/aot/q27/c427}
-export Q27_PREFILL_M8192=${Q27_PREFILL_M8192:-1}
-export Q27_DFLASH2_T8_GDN=${Q27_DFLASH2_T8_GDN:-1}
+export Q27_GDN_C427_AOT=1
+export Q27_GDN_C427_AOT_DIR=${HOME}/.cache/spark-c/aot/q27/c427
+export Q27_PREFILL_M8192=1
+export Q27_DFLASH2_T8_GDN=1
 
 server_pid() {
   local pid=$1

@@ -127,66 +127,71 @@ profiling breakdowns.
 
 # Build and run
 
-The supported target is an NVIDIA DGX Spark running Linux with a working CUDA
-driver and Docker installation. Model weights are not included in this
-repository.
+The supported target is an NVIDIA DGX Spark running Linux with CUDA and Docker.
+Model weights are not included. Start from the repository root:
 
 ```sh
 git clone https://github.com/franchyi/spark.c.git
 cd spark.c
-make list
+./spark doctor
+./spark models
 ```
 
-Build exactly the engine you want:
+Then choose one model. Two commands perform the complete first deployment:
 
 ```sh
-make qwen27-build
-make flash-build
-make flash-build-fused
-make glm-build
+./spark setup flash-next
+./spark serve flash-next
 ```
 
-Build scripts use the pinned CUDA container through `docker.1ms.run`, download
-Hugging Face files through `hf-mirror.com`, and fetch GitHub sources through
-`ghfast.top` by default.
+`setup` is resumable: it downloads the pinned checkpoint, builds the engine,
+and creates the model's derived weight files. Later starts use only `serve`.
+For a one-command first run, use `./spark run flash-next`.
 
-## Model weights
+The same interface applies to every engine:
 
-Qwen3.8-27B requires the target snapshot, its generated scale sidecar, and the
-pinned DFlash2 snapshot:
+| Model | Setup | Serve | Port |
+| --- | --- | --- | ---: |
+| Qwen3.8-27B | `./spark setup qwen27` | `./spark serve qwen27` | 30000 |
+| Qwen3.8 Flash-Next | `./spark setup flash-next` | `./spark serve flash-next` | 8020 |
+| GLM-5.3-Flash Q2 | `./spark setup glm` | `./spark serve glm` | 8010 |
+
+Weights default to `$HOME/models/<organization>/<repository>`. No environment
+variables are required. A different disk and public bind address are explicit:
 
 ```sh
-export SPARK_ENGINE_MODEL="$HOME/models/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
-export SPARK_ENGINE_SIDECAR="$HOME/models/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead/q27-scales-v1.bin"
-export SPARK_DFLASH2_MODEL="$HOME/models/z-lab/Qwen3.8-27B-DFlash2"
-
-make qwen27-serve
+./spark setup flash-next --models-dir /mnt/models
+./spark serve flash-next --models-dir /mnt/models --host 0.0.0.0 --port 8020
 ```
 
-Flash-Next expects the pinned Hugging Face snapshot plus its PLE index and
-SoA-v2 expert sidecar:
+The launcher reads repositories, revisions, and file sizes from
+[`models.lock.json`](models.lock.json). Hugging Face downloads use
+`hf-mirror.com` through the official `hf` client, executed in an isolated uv
+tool environment. If uv is absent, setup installs it using Astral's official
+installer. Interrupted downloads and derived sidecar generation resume.
 
-```sh
-export SPARK_ENGINE_MODEL="$HOME/models/RadixArk/Qwen3.8-Flash-Next-NVFP4"
-export FLASH_QWEN_MODEL="$SPARK_ENGINE_MODEL"
+## Recommended build container
 
-make flash-index-ple
-make flash-serve
+The Qwen engines use this pinned image by default:
+
+```text
+docker.1ms.run/lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1
 ```
 
-GLM Q2 has a pinned downloader. The exact file is 96,505,816,384 bytes and
-needs roughly 110 GiB of available memory before resident startup:
+It provides the known-good CUDA, CUTLASS, TileLang, TVM-FFI, and FlashInfer
+build environment for GB10/SM121. It is a build capsule, not the runtime: the
+deployed servers remain the small native Rust/CUDA or C/CUDA binaries in this
+repository. Docker pulls use `docker.1ms.run`; GitHub source fetches use
+`ghfast.top`.
 
-```sh
-export SPARK_ENGINE_MODEL="$HOME/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf"
+For details specific to weight size and preparation, read the selected engine:
+[Qwen3.8-27B](models/qwen3.8-27b/README.md),
+[Qwen3.8 Flash-Next](models/qwen3.8-flash-next/README.md), or
+[GLM-5.3-Flash Q2](models/glm-5.3-flash-q2/README.md).
 
-make glm-download
-make glm-serve
-```
-
-The default ports are `30000` for Qwen3.8-27B, `8020` for Flash-Next, and
-`8010` for GLM Q2. Each model directory also provides `smoke`, `bench`, and
-`stop` targets.
+Servers bind to `127.0.0.1` by default. From another computer, either pass
+`--host 0.0.0.0` on a trusted network or keep the default and use SSH port
+forwarding. Stop an engine with `./spark stop MODEL`.
 
 ## OpenAI API
 
@@ -207,6 +212,7 @@ curl http://127.0.0.1:30000/v1/chat/completions \
 
 ```text
 spark.c/
+├── spark                           # download, setup, serve, and stop
 ├── common/                         # HTTP/SSE and Qwen tokenization
 ├── models/
 │   ├── qwen3.8-27b/

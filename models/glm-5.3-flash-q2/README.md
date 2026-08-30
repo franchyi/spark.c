@@ -1,26 +1,38 @@
 # GLM-5.3-Flash Q2
 
-A standalone C/CUDA engine for the 96,505,816,384-byte Q2 GGUF. The embedded
-ds4-derived implementation owns GGUF loading, KDA, DSA/MLA, mHC, top-8 MoE,
-MTP, tokenization, sampling, OpenAI endpoints, and SSE. It has no runtime source
-checkout or Python dependency. IQ3 paging is later work and does not block Q2.
+A self-contained C/CUDA engine for the ds4-specific
+`GLM-5.3-Flash-Q2.gguf`. It serves the resident Q2 model without Python or an
+external ds4 checkout.
 
-```bash
-make download
-make build
-make serve
-make smoke
-make bench
-make stop
+## Deploy
+
+From the repository root:
+
+```sh
+./spark setup glm
+./spark serve glm
 ```
 
-Defaults are port `8010`, 2048 context, 128 output tokens, and model path
-`$HOME/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`.
-Startup requires about 110 GiB available memory.
+`setup` downloads the exact pinned 96,505,816,384-byte GGUF through
+`hf-mirror.com`, checks its size, and builds the SM121 server and benchmark.
+Unlike the NVFP4 engines, GGUF needs no derived scale or expert sidecar:
 
-The accepted Spark baseline is 523.02 prefill and 14.52 decode tok/s. A later
-Nsight Systems sample measured a 68.57-ms steady decode boundary (14.58 tok/s):
-Q8 dense 35.7%, Q4 pair 14.9%, BF16 matvec 11.4%, and indexed attention 9.7%.
-The engine now pairs the KDA `f_a/g_a` low-rank projections, removing eleven
-launches per token while retaining `DS4_CUDA_GLM_DISABLE_KDA_FG_PAIR=1` as an
-exact fallback.
+```text
+~/models/antirez/glm-5.3-flash-gguf/
+└── GLM-5.3-Flash-Q2.gguf
+```
+
+The resident engine requires about 110 GiB of available unified memory at
+startup. Stop other model servers before launching it. The service binds to
+`127.0.0.1:8010` with the accepted 2,048-token context and 128-token output
+configuration fixed in the launcher.
+
+To use a different model disk or expose the service on a trusted network:
+
+```sh
+./spark setup glm --models-dir /mnt/models
+./spark serve glm --models-dir /mnt/models --host 0.0.0.0 --port 8010
+```
+
+Stop it with `./spark stop glm`. The retained benchmark measured 523.02 prefill
+and 14.52 decode tok/s; see [../../docs/benchmarks.md](../../docs/benchmarks.md).

@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+lock="$root/models.lock.json"
+mirror=$(jq -er '.mirror' "$lock")
+models_dir="${HOME}/models"
+host="127.0.0.1"
+port=""
+
+die() {
+  echo "spark: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Spark.C deployment
+
+Usage:
+  ./spark models
+  ./spark doctor
+  ./spark download MODEL [--models-dir PATH]
+  ./spark build MODEL
+  ./spark prepare MODEL [--models-dir PATH]
+  ./spark setup MODEL [--models-dir PATH]
+  ./spark serve MODEL [--models-dir PATH] [--host HOST] [--port PORT]
+  ./spark run MODEL [--models-dir PATH] [--host HOST] [--port PORT]
+  ./spark stop MODEL
+
+Models:
+  qwen27       Qwen3.8-27B NVFP4 + DFlash2
+  flash-next   Qwen3.8 Flash-Next NVFP4 + NEXTN
+  glm          GLM-5.3-Flash Q2 GGUF
+
+`setup` downloads the pinned weights, builds the engine, and creates any
+model-specific indexes or sidecars. `run` performs setup and then serves.
+EOF
+}
+
+canonical_model() {
+  case "$1" in
+    qwen27|qwen3.8-27b) echo qwen27 ;;
+    flash-next|qwen3.8-flash-next) echo flash-next ;;
+    glm|glm-5.3-flash-q2) echo glm ;;
+    *) die "unknown model '$1'; run './spark models'" ;;
+  esac
+}
+
+model_id() {
+  case "$1" in
+    qwen27) echo qwen3.8-27b-nvfp4 ;;
+    flash-next) echo qwen3.8-flash-next-nvfp4 ;;
+    glm) echo glm-5.3-flash-q2 ;;
+  esac
+}
+
+lock_value() {
+  local id=$1
+  local expression=$2
+  jq -er --arg id "$id" ".models[] | select(.id == \$id) | $expression" "$lock"
+}
+
+repo_path() {
+  local model=$1
+  local id
+  id=$(model_id "$model")
+  printf '%s/%s\n' "$models_dir" "$(lock_value "$id" '.repo')"
+}
+
+glm_path() {
+  local id=glm-5.3-flash-q2
+  printf '%s/%s/%s\n' "$models_dir" \
+    "$(lock_value "$id" '.repo')" "$(lock_value "$id" '.files[0].path')"
+}
+
+qwen27_draft_path() {
+  printf '%s/%s\n' "$models_dir" \
+    "$(lock_value qwen3.8-27b-nvfp4 '.draft.repo')"
+}
+
+snapshot_complete() {
+  local directory=$1
+  local tokenizer=${2:-required}
+  local shard shard_list
+  [[ -s "$directory/config.json" ]] || return 1
+  [[ "$tokenizer" == optional || -s "$directory/tokenizer.json" ]] || return 1
+  if [[ -s "$directory/model.safetensors" ]]; then
+    return 0
+  fi
+  [[ -s "$directory/model.safetensors.index.json" ]] || return 1
+  shard_list=$(jq -er \
+    '.weight_map | select(type == "object" and length > 0) | [.[]] | unique[]' \
+    "$directory/model.safetensors.index.json") || return 1
+  while IFS= read -r shard; do
+    [[ -s "$directory/$shard" ]] || return 1
+  done <<<"$shard_list"
+}
+
+uv_binary() {
+  if command -v uv >/dev/null 2>&1; then
+    command -v uv
+  elif [[ -x "${HOME}/.local/bin/uv" ]]; then
+    printf '%s\n' "${HOME}/.local/bin/uv"
+  elif [[ -x "${HOME}/.cargo/bin/uv" ]]; then
+    printf '%s\n' "${HOME}/.cargo/bin/uv"
+  else
+    return 1
+  fi
+}
+
+ensure_uv() {
+  local uv
+  if uv=$(uv_binary); then
+    printf '%s\n' "$uv"
+    return
+  fi
+  command -v curl >/dev/null 2>&1 || die "curl is required to install uv"
+  echo "Installing uv with Astral's official installer..." >&2
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv=$(uv_binary) || die "uv installation completed but the binary was not found"
+  printf '%s\n' "$uv"
+}
+
+hf_snapshot() {
+  local repo=$1
+  local revision=$2
+  local destination=$3
+  shift 3
+  local uv
+  uv=$(ensure_uv)
+  mkdir -p "$destination"
+  echo "Downloading $repo@$revision"
+  echo "  mirror: $mirror"
+  echo "  path:   $destination"
+  HF_ENDPOINT="$mirror" HF_HUB_DISABLE_XET=1 \
+    "$uv" tool run --from huggingface_hub hf download \
+      "$repo" "$@" --revision "$revision" --local-dir "$destination"
+}
+
+download_model() {
+  local model=$1
+  local id repo revision destination
+  id=$(model_id "$model")
+  repo=$(lock_value "$id" '.repo')
+  revision=$(lock_value "$id" '.revision')
+  destination="$models_dir/$repo"
+
+  case "$model" in
+    qwen27)
+      if snapshot_complete "$destination"; then
+        echo "Using complete target checkpoint: $destination"
+      else
+        hf_snapshot "$repo" "$revision" "$destination"
+      fi
+      local draft_repo draft_revision draft_destination
+      draft_repo=$(lock_value "$id" '.draft.repo')
+      draft_revision=$(lock_value "$id" '.draft.revision')
+      draft_destination="$models_dir/$draft_repo"
+      if snapshot_complete "$draft_destination" optional; then
+        echo "Using complete DFlash2 checkpoint: $draft_destination"
+      else
+        hf_snapshot "$draft_repo" "$draft_revision" "$draft_destination"
+      fi
+      ;;
+    flash-next)
+      if snapshot_complete "$destination"; then
+        echo "Using complete checkpoint: $destination"
+      else
+        hf_snapshot "$repo" "$revision" "$destination"
+      fi
+      ;;
+    glm)
+      local filename expected_bytes model_file actual_bytes
+      filename=$(lock_value "$id" '.files[0].path')
+      expected_bytes=$(lock_value "$id" '.files[0].size')
+      model_file="$destination/$filename"
+      actual_bytes=0
+      [[ -f "$model_file" ]] && actual_bytes=$(stat -c %s "$model_file")
+      if [[ "$actual_bytes" == "$expected_bytes" ]]; then
+        echo "Using complete checkpoint: $model_file"
+      else
+        hf_snapshot "$repo" "$revision" "$destination" "$filename"
+        actual_bytes=$(stat -c %s "$model_file")
+        [[ "$actual_bytes" == "$expected_bytes" ]] || \
+          die "GLM checkpoint has $actual_bytes bytes; expected $expected_bytes"
+      fi
+      ;;
+  esac
+}
+
+build_model() {
+  local model=$1
+  case "$model" in
+    qwen27)
+      "$root/models/qwen3.8-27b/scripts/build.sh"
+      ;;
+    flash-next)
+      "$root/models/qwen3.8-flash-next/scripts/build.sh"
+      "$root/models/qwen3.8-flash-next/engine/tools/build-fused-server.sh"
+      ;;
+    glm)
+      "$root/models/glm-5.3-flash-q2/scripts/build.sh"
+      ;;
+  esac
+}
+
+prepare_model() {
+  local model=$1
+  case "$model" in
+    qwen27)
+      local target sidecar packer
+      target=$(repo_path qwen27)
+      snapshot_complete "$target" || die "target weights are incomplete; run './spark download qwen27'"
+      sidecar="$target/.spark.c/q27-scales-v1.bin"
+      packer="$root/build/bin/q27-pack-scales"
+      [[ -x "$packer" ]] || die "scale packer is not built; run './spark build qwen27'"
+      mkdir -p "$(dirname "$sidecar")"
+      if [[ -s "$sidecar" ]]; then
+        echo "Using prepared scale sidecar: $sidecar"
+      else
+        "$packer" "$target" "$sidecar"
+      fi
+      ;;
+    flash-next)
+      local target revision artifacts ple sidecar builder
+      target=$(repo_path flash-next)
+      snapshot_complete "$target" || die "weights are incomplete; run './spark download flash-next'"
+      revision=$(lock_value qwen3.8-flash-next-nvfp4 '.revision')
+      artifacts="$target/.spark.c"
+      ple="$artifacts/ple.ssple"
+      sidecar="$artifacts/experts-nvfp4-soa-v2.ssx"
+      builder="$root/build/bin/qwen_expert_sidecar_v2"
+      [[ -x "$builder" ]] || die "weight preparer is not built; run './spark build flash-next'"
+      mkdir -p "$artifacts"
+      python3 "$root/models/qwen3.8-flash-next/engine/tools/ple_index.py" \
+        "$target" "$ple" --revision "$revision"
+      LD_LIBRARY_PATH="$root/build/flash-next:/usr/local/cuda/lib64" \
+        "$builder" "$target" "$sidecar"
+      ;;
+    glm)
+      local file expected_bytes actual_bytes
+      file=$(glm_path)
+      expected_bytes=$(lock_value glm-5.3-flash-q2 '.files[0].size')
+      [[ -f "$file" ]] || die "weights are absent; run './spark download glm'"
+      actual_bytes=$(stat -c %s "$file")
+      [[ "$actual_bytes" == "$expected_bytes" ]] || \
+        die "GLM checkpoint has $actual_bytes bytes; expected $expected_bytes"
+      echo "GGUF is ready: $file"
+      ;;
+  esac
+}
+
+setup_model() {
+  local model=$1
+  download_model "$model"
+  build_model "$model"
+  prepare_model "$model"
+  echo
+  echo "Setup complete. Start with: ./spark serve $model"
+}
+
+default_port() {
+  case "$1" in
+    qwen27) echo 30000 ;;
+    flash-next) echo 8020 ;;
+    glm) echo 8010 ;;
+  esac
+}
+
+serve_model() {
+  local model=$1
+  [[ -n "$port" ]] || port=$(default_port "$model")
+  [[ "$port" =~ ^[1-9][0-9]*$ ]] && (( port <= 65535 )) || die "invalid port '$port'"
+  case "$model" in
+    qwen27)
+      "$root/models/qwen3.8-27b/scripts/serve.sh" \
+        "$(repo_path qwen27)" "$(qwen27_draft_path)" "$host" "$port"
+      ;;
+    flash-next)
+      "$root/models/qwen3.8-flash-next/scripts/serve.sh" \
+        "$(repo_path flash-next)" "$host" "$port"
+      ;;
+    glm)
+      "$root/models/glm-5.3-flash-q2/scripts/serve.sh" \
+        "$(glm_path)" "$host" "$port"
+      ;;
+  esac
+}
+
+stop_model() {
+  case "$1" in
+    qwen27) "$root/models/qwen3.8-27b/scripts/stop.sh" ;;
+    flash-next) "$root/models/qwen3.8-flash-next/scripts/stop.sh" ;;
+    glm) "$root/models/glm-5.3-flash-q2/scripts/stop.sh" ;;
+  esac
+}
+
+doctor() {
+  echo "Spark.C host check"
+  printf '  architecture: %s\n' "$(uname -m)"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    printf '  GPU:          %s\n' "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+  else
+    echo "  GPU:          missing nvidia-smi"
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    printf '  Docker:       %s\n' "$(docker --version)"
+  else
+    echo "  Docker:       missing"
+  fi
+  local uv
+  if uv=$(uv_binary 2>/dev/null); then
+    printf '  uv:           %s\n' "$($uv --version)"
+  else
+    echo "  uv:           not installed (setup installs it automatically)"
+  fi
+  local nvcc
+  nvcc=$(command -v nvcc 2>/dev/null || true)
+  [[ -n "$nvcc" ]] || nvcc=/usr/local/cuda/bin/nvcc
+  if [[ -x "$nvcc" ]]; then
+    printf '  CUDA:         %s\n' "$($nvcc --version | tail -1 | sed 's/^ *//')"
+  else
+    echo "  CUDA:         missing nvcc"
+  fi
+  df -h "$models_dir" 2>/dev/null | awk 'NR == 2 {printf "  model disk:   %s free at %s\n", $4, $6}' || true
+  echo
+  echo "Recommended Qwen build image:"
+  echo "  docker.1ms.run/lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1"
+  echo "This image supplies CUDA/TileLang/TVM build dependencies only; serving remains native."
+}
+
+command=${1:-help}
+[[ $# -eq 0 ]] || shift
+case "$command" in
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+  models)
+    printf '%-12s  %-5s  %s\n' MODEL PORT DESCRIPTION
+    printf '%-12s  %-5s  %s\n' qwen27 30000 'Qwen3.8-27B NVFP4 + DFlash2'
+    printf '%-12s  %-5s  %s\n' flash-next 8020 'Qwen3.8 Flash-Next NVFP4 + NEXTN'
+    printf '%-12s  %-5s  %s\n' glm 8010 'GLM-5.3-Flash Q2 GGUF'
+    exit 0
+    ;;
+  doctor)
+    doctor
+    exit 0
+    ;;
+esac
+
+[[ $# -gt 0 ]] || die "$command requires a model"
+model=$(canonical_model "$1")
+shift
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --models-dir)
+      [[ $# -ge 2 ]] || die "--models-dir requires a path"
+      models_dir=${2%/}
+      shift 2
+      ;;
+    --host)
+      [[ $# -ge 2 ]] || die "--host requires an address"
+      host=$2
+      shift 2
+      ;;
+    --port)
+      [[ $# -ge 2 ]] || die "--port requires a number"
+      port=$2
+      shift 2
+      ;;
+    *) die "unknown option '$1'" ;;
+  esac
+done
+
+case "$command" in
+  download) download_model "$model" ;;
+  build) build_model "$model" ;;
+  prepare) prepare_model "$model" ;;
+  setup) setup_model "$model" ;;
+  serve) serve_model "$model" ;;
+  run) setup_model "$model"; serve_model "$model" ;;
+  stop) stop_model "$model" ;;
+  *) die "unknown command '$command'; run './spark --help'" ;;
+esac

@@ -1,27 +1,49 @@
 # Qwen3.8-27B
 
-A standalone Rust/CUDA engine for
-`RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead`. It owns the fixed 64-layer target
-graph, FP8 KV cache, BF16 GDN state, NVFP4 MLPs, and one DFlash2 T=8 draft.
-FlashInfer/CUTLASS/cuBLAS kernels are shape-specialized behind narrow C ABIs;
-SGLang is not linked into the server.
+A standalone Rust/CUDA engine for the NVFP4 target and its fixed DFlash2 T=8
+draft. The server does not import SGLang or Python.
 
-```bash
-make build
-make serve
-make smoke
-make bench                # Q27_BENCH_CASE=prefill or decode
-make stop
+## Deploy
+
+From the repository root:
+
+```sh
+./spark setup qwen27
+./spark serve qwen27
 ```
 
-Defaults are port `30000`, target checkpoint
-`$HOME/models/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead`, and draft checkpoint
-`$HOME/models/z-lab/Qwen3.8-27B-DFlash2`. The service is
-single-slot, greedy-only, and OpenAI Chat Completions/SSE compatible.
+`setup` performs all weight work:
 
-The promoted prefill path uses donor-exact c427 preparation/recurrence and a
-mixed `8192 + 4096 + 512` tail schedule. One Spark canary measured 926.48
-prefill tok/s versus 826.78 for the pinned Mia/SGLang row. The true-M8 DFlash2
-canary measured 37.76 decode tok/s versus 35.30 for Mia/SGLang. These are
-single-run performance canaries; the decode token-trace mismatch remains a
-correctness gate. See [../../docs/benchmarks.md](../../docs/benchmarks.md).
+1. Download the pinned `RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead` snapshot.
+2. Download the pinned `z-lab/Qwen3.8-27B-DFlash2` snapshot.
+3. Build the target and DFlash2 CUDA capsules in the recommended pinned Docker
+   image.
+4. Generate `.spark.c/q27-scales-v1.bin` beside the target checkpoint.
+
+The default layout is:
+
+```text
+~/models/
+├── RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead/
+│   └── .spark.c/q27-scales-v1.bin
+└── z-lab/Qwen3.8-27B-DFlash2/
+```
+
+Budget roughly 27 GiB for the target, draft, and generated scale sidecar. The
+service binds to `127.0.0.1:30000` and uses the optimized model-specific
+prefill and DFlash2 paths automatically; there are no runtime feature flags to
+choose.
+
+To store models elsewhere or expose the service on a trusted network:
+
+```sh
+./spark setup qwen27 --models-dir /mnt/models
+./spark serve qwen27 --models-dir /mnt/models --host 0.0.0.0 --port 30000
+```
+
+Stop it with `./spark stop qwen27`. Developer-only smoke and benchmark clients
+remain available as `make qwen27-smoke` and `make qwen27-bench`.
+
+The retained performance canaries are 926.48 prefill tok/s and 37.76 decode
+tok/s. The decode token-trace mismatch remains a correctness gate; see
+[../../docs/benchmarks.md](../../docs/benchmarks.md).

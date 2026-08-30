@@ -3,10 +3,11 @@
 .PHONY: help list
 
 help:
-	@echo "Spark.C model commands"
-	@echo "  make qwen27-{build|serve|smoke|bench|stop}"
-	@echo "  make flash-{build|build-fused|index-ple|serve|smoke|bench|stop}"
-	@echo "  make glm-{build|download|serve|smoke|bench|stop}"
+	@echo "Spark.C quick deployment"
+	@echo "  ./spark setup {qwen27|flash-next|glm}"
+	@echo "  ./spark serve {qwen27|flash-next|glm}"
+	@echo "  ./spark run   {qwen27|flash-next|glm}  # setup + serve"
+	@echo "Run './spark --help' for paths, ports, and lower-level commands."
 
 list:
 	@echo qwen3.8-27b

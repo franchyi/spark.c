@@ -19,3 +19,15 @@ All three model directories use the same small operational layout:
 
 The directories share only an HTTP/tokenizer utility layer. They do not share
 a model abstraction, scheduler, allocator, or graph runtime.
+
+Users deploy through the root launcher rather than wiring model paths and
+feature environments by hand:
+
+```sh
+./spark setup MODEL
+./spark serve MODEL
+```
+
+Each model README documents its checkpoint, generated weight files, storage
+budget, and fixed shipping configuration. The per-model Makefiles remain thin
+developer aliases over the same launcher and build scripts.

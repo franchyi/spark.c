@@ -72,7 +72,9 @@ docker run --rm --network host --user "$user_id:$group_id" \
   "$rust_image" \
   cargo build --locked --release --jobs "$jobs" \
     --manifest-path models/qwen3.8-27b/engine/Cargo.toml \
-    --bin q27-serve-dflash2
+    --bin q27-serve-dflash2 --bin q27-pack-scales
 cp -f "$cargo_target/release/q27-serve-dflash2" "$server"
+cp -f "$cargo_target/release/q27-pack-scales" \
+  "$repo_root/build/bin/q27-pack-scales"
 
 echo "Q27 DFlash2 server ready: $server"

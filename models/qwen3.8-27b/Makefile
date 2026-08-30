@@ -1,12 +1,21 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: build serve smoke bench stop
+.PHONY: download build prepare setup serve smoke bench stop
+
+download:
+	@../../spark download qwen27
 
 build:
 	@./scripts/build.sh
 
+prepare:
+	@../../spark prepare qwen27
+
+setup:
+	@../../spark setup qwen27
+
 serve:
-	@./scripts/serve.sh
+	@../../spark serve qwen27
 
 smoke:
 	@./scripts/smoke.sh
