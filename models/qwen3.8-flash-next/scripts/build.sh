@@ -3,8 +3,8 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../.." && pwd)
-cuda_image=${SPARK_CUDA_IMAGE:-docker.1ms.run/lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1}
-rust_image=${FLASH_RUST_IMAGE:-docker.1ms.run/rust:1.89.0}
+cuda_image=${SPARK_CUDA_IMAGE:-lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1}
+rust_image=${FLASH_RUST_IMAGE:-rust:1.89.0}
 jobs=${JOBS:-4}
 target_host=${FLASH_RUST_TARGET:-${HOME}/.cache/spark-c/cargo/flash-target}
 cargo_home=${FLASH_CARGO_HOME:-${HOME}/.cache/spark-c/cargo/home}

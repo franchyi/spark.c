@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../../.." && pwd)
-rust_image=${FLASH_RUST_IMAGE:-docker.1ms.run/rust:1.89.0}
+rust_image=${FLASH_RUST_IMAGE:-rust:1.89.0}
 target_host=${FLASH_RUST_FUSED_TARGET:-${HOME}/.cache/spark-c/cargo/flash-fused-target}
 cargo_home=${FLASH_CARGO_HOME:-${HOME}/.cache/spark-c/cargo/home}
 cuda_host_root=${FLASH_CUDA_HOST_ROOT:-$(readlink -f /usr/local/cuda)}

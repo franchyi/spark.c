@@ -175,14 +175,14 @@ installer. Interrupted downloads and derived sidecar generation resume.
 The Qwen engines use this pinned image by default:
 
 ```text
-docker.1ms.run/lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1
+lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1
 ```
 
 It provides the known-good CUDA, CUTLASS, TileLang, TVM-FFI, and FlashInfer
 build environment for GB10/SM121. It is a build capsule, not the runtime: the
 deployed servers remain the small native Rust/CUDA or C/CUDA binaries in this
-repository. Docker pulls use `docker.1ms.run`; GitHub source fetches use
-`ghfast.top`.
+repository. Docker images and pinned kernel sources are fetched from their
+official registries and GitHub repositories.
 
 For details specific to weight size and preparation, read the selected engine:
 [Qwen3.8-27B](models/qwen3.8-27b/README.md),

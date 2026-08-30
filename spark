@@ -326,7 +326,7 @@ doctor() {
   df -h "$models_dir" 2>/dev/null | awk 'NR == 2 {printf "  model disk:   %s free at %s\n", $4, $6}' || true
   echo
   echo "Recommended Qwen build image:"
-  echo "  docker.1ms.run/lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1"
+  echo "  lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1"
   echo "This image supplies CUDA/TileLang/TVM build dependencies only; serving remains native."
 }
 

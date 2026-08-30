@@ -9,8 +9,8 @@ library_dir="$repo_root/build/q27"
 engine="$library_dir/libq27-dflash2-engine.so"
 server="$repo_root/build/bin/q27-serve-dflash2"
 
-cuda_image=${SPARK_CUDA_IMAGE:-docker.1ms.run/lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1}
-rust_image=${SPARK_RUST_IMAGE:-docker.1ms.run/rust:1.89.0}
+cuda_image=${SPARK_CUDA_IMAGE:-lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1}
+rust_image=${SPARK_RUST_IMAGE:-rust:1.89.0}
 jobs=${JOBS:-4}
 user_id=$(id -u)
 group_id=$(id -g)

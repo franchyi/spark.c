@@ -3,7 +3,6 @@ set -euo pipefail
 
 flashinfer_revision=906181e3f4cf4bcc81835fb480db4011bbd80b62
 cutlass_revision=b46b16d003484063bca4ed365e44095c4c6ed633
-github_proxy=https://ghfast.top/https://github.com/
 destination=${1:-${HOME}/.cache/spark-c/sources/flashinfer}
 
 if [[ -e "$destination" && ! -d "$destination/.git" ]]; then
@@ -14,9 +13,9 @@ fi
 if [[ ! -d "$destination/.git" ]]; then
   mkdir -p "$destination"
   git -C "$destination" init -q
-  git -C "$destination" remote add origin \
-    "${github_proxy}flashinfer-ai/flashinfer.git"
+  git -C "$destination" remote add origin https://github.com/flashinfer-ai/flashinfer.git
 fi
+git -C "$destination" remote set-url origin https://github.com/flashinfer-ai/flashinfer.git
 
 if [[ -n "$(git -C "$destination" status --porcelain --untracked-files=no)" ]]; then
   echo "refusing to replace modified kernel sources in $destination" >&2
@@ -28,9 +27,7 @@ if [[ "$(git -C "$destination" rev-parse HEAD 2>/dev/null || true)" != "$flashin
   git -C "$destination" checkout --detach -q FETCH_HEAD
 fi
 
-git -C "$destination" \
-  -c "url.${github_proxy}.insteadOf=https://github.com/" \
-  submodule update --init --depth=1 3rdparty/cutlass
+git -C "$destination" submodule update --init --depth=1 3rdparty/cutlass
 
 actual_cutlass=$(git -C "$destination/3rdparty/cutlass" rev-parse HEAD)
 if [[ "$actual_cutlass" != "$cutlass_revision" ]]; then
