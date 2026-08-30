@@ -5,7 +5,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../.." && pwd)
 engine_dir=$(cd "$script_dir/.." && pwd)
 pid_file="$engine_dir/.server.pid"
-model=${1:-${SPARK_ENGINE_MODEL:-${GLM53_Q2_MODEL:-/home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf}}}
+model=${1:-${SPARK_ENGINE_MODEL:-${GLM53_Q2_MODEL:-${HOME}/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf}}}
 
 server="$repo_root/build/glm-5.3-flash-q2/glm-server"
 if [[ ! -x "$server" ]]; then

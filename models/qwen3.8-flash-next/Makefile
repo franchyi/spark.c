@@ -10,7 +10,7 @@ build-fused:
 
 index-ple:
 	@python3 engine/tools/ple_index.py \
-		"$${SPARK_ENGINE_MODEL:-/home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4}" \
+		"$${SPARK_ENGINE_MODEL:-$${HOME}/models/RadixArk/Qwen3.8-Flash-Next-NVFP4}" \
 		--revision 7b719225242aacd3dbd3f9407468c2ee9a9d2594
 
 serve:

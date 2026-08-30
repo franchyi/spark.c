@@ -15,8 +15,8 @@ make stop
 ```
 
 Defaults are port `30000`, target checkpoint
-`/home/chaoyi/models/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead`, and draft
-checkpoint `/home/chaoyi/models/z-lab/Qwen3.8-27B-DFlash2`. The service is
+`$HOME/models/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead`, and draft checkpoint
+`$HOME/models/z-lab/Qwen3.8-27B-DFlash2`. The service is
 single-slot, greedy-only, and OpenAI Chat Completions/SSE compatible.
 
 The promoted prefill path uses donor-exact c427 preparation/recurrence and a

@@ -3,7 +3,7 @@ set -euo pipefail
 
 revision="d0d6394cad1046c6d8ad87fa9b0939b4760cb94f"
 filename="GLM-5.3-Flash-Q2.gguf"
-destination="${SPARK_ENGINE_MODEL:-/home/chaoyi/models/antirez/glm-5.3-flash-gguf/${filename}}"
+destination="${SPARK_ENGINE_MODEL:-${HOME}/models/antirez/glm-5.3-flash-gguf/${filename}}"
 endpoint="${HF_ENDPOINT:-https://hf-mirror.com}"
 expected_bytes=96505816384
 expected_sha="e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32"

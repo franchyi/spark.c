@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../.." && pwd)
-model_root=${FLASH_QWEN_MODEL:-/home/chaoyi/models/RadixArk/Qwen3.8-Flash-Next-NVFP4}
+model_root=${FLASH_QWEN_MODEL:-${HOME}/models/RadixArk/Qwen3.8-Flash-Next-NVFP4}
 input_token=${FLASH_QWEN_INPUT_TOKEN:-9707}
 steps=${FLASH_QWEN_BENCH_STEPS:-2}
 

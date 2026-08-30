@@ -15,7 +15,7 @@ make stop
 ```
 
 Defaults are port `8010`, 2048 context, 128 output tokens, and model path
-`/home/chaoyi/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`.
+`$HOME/models/antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`.
 Startup requires about 110 GiB available memory.
 
 The accepted Spark baseline is 523.02 prefill and 14.52 decode tok/s. A later
