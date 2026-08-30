@@ -16,7 +16,7 @@ Supported engines:
 
 * **Qwen3.8-27B** — NVFP4 target model with one fixed DFlash2 T=8 draft.
 * **Qwen3.8 Flash-Next** — NVFP4 MoE with GDN, QSA sparse attention, mHC, and
-  an FP8 PLE cold tier.
+  an FP8 PLE cold tier plus bundled NEXTN/MTP speculative decoding.
 * **GLM-5.3-Flash Q2** — a self-contained, ds4-derived C/CUDA engine for the
   model-specific Q2 GGUF.
 
@@ -30,6 +30,7 @@ servers remain model-specific.
 * Run one of three large models locally on a single DGX Spark.
 * Expose OpenAI-compatible Chat Completions and SSE streaming endpoints.
 * Use DFlash2 speculative decoding for the Qwen3.8-27B engine.
+* Use native top-1 NEXTN with T=2 target verification for Flash-Next.
 * Keep Flash-Next experts in unified DRAM while indexing its much larger PLE
   without copying the complete table.
 * Run the 96.5 GB GLM-5.3 Q2 GGUF resident, without Python or an external ds4
@@ -57,7 +58,7 @@ general-purpose production server.
 | Engine | Current state |
 | --- | --- |
 | Qwen3.8-27B | Complete target and DFlash2 serving path; optimized Spark canaries; decode token-trace parity remains a release gate. |
-| Qwen3.8 Flash-Next | Complete target graph and fused-MoE serving integration; performance work continues. |
+| Qwen3.8 Flash-Next | Complete target, fused-MoE, and native NEXTN serving path; kernel tuning continues. |
 | GLM-5.3-Flash Q2 | Complete resident C/CUDA service and benchmark path. |
 
 Greedy output is the primary correctness path. Performance figures below are
@@ -70,7 +71,7 @@ OpenAI HTTP / SSE
         |
         +-- Qwen3.8-27B -------- Rust owner -- CUDA target + DFlash2
         |
-        +-- Qwen3.8 Flash-Next - Rust owner -- CUDA GDN/QSA/MoE/PLE
+        +-- Qwen3.8 Flash-Next - Rust owner -- CUDA GDN/QSA/MoE/PLE + NEXTN
         |
         `-- GLM-5.3 Q2 --------- C owner ---- CUDA graph + quantized MMQ
 ```
@@ -111,13 +112,14 @@ the rows describe each engine rather than rank the models.
 | Engine | Workload | Prefill | Decode |
 | --- | --- | ---: | ---: |
 | Qwen3.8-27B NVFP4 | optimized c427 prefill; true-M8 DFlash2 decode | **926.48 tok/s** | **37.76 tok/s** |
-| Qwen3.8 Flash-Next NVFP4 | warm 66-token target-only run | **43.3–44.5 tok/s** | **9.7–10.9 tok/s** |
+| Qwen3.8 Flash-Next NVFP4 | warm 56 prompt / 24 output, native NEXTN | **66.75 tok/s** | **11.91 tok/s** |
 | GLM-5.3-Flash Q2 | 2,048 prompt / 128 output | **523.02 tok/s** | **14.52 tok/s** |
 
 The Qwen3.8-27B numbers are separate single canaries. Its prefill response hash
 matched the oracle; its optimized DFlash2 decode trace still differs and must
-not be presented as correctness-promoted. Flash-Next is the least optimized of
-the three engines. GLM's Nsight Systems sample measured a 68.57 ms steady token
+not be presented as correctness-promoted. Flash-Next NEXTN verifies every
+proposal against the target and journals recurrent row-zero state on rejection.
+GLM's Nsight Systems sample measured a 68.57 ms steady token
 boundary, or 14.58 tok/s, consistent with the benchmark.
 
 See [`docs/benchmarks.md`](docs/benchmarks.md) for the retained workloads and

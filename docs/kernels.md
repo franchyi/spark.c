@@ -15,6 +15,7 @@ the one model that compiles it.
 | Flash-Next | NVFP4 routed MoE | FlashInfer/CUTLASS + SGLang routing/join | fixed cache-slot route owned by Rust |
 | Flash-Next | mHC | SGLang reductions + cuBLAS | fixed hidden/rank geometry |
 | Flash-Next | FP8 PLE gather | SGLang arithmetic contract | Rust-owned NVMe row cache and descriptors |
+| Flash-Next | NEXTN/MTP | SGLang Qwen4-Exp MTP graph | BF16 one-layer draft, top-1/T=2 verify, recurrent row-zero journal |
 | GLM Q2 | complete graph and quantized MMQ | ds4 | embedded pinned model-specific C/CUDA source |
 
 ## Adoption rule

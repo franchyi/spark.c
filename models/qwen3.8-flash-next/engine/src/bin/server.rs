@@ -91,6 +91,7 @@ fn run_generation(engine: &mut QwenNativeEngine, command: EngineCommand) {
     // of prompt prefill. This keeps the diagnostic canary short and prevents
     // tracing itself from turning a multi-token prompt into minutes of work.
     let profile_decode = std::env::var_os("FLASH_QWEN_PROFILE_DECODE").is_some();
+    let use_mtp = std::env::var_os("FLASH_QWEN_MTP").is_some();
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         if request.prompt_token_ids.is_empty() {
             return Err("Qwen prompt cannot be empty".into());
@@ -151,7 +152,35 @@ fn run_generation(engine: &mut QwenNativeEngine, command: EngineCommand) {
             prefill_started.elapsed().as_secs_f64()
         );
         let mut token = candidate.ok_or("Qwen prompt did not produce a decode token")?;
-        for generated in 0..request.max_new_tokens {
+        let mut generated = 0_u32;
+        while generated < request.max_new_tokens {
+            if use_mtp && generated + 1 < request.max_new_tokens {
+                let step = engine.forward_mtp_pair(token, trace_layers)?;
+                for output in step.output_tokens.iter().copied() {
+                    if request.stop_token_ids.contains(&output) {
+                        let _ = events.send(EngineEvent::Finished(FinishReason::Stop));
+                        return Ok(());
+                    }
+                    if events.send(EngineEvent::Token(output)).is_err() {
+                        return Ok(());
+                    }
+                    generated += 1;
+                    if generated == request.max_new_tokens {
+                        let _ = events.send(EngineEvent::Finished(FinishReason::Length));
+                        return Ok(());
+                    }
+                }
+                eprintln!(
+                    "Qwen NEXTN: draft {}, accepted {}, emitted {}, next {}, {:.3} s",
+                    step.draft_token,
+                    step.accepted,
+                    step.output_tokens.len(),
+                    step.next_token,
+                    step.elapsed_seconds,
+                );
+                token = step.next_token;
+                continue;
+            }
             if request.stop_token_ids.contains(&token) {
                 let _ = events.send(EngineEvent::Finished(FinishReason::Stop));
                 return Ok(());
@@ -159,15 +188,16 @@ fn run_generation(engine: &mut QwenNativeEngine, command: EngineCommand) {
             if events.send(EngineEvent::Token(token)).is_err() {
                 return Ok(());
             }
-            if generated + 1 == request.max_new_tokens {
+            generated += 1;
+            if generated == request.max_new_tokens {
                 let _ = events.send(EngineEvent::Finished(FinishReason::Length));
                 return Ok(());
             }
             let step = engine
-                .forward_token(token, trace_layers || (profile_decode && generated == 0))?;
+                .forward_token(token, trace_layers || (profile_decode && generated == 1))?;
             eprintln!(
                 "Qwen decode {}: input {token}, next {}, {:.3} s, experts {}/{} hit/pack, {} evictions",
-                generated + 1,
+                generated,
                 step.token,
                 step.elapsed_seconds,
                 step.expert_hits,

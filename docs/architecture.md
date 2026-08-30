@@ -7,7 +7,7 @@ Spark.C supports exactly three products on one DGX Spark:
 | Model | Control | Hot path | Weights |
 | --- | --- | --- | --- |
 | Qwen3.8-27B | Rust, one request slot | CUDA + fixed DFlash2 T=8 | NVFP4 safetensors |
-| Qwen3.8-Flash-Next | Rust, one request slot | CUDA GDN/QSA/MoE/PLE | NVFP4 + FP8 PLE |
+| Qwen3.8-Flash-Next | Rust, one request slot | CUDA GDN/QSA/MoE/PLE + NEXTN | NVFP4 + FP8 PLE + BF16 MTP |
 | GLM-5.3-Flash | embedded C | ds4-derived CUDA graph/MMQ | Q2 GGUF |
 
 Each `models/<name>/engine/` owns its graph, tensor layouts, state, launch

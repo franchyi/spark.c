@@ -377,8 +377,10 @@ pub struct QwenDecodeGlueArgs {
 pub struct QwenLmHeadArgs {
     pub struct_size: u32,
     pub abi_version: u32,
+    pub tokens: u32,
     pub vocabulary: u32,
     pub hidden_size: u32,
+    pub reserved: u32,
     pub hidden_states: *const c_void,
     pub weight: *const c_void,
     pub logits: *mut f32,
@@ -391,10 +393,48 @@ pub struct QwenLmHeadArgs {
 pub struct QwenArgmaxArgs {
     pub struct_size: u32,
     pub abi_version: u32,
+    pub rows: u32,
     pub elements: u32,
+    pub row_stride: u32,
     pub reserved: u32,
     pub values: *const f32,
     pub output_index: *mut u32,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenMtpInputArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub embedding: *const c_void,
+    pub target_hidden: *const c_void,
+    pub embedding_norm_weight: *const c_void,
+    pub hidden_norm_weight: *const c_void,
+    pub embedding_fc_weight: *const c_void,
+    pub hidden_fc_weight: *const c_void,
+    pub embedding_norm_scratch: *mut c_void,
+    pub embedding_projected_scratch: *mut c_void,
+    pub hidden_norm_scratch: *mut c_void,
+    pub output: *mut c_void,
+    pub cublas_handle: *mut c_void,
+    pub cuda_stream: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QwenMtpExpertsArgs {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub hidden_states: *const c_void,
+    pub expert_ids: *const i32,
+    pub expert_weights: *const f32,
+    pub gate_up_weight: *const c_void,
+    pub down_weight: *const c_void,
+    pub gate_up_scratch: *mut c_void,
+    pub activated_scratch: *mut c_void,
+    pub expert_output_scratch: *mut c_void,
+    pub output: *mut c_void,
     pub cuda_stream: *mut c_void,
 }
 
@@ -1681,6 +1721,8 @@ unsafe extern "C" {
     pub fn flash_qwen_qsa_single_value_launch(args: *const QwenDecodeGlueArgs) -> Status;
     pub fn flash_qwen_lm_head_launch(args: *const QwenLmHeadArgs) -> Status;
     pub fn flash_qwen_argmax_launch(args: *const QwenArgmaxArgs) -> Status;
+    pub fn flash_qwen_mtp_input_launch(args: *const QwenMtpInputArgs) -> Status;
+    pub fn flash_qwen_mtp_experts_launch(args: *const QwenMtpExpertsArgs) -> Status;
     pub fn flash_qwen_runtime_mhc_mix(caps: *const DeviceCaps, args: *const MhcArgs) -> Status;
     pub fn flash_qwen_runtime_mhc_combine(caps: *const DeviceCaps, args: *const MhcArgs) -> Status;
     pub fn flash_qwen_runtime_gdn_prepare(
@@ -1998,8 +2040,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<QwenQsaFinishArgs>(), 72);
         assert_eq!(std::mem::size_of::<QwenPleBlockArgs>(), 144);
         assert_eq!(std::mem::size_of::<QwenDecodeGlueArgs>(), 32);
-        assert_eq!(std::mem::size_of::<QwenLmHeadArgs>(), 56);
-        assert_eq!(std::mem::size_of::<QwenArgmaxArgs>(), 40);
+        assert_eq!(std::mem::size_of::<QwenLmHeadArgs>(), 64);
+        assert_eq!(std::mem::size_of::<QwenArgmaxArgs>(), 48);
+        assert_eq!(std::mem::size_of::<QwenMtpInputArgs>(), 104);
+        assert_eq!(std::mem::size_of::<QwenMtpExpertsArgs>(), 88);
         assert_eq!(std::mem::size_of::<KernelInfo>(), 40);
     }
 

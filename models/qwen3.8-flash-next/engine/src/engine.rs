@@ -24,12 +24,14 @@ use crate::ffi::{
     QWEN_GDN_AUX_ABI_VERSION, QWEN_PLE_BLOCK_ABI_VERSION, QWEN_QSA_BLOCK_ABI_VERSION,
     QsaDecodeArgs, QsaDecodePlan, QsaExpandArgs, QsaExpandPlan, QsaIndexPrepArgs, QsaIndexPrepPlan,
     QsaKvPackArgs, QsaKvPackPlan, QsaScoreArgs, QsaScorePlan, QsaTopkArgs, QsaTopkPlan,
-    QwenArgmaxArgs, QwenBf16ToF32Args, QwenDecodeGlueArgs, QwenLmHeadArgs, QwenPleBlockArgs,
-    QwenQsaFinishArgs, QwenQsaProjectArgs, SegmentedNvfp4QuantizeArgs, SegmentedNvfp4QuantizePlan,
-    SegmentedSiluNvfp4Args, SegmentedSiluNvfp4Plan, SharedExpertArgs, SharedExpertPlan, Status,
+    QwenArgmaxArgs, QwenBf16ToF32Args, QwenDecodeGlueArgs, QwenLmHeadArgs, QwenMtpExpertsArgs,
+    QwenMtpInputArgs, QwenPleBlockArgs, QwenQsaFinishArgs, QwenQsaProjectArgs,
+    SegmentedNvfp4QuantizeArgs, SegmentedNvfp4QuantizePlan, SegmentedSiluNvfp4Args,
+    SegmentedSiluNvfp4Plan, SharedExpertArgs, SharedExpertPlan, Status,
     flash_qsa_decode_launch, flash_qsa_expand_launch, flash_qsa_index_prep_launch,
     flash_qsa_kv_pack_launch, flash_qsa_score_launch, flash_qsa_topk_launch,
     flash_qwen_add_hyper_launch, flash_qwen_argmax_launch, flash_qwen_lm_head_launch,
+    flash_qwen_mtp_experts_launch, flash_qwen_mtp_input_launch,
     flash_qwen_ple_block_launch, flash_qwen_qsa_finish_launch, flash_qwen_qsa_project_launch,
     flash_qwen_repeat_embedding_launch,
     flash_qwen_runtime_fused_moe_available, flash_qwen_runtime_fused_moe_create,
@@ -227,6 +229,9 @@ struct QwenDecodeArena {
     final_dummy: CoherentRegionOwner,
     final_hidden: CoherentRegionOwner,
     final_combined: CoherentRegionOwner,
+    mtp_embedding_norm: CoherentRegionOwner,
+    mtp_embedding_projected: CoherentRegionOwner,
+    mtp_expert_activated: CoherentRegionOwner,
     logits: CoherentRegionOwner,
     next_token: CoherentRegionOwner,
 }
@@ -335,10 +340,13 @@ impl QwenDecodeArena {
             ple_normed: slab(HYPER * 2)?,
             ple_delta: slab(HYPER * 2)?,
             final_dummy: slab(HC * HYPER * 2)?,
-            final_hidden: slab(HIDDEN * 2)?,
-            final_combined: slab(HYPER * 2)?,
-            logits: slab(VOCABULARY * 4)?,
-            next_token: slab(4)?,
+            final_hidden: slab(2 * HIDDEN * 2)?,
+            final_combined: slab(2 * HYPER * 2)?,
+            mtp_embedding_norm: slab(HIDDEN * 2)?,
+            mtp_embedding_projected: slab(HIDDEN * 2)?,
+            mtp_expert_activated: slab(u64::from(TOP_K) * INTERMEDIATE * 2)?,
+            logits: slab(2 * VOCABULARY * 4)?,
+            next_token: slab(2 * 4)?,
         })
     }
 }
@@ -907,6 +915,18 @@ pub struct QwenNativeStep {
     pub expert_evictions: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct QwenMtpStep {
+    /// Target-correct tokens ready for the caller to emit. The first token is
+    /// always the input candidate; the second exists only when NEXTN matched
+    /// the target verifier.
+    pub output_tokens: Vec<u32>,
+    pub next_token: u32,
+    pub draft_token: u32,
+    pub accepted: bool,
+    pub elapsed_seconds: f64,
+}
+
 /// Result of an intermediate prompt bucket. It deliberately has no token:
 /// only the final prompt bucket needs the expensive vocabulary projection.
 #[derive(Clone, Copy, Debug)]
@@ -937,15 +957,26 @@ pub struct QwenNativeEngine {
     hidden: CoherentRegionOwner,
     hyper_a: CoherentRegionOwner,
     hyper_b: CoherentRegionOwner,
+    last_target_hyper: CoherentRegionOwner,
+    mtp_hyper_a: CoherentRegionOwner,
+    mtp_hyper_b: CoherentRegionOwner,
     gdn_conv_states: CoherentRegionOwner,
     gdn_temporal_states: CoherentRegionOwner,
     ple_state: CoherentRegionOwner,
+    snapshot_gdn_conv_states: CoherentRegionOwner,
+    snapshot_gdn_temporal_states: CoherentRegionOwner,
+    snapshot_ple_state: CoherentRegionOwner,
     ple: QwenPleRuntime,
     qsa_index_key_states: CoherentRegionOwner,
     qsa_rope_positions: CoherentRegionOwner,
     qsa_compressed_keys: CoherentRegionOwner,
     qsa_full_key_states: CoherentRegionOwner,
     qsa_full_value_states: CoherentRegionOwner,
+    mtp_qsa_index_key_states: CoherentRegionOwner,
+    mtp_qsa_rope_positions: CoherentRegionOwner,
+    mtp_qsa_compressed_keys: CoherentRegionOwner,
+    mtp_qsa_full_key_states: CoherentRegionOwner,
+    mtp_qsa_full_value_states: CoherentRegionOwner,
     fused_moe: Option<QwenFusedMoeRuntime>,
     resident_experts: Option<QwenResidentExpertSidecar>,
     hot_experts: Vec<QwenExpertHotCache>,
@@ -955,6 +986,8 @@ pub struct QwenNativeEngine {
     expert_packs: u64,
     arena: QwenDecodeArena,
     token_history: Vec<u32>,
+    mtp_position: u32,
+    mtp_enabled: bool,
     decode_fast_path: bool,
     direct_expert_pack: bool,
 }
@@ -1087,9 +1120,17 @@ impl QwenNativeEngine {
             hidden: slab(PREFILL_CHUNK_TOKENS * HIDDEN * 2)?,
             hyper_a: slab(PREFILL_CHUNK_TOKENS * HYPER * 2)?,
             hyper_b: slab(PREFILL_CHUNK_TOKENS * HYPER * 2)?,
+            last_target_hyper: slab(HYPER * 2)?,
+            mtp_hyper_a: slab(HYPER * 2)?,
+            mtp_hyper_b: slab(HYPER * 2)?,
             gdn_conv_states: slab(36 * GDN_CONV_WIDTH * 3 * 2)?,
             gdn_temporal_states: slab(36 * VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2)?,
             ple_state: slab(HYPER * 9 * 2)?,
+            snapshot_gdn_conv_states: slab(36 * GDN_CONV_WIDTH * 3 * 2)?,
+            snapshot_gdn_temporal_states: slab(
+                36 * VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2,
+            )?,
+            snapshot_ple_state: slab(HYPER * 9 * 2)?,
             ple,
             qsa_index_key_states: slab(
                 QSA_LAYERS * u64::try_from(QWEN_MODEL_MAX_LENGTH)? * INDEX_HEAD_DIM * 2,
@@ -1102,6 +1143,19 @@ impl QwenNativeEngine {
             qsa_full_value_states: slab(
                 QSA_LAYERS * u64::try_from(QWEN_MODEL_MAX_LENGTH)? * KV_WIDTH * 2,
             )?,
+            mtp_qsa_index_key_states: slab(
+                u64::try_from(QWEN_MODEL_MAX_LENGTH)? * INDEX_HEAD_DIM * 2,
+            )?,
+            mtp_qsa_rope_positions: slab(
+                u64::try_from(QWEN_MODEL_MAX_LENGTH)? * 3 * 8,
+            )?,
+            mtp_qsa_compressed_keys: slab(QSA_COMPRESSED_SLOTS * INDEX_HEAD_DIM * 2)?,
+            mtp_qsa_full_key_states: slab(
+                u64::try_from(QWEN_MODEL_MAX_LENGTH)? * KV_WIDTH * 2,
+            )?,
+            mtp_qsa_full_value_states: slab(
+                u64::try_from(QWEN_MODEL_MAX_LENGTH)? * KV_WIDTH * 2,
+            )?,
             fused_moe,
             resident_experts,
             hot_experts,
@@ -1111,6 +1165,8 @@ impl QwenNativeEngine {
             expert_packs: 0,
             arena: QwenDecodeArena::create()?,
             token_history: Vec::new(),
+            mtp_position: 0,
+            mtp_enabled: std::env::var_os("FLASH_QWEN_MTP").is_some(),
             decode_fast_path: std::env::var_os("FLASH_QWEN_DECODE_FAST_PATH").is_some(),
             direct_expert_pack,
         };
@@ -1160,6 +1216,7 @@ impl QwenNativeEngine {
             )?;
         }
         self.token_history.clear();
+        self.mtp_position = 0;
         Ok(())
     }
 
@@ -1171,6 +1228,212 @@ impl QwenNativeEngine {
         self.forward_tokens(&[input_token], verbose)
     }
 
+    /// Fixed top-1 NEXTN path for Qwen4-Exp. One MTP proposal is verified
+    /// together with the already-known target candidate in a T=2 target pass.
+    /// A first-token rejection restores recurrent state and replays only the
+    /// valid candidate; stale QSA suffix rows are hidden by the shorter logical
+    /// sequence and overwritten by the following pass.
+    pub fn forward_mtp_pair(
+        &mut self,
+        candidate: u32,
+        verbose: bool,
+    ) -> Result<QwenMtpStep, Box<dyn std::error::Error>> {
+        if self.token_history.is_empty()
+            || u64::from(candidate) >= VOCABULARY
+            || self.token_history.len() + 2 > QWEN_MODEL_MAX_LENGTH
+        {
+            return Err("Qwen NEXTN candidate or sequence length is invalid".into());
+        }
+        let started = Instant::now();
+        let history_len = self.token_history.len();
+        let rope_position = u32::try_from(history_len)?;
+        let draft = self.run_mtp_token(
+            candidate,
+            self.last_target_hyper.device_address(),
+            self.mtp_position,
+            rope_position,
+            true,
+        )?
+        .ok_or("Qwen NEXTN draft projection was skipped")?;
+
+        self.advance_tokens(&[candidate, draft], verbose, false, true)?;
+        let final_hyper_base = if LAYERS.is_multiple_of(2) {
+            self.hyper_a.device_address()
+        } else {
+            self.hyper_b.device_address()
+        };
+        let verify = finish_logits_rows(
+            &mut self.weight_maps,
+            &mut self.resident,
+            final_hyper_base,
+            2,
+            "model.language_model.hyper_connection_mixer",
+            &self.arena,
+            &mut self.stream,
+            &self.blas,
+            &self.caps,
+            true,
+        )?;
+        let accepted = verify[0] == draft;
+        let (output_tokens, next_token) = if accepted {
+            // Advance the MTP KV chain through the accepted draft. Its target
+            // hidden input is verifier row zero, corresponding to `candidate`.
+            self.run_mtp_token(
+                draft,
+                final_hyper_base,
+                self.mtp_position + 1,
+                rope_position + 1,
+                false,
+            )?;
+            self.mtp_position += 2;
+            (vec![candidate, draft], verify[1])
+        } else {
+            self.restore_target_state()?;
+            self.token_history.truncate(history_len + 1);
+            unsafe {
+                self.stream.memcpy_async(
+                    self.last_target_hyper.device_address(),
+                    final_hyper_base,
+                    usize::try_from(HYPER * 2)?,
+                )?;
+            }
+            self.mtp_position += 1;
+            (vec![candidate], verify[0])
+        };
+        Ok(QwenMtpStep {
+            output_tokens,
+            next_token,
+            draft_token: draft,
+            accepted,
+            elapsed_seconds: started.elapsed().as_secs_f64(),
+        })
+    }
+
+    fn restore_target_state(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            self.stream.memcpy_async(
+                self.gdn_conv_states.device_address(),
+                self.snapshot_gdn_conv_states.device_address(),
+                self.gdn_conv_states.payload_bytes()?,
+            )?;
+            self.stream.memcpy_async(
+                self.gdn_temporal_states.device_address(),
+                self.snapshot_gdn_temporal_states.device_address(),
+                self.gdn_temporal_states.payload_bytes()?,
+            )?;
+            self.stream.memcpy_async(
+                self.ple_state.device_address(),
+                self.snapshot_ple_state.device_address(),
+                self.ple_state.payload_bytes()?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn run_mtp_token(
+        &mut self,
+        input_token: u32,
+        target_hidden: u64,
+        logical_position: u32,
+        rope_position: u32,
+        project_vocabulary: bool,
+    ) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+        prepare_qsa_metadata(&mut self.arena, logical_position, rope_position, 0)?;
+        let embedding = self.resident.get(
+            &mut self.weight_maps,
+            &mut self.stream,
+            "model.language_model.embed_tokens.weight",
+            "BF16",
+            &[VOCABULARY, HIDDEN],
+            VOCABULARY * HIDDEN * 2,
+        )? + u64::from(input_token) * HIDDEN * 2;
+        let embedding_norm = self.resident.get(
+            &mut self.weight_maps,
+            &mut self.stream,
+            "mtp.pre_fc_norm_embedding.weight",
+            "BF16",
+            &[HIDDEN],
+            HIDDEN * 2,
+        )?;
+        let hidden_norm = self.resident.get(
+            &mut self.weight_maps,
+            &mut self.stream,
+            "mtp.pre_fc_norm_hidden.weight",
+            "BF16",
+            &[HYPER],
+            HYPER * 2,
+        )?;
+        let embedding_fc = self.resident.get(
+            &mut self.weight_maps,
+            &mut self.stream,
+            "mtp.fc_embedding.weight",
+            "BF16",
+            &[HIDDEN, HIDDEN],
+            HIDDEN * HIDDEN * 2,
+        )?;
+        let hidden_fc = self.resident.get(
+            &mut self.weight_maps,
+            &mut self.stream,
+            "mtp.fc_hidden.weight",
+            "BF16",
+            &[HIDDEN, HIDDEN],
+            HIDDEN * HIDDEN * 2,
+        )?;
+        let fusion = QwenMtpInputArgs {
+            struct_size: size::<QwenMtpInputArgs>(),
+            abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
+            embedding: ptr(embedding),
+            target_hidden: ptr(target_hidden),
+            embedding_norm_weight: ptr(embedding_norm),
+            hidden_norm_weight: ptr(hidden_norm),
+            embedding_fc_weight: ptr(embedding_fc),
+            hidden_fc_weight: ptr(hidden_fc),
+            embedding_norm_scratch: ptr_mut(self.arena.mtp_embedding_norm.device_address()),
+            embedding_projected_scratch: ptr_mut(
+                self.arena.mtp_embedding_projected.device_address(),
+            ),
+            hidden_norm_scratch: ptr_mut(self.arena.mhc_normed.device_address()),
+            output: ptr_mut(self.mtp_hyper_a.device_address()),
+            cublas_handle: self.blas.raw(),
+            cuda_stream: self.stream.raw(),
+        };
+        native("Qwen NEXTN input fusion", unsafe {
+            flash_qwen_mtp_input_launch(&fusion)
+        })?;
+        run_mtp_layer(
+            &mut self.weight_maps,
+            &mut self.resident,
+            &self.mtp_hyper_a,
+            &self.mtp_hyper_b,
+            &self.mtp_qsa_index_key_states,
+            &self.mtp_qsa_rope_positions,
+            &self.mtp_qsa_compressed_keys,
+            &self.mtp_qsa_full_key_states,
+            &self.mtp_qsa_full_value_states,
+            logical_position,
+            &mut self.arena,
+            &mut self.stream,
+            &self.blas,
+            &self.caps,
+        )?;
+        if !project_vocabulary {
+            return Ok(None);
+        }
+        let token = finish_logits_rows(
+            &mut self.weight_maps,
+            &mut self.resident,
+            self.mtp_hyper_b.device_address(),
+            1,
+            "mtp.hyper_connection_mixer",
+            &self.arena,
+            &mut self.stream,
+            &self.blas,
+            &self.caps,
+            true,
+        )?[0];
+        Ok(Some(token))
+    }
+
     /// Advance one fixed AOT prefill bucket. Layers remain outermost so their
     /// weights and mapped expert shard are reused across the whole short chunk.
     pub fn forward_tokens(
@@ -1178,7 +1441,7 @@ impl QwenNativeEngine {
         input_tokens: &[u32],
         verbose: bool,
     ) -> Result<QwenNativeStep, Box<dyn std::error::Error>> {
-        let step = self.advance_tokens(input_tokens, verbose, true)?;
+        let step = self.advance_tokens(input_tokens, verbose, true, false)?;
         Ok(QwenNativeStep {
             token: step.token.ok_or("Qwen vocabulary projection was skipped")?,
             elapsed_seconds: step.elapsed_seconds,
@@ -1197,7 +1460,7 @@ impl QwenNativeEngine {
         input_tokens: &[u32],
         verbose: bool,
     ) -> Result<QwenPrefillStep, Box<dyn std::error::Error>> {
-        let step = self.advance_tokens(input_tokens, verbose, false)?;
+        let step = self.advance_tokens(input_tokens, verbose, false, false)?;
         Ok(QwenPrefillStep {
             elapsed_seconds: step.elapsed_seconds,
             expert_hits: step.expert_hits,
@@ -1211,6 +1474,7 @@ impl QwenNativeEngine {
         input_tokens: &[u32],
         verbose: bool,
         project_vocabulary: bool,
+        capture_first_state: bool,
     ) -> Result<QwenBatchStep, Box<dyn std::error::Error>> {
         if !matches!(input_tokens.len(), 1 | 2 | 4 | 8 | 16)
             || input_tokens
@@ -1220,16 +1484,21 @@ impl QwenNativeEngine {
         {
             return Err("Qwen prefill bucket or input token is invalid".into());
         }
+        if capture_first_state && input_tokens.len() != 2 {
+            return Err("Qwen verifier state capture requires the T=2 bucket".into());
+        }
         let start_position = self.token_history.len();
         self.token_history.extend_from_slice(input_tokens);
         let num_tokens = u32::try_from(input_tokens.len())?;
         // Prepare every token's immutable QSA metadata before enqueuing any
         // layer work. Each token owns one fixed slot for the whole bucket, so
         // the ordered CUDA stream needs no host fence between prompt tokens.
-        let fast_decode = self.decode_fast_path && input_tokens.len() == 1 && project_vocabulary;
+        let fast_decode = self.decode_fast_path
+            && ((input_tokens.len() == 1 && project_vocabulary) || capture_first_state);
         for token_offset in 0..input_tokens.len() {
             prepare_qsa_metadata(
                 &mut self.arena,
+                u32::try_from(start_position + token_offset)?,
                 u32::try_from(start_position + token_offset)?,
                 u32::try_from(token_offset)?,
             )?;
@@ -1285,6 +1554,7 @@ impl QwenNativeEngine {
                     input_tokens.len(),
                     current.device_address(),
                     &self.ple_state,
+                    capture_first_state.then_some(&self.snapshot_ple_state),
                     &mut self.arena,
                     &mut self.stream,
                     &self.blas,
@@ -1314,6 +1584,8 @@ impl QwenNativeEngine {
                 next,
                 &self.gdn_conv_states,
                 &self.gdn_temporal_states,
+                capture_first_state.then_some(&self.snapshot_gdn_conv_states),
+                capture_first_state.then_some(&self.snapshot_gdn_temporal_states),
                 &self.qsa_index_key_states,
                 &self.qsa_rope_positions,
                 &self.qsa_compressed_keys,
@@ -1344,13 +1616,39 @@ impl QwenNativeEngine {
                 );
             }
         }
+        let final_hyper_base = if LAYERS.is_multiple_of(2) {
+            self.hyper_a.device_address()
+        } else {
+            self.hyper_b.device_address()
+        };
+        let final_hyper = final_hyper_base + u64::try_from(input_tokens.len() - 1)? * HYPER * 2;
+        if self.mtp_enabled && !capture_first_state {
+            let first_offset = usize::from(start_position == 0);
+            let previous_target_hidden = self.last_target_hyper.device_address();
+            for offset in first_offset..input_tokens.len() {
+                let source_hidden = if offset == 0 {
+                    previous_target_hidden
+                } else {
+                    final_hyper_base + u64::try_from(offset - 1)? * HYPER * 2
+                };
+                self.run_mtp_token(
+                    input_tokens[offset],
+                    source_hidden,
+                    self.mtp_position,
+                    u32::try_from(start_position + offset)?,
+                    false,
+                )?;
+                self.mtp_position += 1;
+            }
+        }
+        unsafe {
+            self.stream.memcpy_async(
+                self.last_target_hyper.device_address(),
+                final_hyper,
+                usize::try_from(HYPER * 2)?,
+            )?;
+        }
         let token = if project_vocabulary {
-            let final_hyper_base = if LAYERS.is_multiple_of(2) {
-                self.hyper_a.device_address()
-            } else {
-                self.hyper_b.device_address()
-            };
-            let final_hyper = final_hyper_base + u64::try_from(input_tokens.len() - 1)? * HYPER * 2;
             Some(finish_logits(
                 &mut self.weight_maps,
                 &mut self.resident,
@@ -1454,6 +1752,8 @@ fn run_layer(
     hyper_output: &CoherentRegionOwner,
     gdn_conv_states: &CoherentRegionOwner,
     gdn_temporal_states: &CoherentRegionOwner,
+    snapshot_gdn_conv_states: Option<&CoherentRegionOwner>,
+    snapshot_gdn_temporal_states: Option<&CoherentRegionOwner>,
     qsa_index_key_states: &CoherentRegionOwner,
     qsa_rope_positions: &CoherentRegionOwner,
     qsa_compressed_keys: &CoherentRegionOwner,
@@ -1500,7 +1800,8 @@ fn run_layer(
         run_qsa(
             maps,
             resident,
-            layer,
+            &format!("model.language_model.layers.{layer}.self_attn"),
+            u64::from(layer / 4),
             start_position,
             num_tokens,
             arena.mixed.device_address(),
@@ -1524,6 +1825,8 @@ fn run_layer(
             num_tokens,
             gdn_conv_states,
             gdn_temporal_states,
+            snapshot_gdn_conv_states,
+            snapshot_gdn_temporal_states,
             arena,
             stream,
             blas,
@@ -1583,6 +1886,225 @@ fn run_layer(
         flash_mhc_combine_launch(caps, &mlp_mhc)
     })?;
     trace_stage(stream, trace, layer, "MLP mHC combine")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_layer(
+    maps: &mut FlashNextWeightMaps,
+    resident: &mut QwenResidentWeights,
+    hyper_input: &CoherentRegionOwner,
+    hyper_output: &CoherentRegionOwner,
+    qsa_index_key_states: &CoherentRegionOwner,
+    qsa_rope_positions: &CoherentRegionOwner,
+    qsa_compressed_keys: &CoherentRegionOwner,
+    qsa_full_key_states: &CoherentRegionOwner,
+    qsa_full_value_states: &CoherentRegionOwner,
+    position: u32,
+    arena: &mut QwenDecodeArena,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
+    caps: &DeviceCaps,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let attn_weights = load_mhc_weights(
+        maps,
+        resident,
+        stream,
+        "mtp.layers.0.attn_hyper_connection",
+    )?;
+    let attn_mhc = mhc_args(
+        1,
+        hyper_input.device_address(),
+        arena.attention.device_address(),
+        arena.hyper_mid.device_address(),
+        &arena.mixed,
+        &arena.mhc_normed,
+        &arena.mhc_down,
+        &arena.mhc_activated,
+        &arena.mhc_up,
+        &attn_weights,
+        blas,
+        stream,
+    );
+    native("Qwen NEXTN attention mHC mix", unsafe {
+        flash_mhc_mix_launch(caps, &attn_mhc)
+    })?;
+    run_qsa(
+        maps,
+        resident,
+        "mtp.layers.0.self_attn",
+        0,
+        position,
+        1,
+        arena.mixed.device_address(),
+        arena.attention.device_address(),
+        qsa_index_key_states,
+        qsa_rope_positions,
+        qsa_compressed_keys,
+        qsa_full_key_states,
+        qsa_full_value_states,
+        arena,
+        stream,
+        blas,
+        caps,
+        true,
+    )?;
+    native("Qwen NEXTN attention mHC combine", unsafe {
+        flash_mhc_combine_launch(caps, &attn_mhc)
+    })?;
+
+    let mlp_weights = load_mhc_weights(
+        maps,
+        resident,
+        stream,
+        "mtp.layers.0.mlp_hyper_connection",
+    )?;
+    let mlp_mhc = mhc_args(
+        1,
+        arena.hyper_mid.device_address(),
+        arena.moe_output.device_address(),
+        hyper_output.device_address(),
+        &arena.mixed,
+        &arena.mhc_normed,
+        &arena.mhc_down,
+        &arena.mhc_activated,
+        &arena.mhc_up,
+        &mlp_weights,
+        blas,
+        stream,
+    );
+    native("Qwen NEXTN MLP mHC mix", unsafe {
+        flash_mhc_mix_launch(caps, &mlp_mhc)
+    })?;
+    run_mtp_moe(maps, resident, arena, stream, blas, caps)?;
+    native("Qwen NEXTN MLP mHC combine", unsafe {
+        flash_mhc_combine_launch(caps, &mlp_mhc)
+    })?;
+    Ok(())
+}
+
+fn run_mtp_moe(
+    maps: &mut FlashNextWeightMaps,
+    resident: &mut QwenResidentWeights,
+    arena: &mut QwenDecodeArena,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
+    caps: &DeviceCaps,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prefix = "mtp.layers.0.mlp";
+    let router = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.gate.weight"),
+        "BF16",
+        &[512, HIDDEN],
+        512 * HIDDEN * 2,
+    )?;
+    let gate = MoeGateArgs {
+        struct_size: size::<MoeGateArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: MoeGatePlan::qwen38_flash(1),
+        hidden_states: ptr(arena.mixed.device_address()),
+        router_weight: ptr(router),
+        router_logits: ptr_mut(arena.router_logits.device_address()),
+        topk_weights: ptr_mut(arena.route_weights.device_address()).cast::<f32>(),
+        topk_ids: ptr_mut(arena.route_ids.device_address()).cast::<i32>(),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen NEXTN router", unsafe {
+        flash_moe_gate_launch(caps, &gate)
+    })?;
+    let expert_gate_up = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.experts.gate_up_proj"),
+        "BF16",
+        &[512, 2 * INTERMEDIATE, HIDDEN],
+        512 * 2 * INTERMEDIATE * HIDDEN * 2,
+    )?;
+    let expert_down = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.experts.down_proj"),
+        "BF16",
+        &[512, HIDDEN, INTERMEDIATE],
+        512 * HIDDEN * INTERMEDIATE * 2,
+    )?;
+    let experts = QwenMtpExpertsArgs {
+        struct_size: size::<QwenMtpExpertsArgs>(),
+        abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
+        hidden_states: ptr(arena.mixed.device_address()),
+        expert_ids: ptr(arena.route_ids.device_address()).cast::<i32>(),
+        expert_weights: ptr(arena.route_weights.device_address()).cast::<f32>(),
+        gate_up_weight: ptr(expert_gate_up),
+        down_weight: ptr(expert_down),
+        gate_up_scratch: ptr_mut(arena.gate_up.device_address()),
+        activated_scratch: ptr_mut(arena.mtp_expert_activated.device_address()),
+        expert_output_scratch: ptr_mut(arena.expert_output.device_address()),
+        output: ptr_mut(arena.moe_output.device_address()),
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen NEXTN BF16 experts", unsafe {
+        flash_qwen_mtp_experts_launch(&experts)
+    })?;
+
+    let shared_gate_up = resident.merged_bf16_pair(
+        maps,
+        stream,
+        &format!("{prefix}.shared_expert.gate_up_merged"),
+        &format!("{prefix}.shared_expert.gate_proj.weight"),
+        &format!("{prefix}.shared_expert.up_proj.weight"),
+        &[INTERMEDIATE, HIDDEN],
+        INTERMEDIATE * HIDDEN * 2,
+    )?;
+    let shared_down = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.shared_expert.down_proj.weight"),
+        "BF16",
+        &[HIDDEN, INTERMEDIATE],
+        HIDDEN * INTERMEDIATE * 2,
+    )?;
+    let shared_gate_weight = resident.get(
+        maps,
+        stream,
+        &format!("{prefix}.shared_expert_gate.weight"),
+        "BF16",
+        &[1, HIDDEN],
+        HIDDEN * 2,
+    )?;
+    let shared = SharedExpertArgs {
+        struct_size: size::<SharedExpertArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: SharedExpertPlan::qwen38_flash(1),
+        hidden_states: ptr(arena.mixed.device_address()),
+        gate_up_weight: ptr(shared_gate_up),
+        down_weight: ptr(shared_down),
+        shared_gate_weight: ptr(shared_gate_weight),
+        gate_up: ptr_mut(arena.shared_gate_up.device_address()),
+        activated: ptr_mut(arena.shared_activated.device_address()),
+        shared_gate: std::ptr::null_mut(),
+        output: ptr_mut(arena.shared_output.device_address()),
+        cublas_handle: blas.raw(),
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen NEXTN shared expert", unsafe {
+        flash_shared_expert_launch(caps, &shared)
+    })?;
+    let join = MoeJoinArgs {
+        struct_size: size::<MoeJoinArgs>(),
+        abi_version: KERNEL_ABI_VERSION,
+        plan: MoeJoinPlan::qwen38_flash(1),
+        hidden_states: ptr(arena.mixed.device_address()),
+        shared_gate_weight: ptr(shared_gate_weight),
+        shared_output: ptr(arena.shared_output.device_address()),
+        routed_output: ptr_mut(arena.moe_output.device_address()),
+        cuda_stream: stream.raw(),
+    };
+    native("Qwen NEXTN MoE join", unsafe {
+        flash_moe_join_launch(caps, &join)
+    })?;
     Ok(())
 }
 
@@ -1706,6 +2228,8 @@ fn run_gdn(
     num_tokens: u32,
     conv_states: &CoherentRegionOwner,
     temporal_states: &CoherentRegionOwner,
+    snapshot_conv_states: Option<&CoherentRegionOwner>,
+    snapshot_temporal_states: Option<&CoherentRegionOwner>,
     arena: &QwenDecodeArena,
     stream: &mut CudaStreamOwner,
     blas: &CudaBlasOwner,
@@ -1769,87 +2293,141 @@ fn run_gdn(
     let conv_state = conv_states.device_address() + gdn_ordinal * GDN_CONV_WIDTH * 3 * 2;
     let temporal_state =
         temporal_states.device_address() + gdn_ordinal * VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2;
-    // SGLang merges qkvz+ba into one BF16 GEMM for decode, saving three tiny-M
-    // launches. At prefill widths it deliberately keeps the four row views,
-    // because the single very-wide GEMM is slower there. The T=1 fused output
-    // fits in the existing T=16 qkv scratch without another allocation.
-    let fused_decode_projection = num_tokens == 1;
-    let projected_qkv = arena.gdn_projected_qkv.device_address();
-    let projected_z = if fused_decode_projection {
-        projected_qkv + GDN_CONV_WIDTH * 2
+    // Rejected speculative rows must not commit recurrent state. For T=2
+    // verification, execute the two recurrence rows in order and retain the
+    // state after row zero. Attention/MLP still run as T=2, while rejection
+    // becomes a state restore instead of a complete 48-layer T=1 replay.
+    let launch = |launch_tokens: u32,
+                  hidden_states: u64,
+                  attention_output: u64,
+                  stream: &mut CudaStreamOwner|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let fused_decode_projection = launch_tokens == 1;
+        let projected_qkv = arena.gdn_projected_qkv.device_address();
+        let projected_z = if fused_decode_projection {
+            projected_qkv + GDN_CONV_WIDTH * 2
+        } else {
+            arena.gdn_projected_z.device_address()
+        };
+        let projected_b = if fused_decode_projection {
+            projected_z + VALUE_WIDTH * 2
+        } else {
+            arena.gdn_projected_b.device_address()
+        };
+        let projected_a = if fused_decode_projection {
+            projected_b + VALUE_HEADS * 2
+        } else {
+            arena.gdn_projected_a.device_address()
+        };
+        let mut plan = GdnBlockPlan::qwen38_flash_decode(launch_tokens);
+        plan.reserved = u32::from(fused_decode_projection);
+        let block = GdnBlockArgs {
+            struct_size: size::<GdnBlockArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan,
+            hidden_states: ptr(hidden_states),
+            in_proj_qkv_weight: ptr(qkv),
+            in_proj_z_weight: ptr(z),
+            in_proj_b_weight: ptr(b),
+            in_proj_a_weight: ptr(a),
+            conv_weight: ptr(conv),
+            gated_norm_weight: ptr(norm),
+            out_proj_weight: ptr(out),
+            conv_state_pool: ptr_mut(conv_state),
+            state_indices: ptr(arena.state_index.device_address()).cast::<i32>(),
+            projected_qkv: ptr_mut(projected_qkv),
+            projected_z: ptr_mut(projected_z),
+            projected_b: ptr_mut(projected_b),
+            projected_a: ptr_mut(projected_a),
+            convolved_qkv: ptr_mut(arena.gdn_convolved.device_address()),
+            gdn_core_output: ptr(arena.gdn_core.device_address()),
+            gated_norm_output: ptr_mut(arena.gdn_gated.device_address()),
+            attention_output: ptr_mut(attention_output),
+            cublas_handle: blas.raw(),
+            cuda_stream: stream.raw(),
+        };
+        let recurrence = GdnDecodeArgs {
+            struct_size: size::<GdnDecodeArgs>(),
+            abi_version: KERNEL_ABI_VERSION,
+            plan: GdnDecodePlan::qwen38_flash_decode(1, 1),
+            q: ptr(arena.gdn_convolved.device_address()),
+            k: ptr(
+                arena.gdn_convolved.device_address()
+                    + u64::from(launch_tokens) * QK_WIDTH * 2,
+            ),
+            v: ptr(
+                arena.gdn_convolved.device_address()
+                    + 2 * u64::from(launch_tokens) * QK_WIDTH * 2,
+            ),
+            a: ptr(projected_a),
+            b: ptr(projected_b),
+            a_log: ptr(a_log).cast::<f32>(),
+            dt_bias: ptr(dt).cast::<f32>(),
+            state_pool: ptr_mut(temporal_state),
+            state_indices: ptr(arena.state_index.device_address()).cast::<i32>(),
+            output: ptr_mut(arena.gdn_core.device_address()),
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            sequence_length: launch_tokens,
+            cuda_stream: stream.raw(),
+        };
+        native("Qwen GDN prepare", unsafe {
+            flash_gdn_block_prepare_launch(caps, &block)
+        })?;
+        native("Qwen GDN recurrence", unsafe {
+            flash_gdn_decode_launch(caps, &recurrence)
+        })?;
+        native("Qwen GDN finish", unsafe {
+            flash_gdn_block_finish_launch(caps, &block)
+        })?;
+        Ok(())
+    };
+
+    if num_tokens == 2 && snapshot_conv_states.is_some() {
+        launch(
+            1,
+            arena.mixed.device_address(),
+            arena.attention.device_address(),
+            stream,
+        )?;
+        let snapshot_conv = snapshot_conv_states.expect("checked above").device_address()
+            + gdn_ordinal * GDN_CONV_WIDTH * 3 * 2;
+        let snapshot_temporal = snapshot_temporal_states
+            .ok_or("Qwen verifier temporal snapshot is missing")?
+            .device_address()
+            + gdn_ordinal * VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2;
+        unsafe {
+            stream.memcpy_async(
+                snapshot_conv,
+                conv_state,
+                usize::try_from(GDN_CONV_WIDTH * 3 * 2)?,
+            )?;
+            stream.memcpy_async(
+                snapshot_temporal,
+                temporal_state,
+                usize::try_from(VALUE_HEADS * HEAD_DIM * HEAD_DIM * 2)?,
+            )?;
+        }
+        launch(
+            1,
+            arena.mixed.device_address() + HIDDEN * 2,
+            arena.attention.device_address() + HIDDEN * 2,
+            stream,
+        )?;
     } else {
-        arena.gdn_projected_z.device_address()
-    };
-    let projected_b = if fused_decode_projection {
-        projected_z + VALUE_WIDTH * 2
-    } else {
-        arena.gdn_projected_b.device_address()
-    };
-    let projected_a = if fused_decode_projection {
-        projected_b + VALUE_HEADS * 2
-    } else {
-        arena.gdn_projected_a.device_address()
-    };
-    let mut plan = GdnBlockPlan::qwen38_flash_decode(num_tokens);
-    plan.reserved = u32::from(fused_decode_projection);
-    let block = GdnBlockArgs {
-        struct_size: size::<GdnBlockArgs>(),
-        abi_version: KERNEL_ABI_VERSION,
-        plan,
-        hidden_states: ptr(arena.mixed.device_address()),
-        in_proj_qkv_weight: ptr(qkv),
-        in_proj_z_weight: ptr(z),
-        in_proj_b_weight: ptr(b),
-        in_proj_a_weight: ptr(a),
-        conv_weight: ptr(conv),
-        gated_norm_weight: ptr(norm),
-        out_proj_weight: ptr(out),
-        conv_state_pool: ptr_mut(conv_state),
-        state_indices: ptr(arena.state_index.device_address()).cast::<i32>(),
-        projected_qkv: ptr_mut(projected_qkv),
-        projected_z: ptr_mut(projected_z),
-        projected_b: ptr_mut(projected_b),
-        projected_a: ptr_mut(projected_a),
-        convolved_qkv: ptr_mut(arena.gdn_convolved.device_address()),
-        gdn_core_output: ptr(arena.gdn_core.device_address()),
-        gated_norm_output: ptr_mut(arena.gdn_gated.device_address()),
-        attention_output: ptr_mut(arena.attention.device_address()),
-        cublas_handle: blas.raw(),
-        cuda_stream: stream.raw(),
-    };
-    let recurrence = GdnDecodeArgs {
-        struct_size: size::<GdnDecodeArgs>(),
-        abi_version: KERNEL_ABI_VERSION,
-        plan: GdnDecodePlan::qwen38_flash_decode(1, 1),
-        q: ptr(arena.gdn_convolved.device_address()),
-        k: ptr(arena.gdn_convolved.device_address() + u64::from(num_tokens) * QK_WIDTH * 2),
-        v: ptr(arena.gdn_convolved.device_address() + 2 * u64::from(num_tokens) * QK_WIDTH * 2),
-        a: ptr(projected_a),
-        b: ptr(projected_b),
-        a_log: ptr(a_log).cast::<f32>(),
-        dt_bias: ptr(dt).cast::<f32>(),
-        state_pool: ptr_mut(temporal_state),
-        state_indices: ptr(arena.state_index.device_address()).cast::<i32>(),
-        output: ptr_mut(arena.gdn_core.device_address()),
-        scale: 1.0 / (HEAD_DIM as f32).sqrt(),
-        sequence_length: num_tokens,
-        cuda_stream: stream.raw(),
-    };
-    native("Qwen GDN prepare", unsafe {
-        flash_gdn_block_prepare_launch(caps, &block)
-    })?;
-    native("Qwen GDN recurrence", unsafe {
-        flash_gdn_decode_launch(caps, &recurrence)
-    })?;
-    native("Qwen GDN finish", unsafe {
-        flash_gdn_block_finish_launch(caps, &block)
-    })?;
+        launch(
+            num_tokens,
+            arena.mixed.device_address(),
+            arena.attention.device_address(),
+            stream,
+        )?;
+    }
     Ok(())
 }
 
 fn prepare_qsa_metadata(
     arena: &mut QwenDecodeArena,
     position: u32,
+    rope_position: u32,
     slot: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if u64::from(slot) >= PREFILL_CHUNK_TOKENS {
@@ -1863,7 +2441,7 @@ fn prepare_qsa_metadata(
     write_word_at(
         &mut arena.qsa_positions,
         u64::from(slot) * 8,
-        i64::from(position).to_ne_bytes(),
+        i64::from(rope_position).to_ne_bytes(),
     )?;
     write_word_at(
         &mut arena.qsa_cache_locs,
@@ -1923,7 +2501,8 @@ fn prepare_qsa_metadata(
 fn run_qsa(
     maps: &mut FlashNextWeightMaps,
     resident: &mut QwenResidentWeights,
-    layer: u32,
+    prefix: &str,
+    qsa_ordinal: u64,
     start_position: u32,
     num_tokens: u32,
     hidden_states: u64,
@@ -1939,7 +2518,6 @@ fn run_qsa(
     caps: &DeviceCaps,
     fast_decode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let prefix = format!("model.language_model.layers.{layer}.self_attn");
     if num_tokens == 0 || u64::from(num_tokens) > PREFILL_CHUNK_TOKENS {
         return Err("Qwen QSA batch exceeds the AOT prefill bucket".into());
     }
@@ -2016,7 +2594,6 @@ fn run_qsa(
         HIDDEN * QUERY_WIDTH * 2,
     )?;
 
-    let qsa_ordinal = u64::from(layer / 4);
     if qsa_ordinal >= QSA_LAYERS {
         return Err("Qwen QSA layer ordinal exceeds the persistent state".into());
     }
@@ -3144,6 +3721,7 @@ fn run_ple(
     num_tokens: usize,
     hyper_base: u64,
     state: &CoherentRegionOwner,
+    snapshot_state: Option<&CoherentRegionOwner>,
     arena: &mut QwenDecodeArena,
     stream: &mut CudaStreamOwner,
     blas: &CudaBlasOwner,
@@ -3298,6 +3876,17 @@ fn run_ple(
             stream,
             flash_qwen_add_hyper_launch,
         )?;
+        if token_offset == 0 {
+            if let Some(snapshot) = snapshot_state {
+                unsafe {
+                    stream.memcpy_async(
+                        snapshot.device_address(),
+                        state.device_address(),
+                        state.payload_bytes()?,
+                    )?;
+                }
+            }
+        }
     }
     // T=1 decode keeps its existing asynchronous behavior. Prefill now needs
     // one bucket fence rather than one fence per token; layer 1's MoE owns the
@@ -3319,7 +3908,37 @@ fn finish_logits(
     caps: &DeviceCaps,
     fast_decode: bool,
 ) -> Result<u32, Box<dyn std::error::Error>> {
-    let prefix = "model.language_model.hyper_connection_mixer";
+    let tokens = finish_logits_rows(
+        maps,
+        resident,
+        hyper,
+        1,
+        "model.language_model.hyper_connection_mixer",
+        arena,
+        stream,
+        blas,
+        caps,
+        fast_decode,
+    )?;
+    Ok(tokens[0])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_logits_rows(
+    maps: &mut FlashNextWeightMaps,
+    resident: &mut QwenResidentWeights,
+    hyper: u64,
+    num_tokens: u32,
+    prefix: &str,
+    arena: &QwenDecodeArena,
+    stream: &mut CudaStreamOwner,
+    blas: &CudaBlasOwner,
+    caps: &DeviceCaps,
+    device_argmax: bool,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    if !(1..=2).contains(&num_tokens) {
+        return Err("Qwen LM-head row count exceeds the fixed verify bucket".into());
+    }
     let norm = resident.get(
         maps,
         stream,
@@ -3347,7 +3966,7 @@ fn finish_logits(
     let args = MhcArgs {
         struct_size: size::<MhcArgs>(),
         abi_version: KERNEL_ABI_VERSION,
-        plan: MhcPlan::qwen38_flash(1),
+        plan: MhcPlan::qwen38_flash(num_tokens),
         hyper_input: ptr(hyper),
         norm_weight: ptr(norm),
         mix_down_weight: ptr(down),
@@ -3377,8 +3996,10 @@ fn finish_logits(
     let head = QwenLmHeadArgs {
         struct_size: size::<QwenLmHeadArgs>(),
         abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
+        tokens: num_tokens,
         vocabulary: VOCABULARY as u32,
         hidden_size: HIDDEN as u32,
+        reserved: 0,
         hidden_states: ptr(arena.final_hidden.device_address()),
         weight: ptr(lm_head),
         logits: ptr_mut(arena.logits.device_address()).cast::<f32>(),
@@ -3386,11 +4007,13 @@ fn finish_logits(
         cuda_stream: stream.raw(),
     };
     native("Qwen LM head", unsafe { flash_qwen_lm_head_launch(&head) })?;
-    if fast_decode {
+    if device_argmax {
         let argmax = QwenArgmaxArgs {
             struct_size: size::<QwenArgmaxArgs>(),
             abi_version: QWEN_DECODE_GLUE_ABI_VERSION,
+            rows: num_tokens,
             elements: u32::try_from(VOCABULARY)?,
+            row_stride: u32::try_from(VOCABULARY)?,
             reserved: 0,
             values: ptr(arena.logits.device_address()).cast::<f32>(),
             output_index: ptr_mut(arena.next_token.device_address()).cast::<u32>(),
@@ -3400,18 +4023,30 @@ fn finish_logits(
             flash_qwen_argmax_launch(&argmax)
         })?;
         stream.synchronize()?;
-        return read_u32_scalar(&arena.next_token);
+        let bytes = unsafe { arena.next_token.host_payload()? };
+        return bytes
+            .chunks_exact(4)
+            .take(usize::try_from(num_tokens)?)
+            .map(|word| Ok(u32::from_ne_bytes(word.try_into()?)))
+            .collect();
     }
     stream.synchronize()?;
     let values = unsafe { arena.logits.host_payload()? };
-    let mut best = (0_u32, f32::NEG_INFINITY);
-    for (index, bytes) in values.chunks_exact(4).enumerate() {
-        let value = f32::from_ne_bytes(bytes.try_into()?);
-        if value > best.1 {
-            best = (u32::try_from(index)?, value);
+    let mut tokens = Vec::with_capacity(usize::try_from(num_tokens)?);
+    for row in values
+        .chunks_exact(usize::try_from(VOCABULARY * 4)?)
+        .take(usize::try_from(num_tokens)?)
+    {
+        let mut best = (0_u32, f32::NEG_INFINITY);
+        for (index, bytes) in row.chunks_exact(4).enumerate() {
+            let value = f32::from_ne_bytes(bytes.try_into()?);
+            if value > best.1 {
+                best = (u32::try_from(index)?, value);
+            }
         }
+        tokens.push(best.0);
     }
-    Ok(best.0)
+    Ok(tokens)
 }
 
 fn checked_tensor(
@@ -3563,14 +4198,6 @@ fn read_i32_region(
         .chunks_exact(4)
         .map(|value| i32::from_ne_bytes(value.try_into().unwrap()))
         .collect())
-}
-
-fn read_u32_scalar(region: &CoherentRegionOwner) -> Result<u32, Box<dyn std::error::Error>> {
-    let payload = unsafe { region.host_payload()? };
-    if payload.len() != 4 {
-        return Err("u32 scalar slab size mismatch".into());
-    }
-    Ok(u32::from_ne_bytes(payload.try_into()?))
 }
 
 fn write_u32(

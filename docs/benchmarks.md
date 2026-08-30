@@ -11,6 +11,7 @@ cache policy match.
 | Spark.C Qwen3.8-27B, true-M8 DFlash2 | matched 47 → 256 decode | — | **37.76 tok/s** |
 | Spark.C Flash-Next, before batched QSA | warm 66-token prompt | 43.3-44.5 tok/s | 9.7-10.9 tok/s |
 | Spark.C Flash-Next, batched QSA | warm 57-token prompt / 2 output | **74.80 tok/s** | **10.87 tok/s** |
+| Spark.C Flash-Next, native NEXTN | warm 56-token prompt / 24 output | **66.75 tok/s** | **11.91 tok/s** |
 | Spark.C GLM-5.3 Q2 | 2048 prompt / 128 output | 523.02 tok/s | 14.52 tok/s |
 
 Qwen3.8-27B first measured 537.42 prefill and 17.07 DFlash2 decode tok/s. The
@@ -34,3 +35,10 @@ QKVZBA merging removes three GEMM launches from each T=1 GDN layer. Batching
 QSA input/output projections across the existing T=16 prompt bucket then cut
 the retained warm 57-token canary from 1.182 s to 0.762 s while producing the
 same two token IDs. These are single canaries, not repeated statistical claims.
+
+Flash-Next NEXTN uses the checkpoint's bundled BF16 MTP layer, a top-1 draft,
+and fixed T=2 target verification. Prompt draft-extension reduced target-only
+prefill throughput modestly but raised proposal acceptance to about 77%. The
+warm HTTP request completed in 2.854 s: 0.839 s model prefill plus approximately
+2.015 s for 24 output tokens. Rejected proposals commit verifier row zero from
+per-layer recurrent journals, avoiding the earlier 0.23-s target replay.

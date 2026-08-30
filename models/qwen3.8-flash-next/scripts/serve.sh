@@ -49,6 +49,8 @@ trap cleanup EXIT INT TERM
 
 export FLASH_QWEN_FUSED_MOE=1
 export FLASH_QWEN_FUSED_MOE_SIDECAR="$sidecar"
+export FLASH_QWEN_MTP=${FLASH_QWEN_MTP:-1}
+export FLASH_QWEN_DECODE_FAST_PATH=${FLASH_QWEN_DECODE_FAST_PATH:-1}
 export LD_LIBRARY_PATH="$repo_root/build/flash-next:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$binary" "$model_root" "$bind" "$model_id" &
 child_pid=$!

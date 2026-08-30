@@ -94,8 +94,6 @@ fn is_nonresident_tensor(name: &str) -> bool {
     (name.contains(".ngram_embedding.shard_") && name.ends_with(".weight"))
         || name.starts_with("model.visual.")
         || name.contains(".visual.")
-        || name.starts_with("mtp.")
-        || name.contains(".mtp.")
 }
 
 #[derive(Debug)]
