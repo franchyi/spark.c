@@ -250,31 +250,3 @@ Spark.C exists because of the work in
 [`llama.cpp`](https://github.com/ggml-org/llama.cpp), and GGML. Their kernels,
 quantization formats, model integrations, tests, and accumulated systems
 knowledge made these model-specific engines possible.
-
-Pinned source revisions are ds4
-`a60a2a0d25137a849a101e04e86ea830a346073a`, FlashInfer
-`906181e3f4cf4bcc81835fb480db4011bbd80b62`, CUTLASS
-`b46b16d003484063bca4ed365e44095c4c6ed633`, TileLang
-`cd37ed5fc35ae7a60a1277c8eb49028174ac51e6`, and the SGLang revisions recorded
-in [`docs/kernels.md`](docs/kernels.md). Adapted sources retain inline notices;
-the upstream projects remain under their respective MIT, Apache-2.0, and
-BSD-3-Clause terms.
-
-The ds4-derived work includes Copyright (c) 2026 the ds4.c authors and
-Copyright (c) 2023–2026 the GGML authors. TileLang-derived generated templates
-include Copyright (c) Tile-AI.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-the MIT-licensed software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation the
-rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished
-to do so, subject to the following conditions: the above copyright notice and
-this permission notice shall be included in all copies or substantial portions
-of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
-OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
